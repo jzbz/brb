@@ -1,6 +1,6 @@
 # Backup disc 01 of 1 — `home-2026-08-07`
 
-Created 2026-08-08T01:28:57-04:00 from `/tmp/tmp.N2XlELH8bA/src`.
+Created 2026-08-08T21:27:41-04:00 from `/home/you`.
 Written by brb (Blu-ray Backup) 1.0.0.
 
 **This disc is self-contained.** It holds a complete, independent SquashFS
