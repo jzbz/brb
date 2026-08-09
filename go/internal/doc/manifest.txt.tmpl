@@ -1,0 +1,39 @@
+brb (Blu-ray Backup) manifest
+=============================
+
+archive name    : {{.Archive}}
+created         : {{.Created}}
+host            : {{.Host}}
+source          : {{.Source}}
+discs           : {{.Total}}
+disc type       : {{.DiscType}}
+image format    : SquashFS 4.0 (mountable by the Linux kernel)
+disc format     : ISO 9660 level 3 (multi-extent; no UDF), Rock Ridge + Joliet
+compression     : {{.Compression}} level {{.Level}}, block {{.BlockSize}}
+encryption      : age, X25519 recipients
+parity          : par2 {{.Redundancy}}% over ciphertext
+brb version     : {{.Version}}
+
+IMPORTANT: each disc is INDEPENDENT. Losing one disc loses only the
+files stored on it; every other disc restores on its own.
+
+tool versions used to create this set
+-------------------------------------
+{{range .ToolVersions}}  {{.}}
+{{else}}  (not recorded)
+{{end}}
+age recipients (public keys — harmless on their own)
+----------------------------------------------------
+{{range .Recipients}}  {{.}}
+{{else}}  (none recorded — this set cannot be decrypted without the key that made it)
+{{end}}
+disc contents
+-------------
+{{range .Discs}}  disc {{printf "%02d" .Number}} of {{printf "%02d" $.Total}}
+{{range .Files}}      {{.Name}}  ({{.Size}} bytes)
+{{end}}{{end}}
+excluded from this backup
+-------------------------
+{{range .PruneDirs}}  prune: {{.}}
+{{end}}{{range .ExcludeMasks}}  mask : {{.}}
+{{end}}

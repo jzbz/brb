@@ -1,0 +1,14 @@
+# Vendored Go dependencies. Regenerated deterministically from the committed
+# go.mod and go.sum by `go mod vendor`, which build-dist.sh runs itself before
+# every release build — so the tree does not need to carry 832K of third-party
+# source. The offline-rebuild promise the on-disc README makes is kept by the
+# SOURCE TARBALL, which is vendored at build time and ships on every disc.
+go/vendor/
+
+# Optional symlink to the disc payload directory (BRB_DIST_DIR), per the README.
+/dist
+
+# Build output never belongs in here: binaries go to ~/zx/dev/artifacts.
+/brb
+/brb-linux-*
+/brb-src.tar.gz
