@@ -15,9 +15,10 @@
 #
 #   tar xzf brb-src.tar.gz && cd brb-*/go && go build -mod=vendor ./cmd/brb
 #
-# Output goes outside the working tree by default, per this machine's convention
-# that generated files live under ~/zx/dev/artifacts. Point brb at the result
-# with BRB_DIST_DIR, or symlink it to ./dist.
+# Output goes outside the working tree: build products do not belong in the
+# source. Name the directory as the first argument, or set BRB_DIST_OUT once;
+# the fallback is ~/brb-dist. Point brb at the result with BRB_DIST_DIR, or
+# symlink it to ./dist.
 #
 # Copyright (c) 2026 Jonathan Zeppettini. MIT licensed — see the LICENSE file,
 # which is the authoritative copy of the licence text for everything here.
@@ -25,7 +26,7 @@
 set -Eeuo pipefail
 
 REPO="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-OUT="${1:-/home/jz/zx/dev/artifacts/brb-dist}"
+OUT="${1:-${BRB_DIST_OUT:-$HOME/brb-dist}}"
 
 # The version the tarball and the say() lines are named after.
 VERSION="$(sed -n 's/^VERSION="\([^"]*\)".*/\1/p' "$REPO/brb.sh" | head -1)"

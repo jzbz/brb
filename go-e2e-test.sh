@@ -16,7 +16,12 @@
 #
 set -uo pipefail
 
-BRB="${1:-/home/jz/zx/dev/artifacts/brb-go/brb}"
+# The binary under test: first argument, else $BRB_GO_BIN, else one built
+# beside this script. No absolute path baked in — the tree has moved once and
+# this is a public repo, so a hardcoded home directory is just a stale default
+# that reads like a missing tool.
+HERE="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+BRB="${1:-${BRB_GO_BIN:-$HERE/brb}}"
 [[ -x "$BRB" ]] || { echo "no executable Go brb at: $BRB" >&2; exit 2; }
 
 W="$(mktemp -d)"

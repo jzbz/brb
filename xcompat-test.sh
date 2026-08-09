@@ -45,7 +45,7 @@ set -uo pipefail
 # tool rather than a stale default. build-dist.sh derives its REPO the same way.
 HERE="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 BRB_SH=${1:-$HERE/brb.sh}
-BRB_GO=${2:-/home/jz/zx/dev/artifacts/brb-go/brb}
+BRB_GO=${2:-${BRB_GO_BIN:-$HERE/brb}}
 
 # ---------------------------------------------------------------------------
 # reporting

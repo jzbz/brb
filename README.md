@@ -198,17 +198,23 @@ having it costs about 10 MiB out of a 100 MiB reserve, so there is no reason not
 
 That cross-compiles `brb-linux-amd64` and `brb-linux-aarch64` (static, `CGO_ENABLED=0`,
 so no libc and no shared libraries), vendors every Go dependency, and packs
-`brb-src.tar.gz`. Output goes to `~/zx/dev/artifacts/brb-dist` — outside the working tree.
-Pass a different directory as the first argument if you want it elsewhere.
-
-Then point `brb` at it, either way:
+`brb-src.tar.gz`. It writes to a directory you name, deliberately outside the working
+tree — build output does not belong in the source:
 
 ```bash
-export BRB_DIST_DIR=~/zx/dev/artifacts/brb-dist
+./build-dist.sh /path/to/dist
+```
+
+With no argument it uses `$BRB_DIST_OUT`, falling back to `~/brb-dist`.
+
+Then point `brb` at the result, either way:
+
+```bash
+export BRB_DIST_DIR=/path/to/dist
 ```
 
 ```bash
-ln -sfn ~/zx/dev/artifacts/brb-dist ~/zx/dev/brb/dist
+ln -sfn /path/to/dist ./dist
 ```
 
 `brb` also looks in `/usr/local/share/brb` and `/usr/share/brb`. If it finds nothing it

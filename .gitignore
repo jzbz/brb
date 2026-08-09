@@ -8,7 +8,7 @@ go/vendor/
 # Optional symlink to the disc payload directory (BRB_DIST_DIR), per the README.
 /dist
 
-# Build output never belongs in here: binaries go to ~/zx/dev/artifacts.
+# Build output never belongs in here; see BRB_DIST_OUT in build-dist.sh.
 /brb
 /brb-linux-*
 /brb-src.tar.gz
