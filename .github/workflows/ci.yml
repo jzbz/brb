@@ -1,0 +1,211 @@
+# CI for brb.
+#
+# Three jobs, cheapest first:
+#
+#   check   gofmt, vet, build. No external tools, no disc format, ~1 minute.
+#   test    the Go tests and both shell suites, against real mksquashfs/age/par2.
+#   dist    the disc payload, and the offline rebuild the on-disc README promises.
+#
+# test and dist wait on check so a stray gofmt diff costs one minute rather than
+# fifteen of par2 arithmetic, and so a red run points at one job instead of three.
+#
+# WHY A FRESH RUNNER IS THE POINT. This repo shipped with one machine's home
+# directory baked into three defaults, and that was found only because the tree
+# happened to move. Every job below starts from a bare checkout with nothing
+# exported, which is the only arrangement that can catch the next one: the suites
+# and build-dist.sh are invoked here with no arguments and no environment at all.
+#
+# Copyright (c) 2026 Jonathan Zeppettini. MIT licensed — see the LICENSE file.
+
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  # The dependencies here are distro packages and a disc format meant to still
+  # be readable in twenty years. Nothing about that is exercised by a quiet
+  # month, so run weekly: a squashfs-tools or par2 update that breaks an
+  # assumption should surface on its own, not on the next unrelated push.
+  schedule:
+    - cron: '17 5 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: build, vet, gofmt
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          # Read the version out of go.mod rather than pinning it twice.
+          go-version-file: go/go.mod
+          cache-dependency-path: go/go.sum
+
+      # A clean checkout carries no vendor/ — it is gitignored, and regenerated
+      # by build-dist.sh for the source tarball. Building here therefore also
+      # proves go.mod and go.sum alone are enough to construct the program.
+      - name: Build
+        working-directory: ./go
+        run: go build ./...
+
+      - name: Vet
+        working-directory: ./go
+        run: go vet ./...
+
+      - name: gofmt
+        working-directory: ./go
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "::error::gofmt would rewrite these files:"
+            echo "$unformatted"
+            gofmt -d .
+            exit 1
+          fi
+
+  test:
+    name: tests and cross-compatibility suites
+    runs-on: ubuntu-latest
+    needs: check
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go/go.mod
+          cache-dependency-path: go/go.sum
+
+      - name: Install the tools brb shells out to
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            squashfs-tools par2 xorriso locales
+          # xcompat's locale round-trip is skipped unless en_US.UTF-8 exists.
+          sudo locale-gen en_US.UTF-8
+
+      - name: Install age
+        run: |
+          # Prefer the distro package, because that is what the README tells a
+          # reader to install and so it is the path worth exercising. Fall back
+          # to the exact version go.mod already depends on, which keeps CI alive
+          # across runner image changes without introducing a new trust root or
+          # an unpinned download.
+          if sudo apt-get install -y --no-install-recommends age; then
+            echo "age: from apt"
+          else
+            echo "age: apt has no package, building v1.3.1 from the pinned module"
+            go install filippo.io/age/cmd/age@v1.3.1
+            go install filippo.io/age/cmd/age-keygen@v1.3.1
+            echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+          fi
+
+      # THIS STEP IS LOAD-BEARING, NOT CEREMONY. Every tool-dependent Go test calls
+      # t.Skipf when detection fails, and the shell suites exit 77. Both are
+      # correct behaviour for a person's laptop and both are silent here: a
+      # runner missing par2 would report a green `go test ./...` in which the
+      # integration tests never ran at all. Failing loudly on a missing tool is
+      # what stops CI from certifying a run that tested nothing.
+      - name: Every required tool must actually be present
+        run: |
+          missing=()
+          for t in sha512sum mksquashfs unsquashfs par2 age age-keygen \
+                   xorriso gzip diff find awk sed cmp sort script; do
+            command -v "$t" >/dev/null 2>&1 || missing+=("$t")
+          done
+          if [ ${#missing[@]} -ne 0 ]; then
+            echo "::error::the suites would skip themselves; missing: ${missing[*]}"
+            exit 1
+          fi
+          locale -a | grep -qiE '^en_US\.utf-?8$' || {
+            echo "::error::no en_US.UTF-8; xcompat's locale checks would skip"
+            exit 1
+          }
+          # squashfs-tools below 4.5 has no -cpiostyle0, which the backup path
+          # depends on and whose absence is another silent t.Skip.
+          mksquashfs -version | head -1
+          par2 --version 2>&1 | head -1 || true
+          age --version
+
+      - name: Go tests
+        working-directory: ./go
+        run: go test -count=1 ./...
+
+      - name: Go tests under the race detector
+        working-directory: ./go
+        run: go test -count=1 -race ./...
+
+      # Built to ./brb, which is exactly where both suites look by default when
+      # given no argument. Nothing is exported and nothing is passed.
+      - name: Build the binary the suites read
+        run: go -C go build -o ../brb ./cmd/brb
+
+      - name: Cross-compatibility suite (bash reader vs Go writer)
+        run: ./xcompat-test.sh
+
+      - name: Go end-to-end suite
+        run: ./go-e2e-test.sh
+
+  dist:
+    name: disc payload and offline rebuild
+    runs-on: ubuntu-latest
+    needs: check
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go/go.mod
+          cache-dependency-path: go/go.sum
+
+      # No argument: this also proves the output default is not machine-specific.
+      - name: Build the payload
+        run: ./build-dist.sh "$RUNNER_TEMP/dist"
+
+      - name: The published set must verify against its own SHA512SUMS
+        working-directory: ${{ runner.temp }}/dist
+        run: sha512sum -c SHA512SUMS
+
+      - name: Both binaries must be static, and the right architectures
+        working-directory: ${{ runner.temp }}/dist
+        run: |
+          file brb-linux-amd64 brb-linux-aarch64
+          # A cross-compile that silently produced two amd64 binaries would sail
+          # through every other check in this file, and strand anyone restoring
+          # on an ARM machine with a binary their kernel refuses to exec.
+          file brb-linux-amd64   | grep -q 'x86-64'           || exit 1
+          file brb-linux-aarch64 | grep -q 'ARM aarch64'      || exit 1
+          file brb-linux-amd64   | grep -q 'statically linked' || exit 1
+          file brb-linux-aarch64 | grep -q 'statically linked' || exit 1
+          # Static means it runs on a rescue system with no libc and no Go.
+          ./brb-linux-amd64 version
+
+      # The on-disc README tells whoever finds these discs that the source
+      # tarball rebuilds with no network access. That promise is only as good as
+      # the last time someone tried it, so try it on every run.
+      - name: The source tarball must rebuild with the network off
+        run: |
+          cd "$RUNNER_TEMP"
+          tar xzf dist/brb-src.tar.gz
+          cd brb-*/go
+          GOPROXY=off go build -mod=vendor -o "$RUNNER_TEMP/brb-offline" ./cmd/brb
+          "$RUNNER_TEMP/brb-offline" version
+
+      # build-dist.sh runs `go mod tidy && go mod vendor` before it builds. That
+      # is deliberate, and it makes this the cheapest possible dependency-drift
+      # alarm: if tidy wants to change anything, the committed go.mod and go.sum
+      # no longer describe the module that actually gets shipped on the discs.
+      - name: go.mod and go.sum must already be tidy
+        run: git diff --exit-code -- go/go.mod go/go.sum

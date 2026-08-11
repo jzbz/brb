@@ -1,5 +1,7 @@
 # brb — Blu-ray Backup
 
+[![CI](https://github.com/jzbz/brb/actions/workflows/ci.yml/badge.svg)](https://github.com/jzbz/brb/actions/workflows/ci.yml)
+
 Independent, mountable, encrypted backup discs.
 
 `brb` bin-packs a directory tree into disc-sized groups, builds one self-contained
@@ -899,6 +901,28 @@ Plus the Go unit tests:
 ```bash
 cd go && go test ./...
 ```
+
+### Continuous integration
+
+[`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs all of the above on
+every push and pull request, weekly on a schedule, and on demand. Both suites and
+`build-dist.sh` are invoked there with **no arguments and no environment**, which
+is the only arrangement that catches a machine-specific path getting baked into a
+default again.
+
+One step in it is load-bearing and worth knowing about: CI verifies every
+external tool is present *before* running anything. The tool-dependent Go tests
+call `t.Skip` when detection fails and the shell suites exit 77, which is right
+on a laptop and dangerously quiet on a build runner — a runner missing `par2`
+would otherwise report a green `go test ./...` in which the integration tests
+never ran at all. A missing tool fails the run instead.
+
+The release job rebuilds `brb-src.tar.gz` with `GOPROXY=off`, so the offline
+rebuild the on-disc README promises is re-proven on every run rather than resting
+on the last time somebody tried it by hand. It also checks the two cross-compiled
+binaries are genuinely x86-64 and aarch64 and both static, and that `go.mod` and
+`go.sum` are already tidy — `build-dist.sh` runs `go mod tidy` itself, so any
+drift there means the committed module no longer describes what ships on a disc.
 
 ---
 
