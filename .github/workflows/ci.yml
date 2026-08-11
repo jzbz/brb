@@ -40,11 +40,37 @@ concurrency:
 
 jobs:
   check:
-    name: build, vet, gofmt
+    name: build, vet, gofmt, shellcheck
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v5
+
+      # Pinned, and checksummed, rather than taken from apt. Ubuntu ships
+      # shellcheck 0.9.0; these scripts were triaged against 0.11.0, and the two
+      # do not report the same set — 0.11.0 is the one that finds the `local a=$1
+      # b=$a` class. A lint gate that changes its mind when the runner image is
+      # rebuilt is worse than no gate, so the version is part of the config.
+      - name: Install shellcheck
+        env:
+          SC_VERSION: v0.11.0
+          SC_SHA512: 25df28923d7d89cfdb9fa8aeef762a887f2bd4ebfbcd43ae71068c60e9458d66250b0f8d6fd66b4bc03723e6cdd47983c547e3ab4f3ea2cbc4bc4028842cc7b9
+        run: |
+          cd "$RUNNER_TEMP"
+          curl -fsSLo sc.tar.xz \
+            "https://github.com/koalaman/shellcheck/releases/download/$SC_VERSION/shellcheck-$SC_VERSION.linux.x86_64.tar.xz"
+          echo "$SC_SHA512  sc.tar.xz" | sha512sum -c -
+          tar xJf sc.tar.xz
+          sudo install -m 0755 "shellcheck-$SC_VERSION/shellcheck" /usr/local/bin/shellcheck
+          shellcheck --version
+
+      # A glob, not a list, so a script added later is covered without anyone
+      # remembering to add it here. --severity=style is shellcheck's most
+      # inclusive setting; all four scripts are clean at it today, and the two
+      # deliberate idioms that are not are disabled at their sites with the
+      # reason written next to them.
+      - name: shellcheck
+        run: shellcheck --severity=style --format=gcc -- *.sh
 
       - uses: actions/setup-go@v6
         with:

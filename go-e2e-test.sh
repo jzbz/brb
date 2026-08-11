@@ -2,9 +2,10 @@
 #
 # go-e2e-test.sh — end-to-end regression suite for the Go implementation.
 #
-# Counterpart to e2e-test.sh (which exercises brb.sh). Its focus is the things
-# only a real run can prove: that an interrupted multi-disc backup resumes
-# correctly, and that the resumed set restores byte-identical to its source.
+# Counterpart to xcompat-test.sh, which owns the format contract between the
+# two implementations. This one's focus is the things only a real run can
+# prove: that an interrupted multi-disc backup resumes correctly, and that the
+# resumed set restores byte-identical to its source.
 #
 # Usage: ./go-e2e-test.sh [path-to-go-brb]
 # Exit 0 when every assertion passed.
@@ -14,6 +15,16 @@
 #
 # MIT licensed — see the LICENSE file.
 #
+# This suite asserts by running a condition and handing its exit status to ck:
+#
+#     (( imgs_before >= 1 )); ck "  ... with $imgs_before image(s)" $?
+#
+# which is what SC2319 and SC2181 exist to question, because a $? read too late
+# reports something other than the thing being tested. Here the condition and
+# the ck call are always one line with a single ; between them, so nothing can
+# get in between to overwrite the status. Disabled for the file rather than at
+# seventeen separate sites; keep the two halves on one line and it stays true.
+# shellcheck disable=SC2319,SC2181
 set -uo pipefail
 
 # The binary under test: first argument, else $BRB_GO_BIN, else one built
@@ -151,6 +162,10 @@ ck "  ... re-seeding from the discs already written" $?
 
 sect "the discs built before the kill were not rebuilt"
 names=$(printf '%s\n' "$before" | awk '{print $2}')
+# shellcheck disable=SC2086  # $names is deliberately split into one argument
+# per disc image. The names are brb's own (discNN.squashfs.age), so they carry
+# no whitespace, and the [[ -n "$after" ]] below refuses to let a split that
+# went wrong pass as agreement.
 after="$(sha512sum $names 2>/dev/null | LC_ALL=C sort)"
 [[ -n "$after" && "$before" == "$after" ]]
 ck "already-protected discs are byte-identical after the resume" $?

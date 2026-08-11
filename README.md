@@ -910,6 +910,14 @@ every push and pull request, weekly on a schedule, and on demand. Both suites an
 is the only arrangement that catches a machine-specific path getting baked into a
 default again.
 
+The four shell scripts are linted with a pinned, checksummed **shellcheck
+0.11.0** at its most inclusive severity, and all four are clean at it. The
+version is pinned deliberately: Ubuntu ships 0.9.0, which does not report the
+same set, and a lint gate that changes its mind when the runner image is
+rebuilt is worse than no gate. The two places where a deliberate idiom trips a
+check are disabled at the site, with the reason written next to them, rather
+than switched off across the repo.
+
 One step in it is load-bearing and worth knowing about: CI verifies every
 external tool is present *before* running anything. The tool-dependent Go tests
 call `t.Skip` when detection fails and the shell suites exit 77, which is right

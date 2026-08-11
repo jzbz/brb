@@ -305,7 +305,11 @@ cmd_doctor() {
 
   echo >&2
   for t in ddrescue udisksctl findmnt eject pv; do
-    command -v "$t" >/dev/null 2>&1 && ok "$t  (optional)" || step "$t  not found (optional)"
+    if command -v "$t" >/dev/null 2>&1; then
+      ok "$t  (optional)"
+    else
+      step "$t  not found (optional)"
+    fi
   done
   step "ddrescue is the one worth having: cp stops at the first I/O error on a"
   step "scratched disc, ddrescue does not, and par2 needs the rest of the bytes"
@@ -794,6 +798,9 @@ cmd_restore() {
   # unsquashfs is run with -f for every image, because discs 2..N extract into a
   # tree disc 1 already populated. Into a live $HOME that silently overwrites
   # current files with the backup's versions, mode and mtime included.
+  # shellcheck disable=SC2012  # ls, not find: this output is only tested for
+  # emptiness and then shown to a person, never parsed back into filenames, and
+  # ls is the one of the two that a busybox rescue system is sure to have.
   if [[ -n "$(ls -A -- "$dest" 2>/dev/null)" ]]; then
     warn "$dest is not empty. unsquashfs -f will OVERWRITE existing files with the backup versions."
     warn "  existing entries: $(ls -A -- "$dest" | head -5 | tr '\n' ' ')..."
@@ -924,7 +931,10 @@ cmd_restore() {
     # non-fatal ones. Treating 2 as failure would abort a restore whose files
     # are all present and correct; treating it as success would hide real
     # trouble. Report it, keep the log, and continue.
-    local ulog="$RESTORE_DIR/unsquashfs.$(basename "$img").log" urc=0
+    # Declared first and assigned after: `local x=$(cmd)` makes the local
+    # builtin's own status the one $? reports, hiding a failure in cmd.
+    local ulog urc=0
+    ulog="$RESTORE_DIR/unsquashfs.$(basename "$img").log"
     unsquashfs "${ua[@]}" >"$ulog" 2>&1 || urc=$?
     if (( urc == 2 )); then
       warn "unsquashfs reported non-fatal errors on $(basename "$img") — see $ulog"

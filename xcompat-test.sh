@@ -473,6 +473,8 @@ manual_restore() {
   ( cd "$w" && sha512sum -c --quiet disc01.squashfs.sha512 ) >&2
 }
 assert0 "the README's manual recipe decrypts and verifies with no brb at all" manual_restore
+# shellcheck disable=SC2016  # $0 is sh -c's own positional parameter, so the
+# single quotes are the point: it must be expanded by the inner shell, not here.
 assert0 "unsquashfs lists the manually decrypted image" \
   sh -c 'unsquashfs -l "$0"/disc01.squashfs >/dev/null 2>&1' "$T/manual"
 
@@ -626,6 +628,7 @@ multi_enough() { (( n_m >= 2 )); }
 assert0 "the multi-disc set spans $n_m discs" multi_enough
 
 if (( n_m >= 2 )); then
+  # shellcheck disable=SC2016  # as above: $0..$3 belong to the inner sh -c.
   assert0 "brb.sh restores the whole multi-disc set" \
     sh -c 'rm -rf "$1"; mkdir -p "$1"; bash "$0" --yes -c "$2" restore "$1" >"$3" 2>&1' \
     "$BRB_SH" "$T/out-m-sh" "$T/cfg/m" "$LOG/restore-m-sh.log"
@@ -673,7 +676,8 @@ head_s "9. ingest, driven on a real terminal"
 # is also the only shape available here: no optical drive, not root.
 if (( HAVE_SCRIPT )); then
   ing_prepare() { # ing_prepare sh|go — a staging area of its own, asserted empty
-    local who=$1 st=$T/ing-$who
+    local who=$1
+    local st=$T/ing-$who
     rm -rf "$st"; mkdir -p "$st/enc"
     mkcfg "$T/cfg/ing-$who" "$st" "$SRC"
     (( $(find "$st/enc" -type f | wc -l) == 0 ))
@@ -692,7 +696,8 @@ if (( HAVE_SCRIPT )); then
   # leave it alone. This is the check that catches a partial copy going sticky:
   # "already have" has to mean "already have a file proven good".
   ingest_is_idempotent() { # ingest_is_idempotent sh|go
-    local who=$1 st=$T/ing-$who before after
+    local who=$1
+    local st=$T/ing-$who before after
     before=$(sha512sum < "$st/enc/disc01.squashfs.age")
     ingest_pty "$who" "$LOG/ingest2-$who.log" || return 1
     grep -qi 'already have' "$LOG/ingest2-$who.log" \
@@ -704,7 +709,8 @@ if (( HAVE_SCRIPT )); then
   # The point of ingest is that what comes off the discs restores. Copying the
   # right file names proves nothing on its own.
   restore_from_ingest() { # restore_from_ingest sh|go
-    local who=$1 dest=$T/out-ing-$who
+    local who=$1
+    local dest=$T/out-ing-$who
     rm -rf "$dest"; mkdir -p "$dest"
     case $who in
       sh) run_sh "$LOG/restore-ing-sh.log" "$T/cfg/ing-sh" restore "$dest" ;;
@@ -786,7 +792,8 @@ if (( HAVE_SCRIPT )); then
   # The cheaper key wins: a plaintext identity sitting beside the rescue key
   # must be the one used, and nothing may ask for a passphrase.
   rescue_is_last_resort() { # rescue_is_last_resort sh|go
-    local who=$1 lf=$LOG/rescue-order-$who.log
+    local who=$1
+    local lf=$LOG/rescue-order-$who.log
     [[ -f "$RKEY/identity.txt" ]] || { echo "fixture lost the plaintext identity" >&2; return 1; }
     brb_pty "$who" "$lf" '' index || return 1
     ! grep -qi 'passphrase' "$lf" \
@@ -802,7 +809,8 @@ if (( HAVE_SCRIPT )); then
   # ...and when it is gone, the rescue key is picked up, unlocked, and decrypts
   # the very same index.
   rescue_unlocks() { # rescue_unlocks sh|go
-    local who=$1 lf=$LOG/rescue-use-$who.log rc=0
+    local who=$1
+    local lf=$LOG/rescue-use-$who.log rc=0
     mv -f "$RKEY/identity.txt" "$RKEY/identity.hidden" || return 1
     brb_pty "$who" "$lf" "$RESCUE_PASS"$'\n' index || rc=$?
     mv -f "$RKEY/identity.hidden" "$RKEY/identity.txt"
@@ -817,7 +825,8 @@ if (( HAVE_SCRIPT )); then
   # One command, one prompt. --only decrypts the index and then the image, so a
   # reader that asked per decryption would ask twice here.
   rescue_asks_once() { # rescue_asks_once sh|go
-    local who=$1 lf=$LOG/rescue-once-$who.log dest=$T/out-rescue-$who rc=0 n
+    local who=$1
+    local lf=$LOG/rescue-once-$who.log dest=$T/out-rescue-$who rc=0 n
     rm -rf "$dest" "$RSTAGE/restore"; mkdir -p "$dest"
     mv -f "$RKEY/identity.txt" "$RKEY/identity.hidden" || return 1
     # No --yes on either side: the Go build refuses to prompt under it, which is
@@ -834,7 +843,8 @@ if (( HAVE_SCRIPT )); then
   # A wrong passphrase must stop the command, not fall through to "no identity"
   # and a confusing failure three steps later.
   rescue_refuses_a_wrong_passphrase() { # sh|go
-    local who=$1 lf=$LOG/rescue-bad-$who.log rc=0
+    local who=$1
+    local lf=$LOG/rescue-bad-$who.log rc=0
     mv -f "$RKEY/identity.txt" "$RKEY/identity.hidden" || return 1
     brb_pty "$who" "$lf" $'not the passphrase\n' index || rc=$?
     mv -f "$RKEY/identity.hidden" "$RKEY/identity.txt"
@@ -1076,7 +1086,8 @@ unset name D
 # symlink, and the whole archive is written there. Written the way it ought to
 # pass, so the day it is fixed this reports XPASS and this comment gets deleted.
 selflink_slash_refused() { # selflink_slash_refused sh|go
-  local who=$1 d=$T/symslash-$who
+  local who=$1
+  local d=$T/symslash-$who
   plant itself "$d" || return 1
   escape_refused "$who" "selfslash-$who" "$d/"
 }
@@ -1172,7 +1183,8 @@ glob_restores() { # glob_restores sh|go
 # damage, the same metacharacter staging, the alternate copy taken away. If this
 # restored too, the repair above would not have been a combination of anything.
 glob_without_the_copy_fails() { # glob_without_the_copy_fails sh|go
-  local who=$1 st="$T/g-nc-$who/$GNAME" dest=$T/g-nc-out-$who
+  local who=$1
+  local st="$T/g-nc-$who/$GNAME" dest=$T/g-nc-out-$who
   rm -rf -- "$T/g-nc-$who" "$dest"; mkdir -p "$T/g-nc-$who" "$dest"
   cp -a "$GREF" "$st" || return 1
   rm -rf -- "$st/restore"
@@ -1265,7 +1277,8 @@ if (( HAVE_SCRIPT )); then
   esc_rows() { grep -E "^[0-9]+$(printf '\t')" "$1" | LC_ALL=C sort; }
 
   terminal_index_is_escaped() { # terminal_index_is_escaped sh|go
-    local who=$1 lf=$LOG/esc-idx-$who.log n
+    local who=$1
+    local lf=$LOG/esc-idx-$who.log n
     esc_pty "$who" "$lf" index || { echo "index exited non-zero on a terminal" >&2; return 1; }
     n=$(raw_ctl_bytes "$lf")
     (( n == 0 )) || { echo "$n raw control byte(s) reached the terminal" >&2; return 1; }
@@ -1278,7 +1291,8 @@ if (( HAVE_SCRIPT )); then
       || { echo "escaping split a row" >&2; return 1; }
   }
   terminal_list_is_escaped() { # terminal_list_is_escaped sh|go
-    local who=$1 lf=$LOG/esc-list-$who.log n
+    local who=$1
+    local lf=$LOG/esc-list-$who.log n
     rm -rf -- "$T/stage-esc/restore"
     esc_pty "$who" "$lf" 'list 1' || { echo "list exited non-zero on a terminal" >&2; return 1; }
     n=$(raw_ctl_bytes "$lf")
