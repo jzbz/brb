@@ -2,12 +2,40 @@ package tools
 
 import (
 	"bytes"
+	"encoding/hex"
+	"math/rand"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
 	"testing"
 )
+
+// randomBytes returns n deterministic pseudo-random bytes.
+//
+// Deterministic so that a failure reproduces; pseudo-random because the par2
+// tests below depend on no two data blocks of a fixture being byte-identical.
+//
+// That is not a stylistic preference. par2 identifies data blocks by hash, so
+// a file whose blocks are all the same bytes gives it no way to tell which
+// position a block it found belongs to. TestPar2CreateVerifyRepair used to
+// build its payload as "recovery data test\n" repeated to 380000 bytes and ask
+// for 40 blocks: 380000/40 is 9500, 9500/19 is exactly 500, and so all forty
+// blocks were identical. par2cmdline 1.2.0 sees through that. 0.8.1 — which is
+// what Debian and Ubuntu ship, and what CI runs — reports "found 40 of 40" on
+// the damaged file, concludes that none of the recovery blocks are needed, and
+// rewrites a file that is still wrong.
+//
+// Nothing brb writes can look like that: the payload is age ciphertext and the
+// sidecars are hex digests. The fixtures were the thing out of step with the
+// data they stand for, so they are generated the way the real thing looks.
+func randomBytes(seed int64, n int) []byte {
+	b := make([]byte, n)
+	if _, err := rand.New(rand.NewSource(seed)).Read(b); err != nil {
+		panic(err) // (*rand.Rand).Read never returns an error
+	}
+	return b
+}
 
 // realSet returns a Set detected from PATH, skipping the test unless every
 // named binary is installed. None of these tests are required to pass on a
@@ -209,7 +237,10 @@ func TestPar2CreateVerifyRepair(t *testing.T) {
 
 	dir := t.TempDir()
 	name := "disc01.squashfs.age"
-	body := bytes.Repeat([]byte("recovery data test\n"), 20000)
+	// 380000 bytes of high-entropy payload, as an encrypted image is. See
+	// randomBytes: a repeated string here divides evenly into the block size
+	// and makes every block identical, which par2cmdline 0.8.1 cannot repair.
+	body := randomBytes(1, 380000)
 	if err := os.WriteFile(filepath.Join(dir, name), body, 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -266,10 +297,15 @@ func TestPar2CreateProtectsSeveralFilesUnderOneSet(t *testing.T) {
 	ctx := t.Context()
 
 	dir := t.TempDir()
+	// Shaped like the real files: 64 random bytes hex-encoded is 128 characters,
+	// which is exactly a SHA-512 digest, and the index is encrypted gzip. The
+	// previous spelling repeated a four-byte group, giving these a period that
+	// divides the par2 block size — the duplicate-block trap randomBytes
+	// describes, which this test only escaped by an accident of block sizing.
 	members := map[string][]byte{
-		"disc01.squashfs.age.sha512": []byte(strings.Repeat("a1b2", 32) + "  disc01.squashfs.age\n"),
-		"disc01.squashfs.sha512":     []byte(strings.Repeat("c3d4", 32) + "  disc01.squashfs\n"),
-		"index.tsv.gz.age":           bytes.Repeat([]byte("encrypted index\n"), 300),
+		"disc01.squashfs.age.sha512": []byte(hex.EncodeToString(randomBytes(2, 64)) + "  disc01.squashfs.age\n"),
+		"disc01.squashfs.sha512":     []byte(hex.EncodeToString(randomBytes(3, 64)) + "  disc01.squashfs\n"),
+		"index.tsv.gz.age":           randomBytes(4, 4800),
 	}
 	names := make([]string, 0, len(members))
 	for name, body := range members {
