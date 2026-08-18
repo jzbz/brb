@@ -45,6 +45,21 @@ type Config struct {
 	AgeRecipientsFile string
 	// AgeIdentity is the age secret key, needed only to restore (AGE_IDENTITY).
 	AgeIdentity string
+	// PublicArchive makes a set that deliberately keeps no secret
+	// (PUBLIC_ARCHIVE). brb mints a keypair for the archive, encrypts to it as
+	// usual, and writes the secret key onto every disc, so the set opens with
+	// nothing but the disc in hand.
+	//
+	// It exists because encryption is a second way to lose an archive: media
+	// that outlives the key is still landfill. For a set meant to be readable
+	// by a stranger in forty years, that risk can outweigh confidentiality.
+	// Nothing else about the format changes — same age container, same par2
+	// over the same ciphertext, same readers.
+	//
+	// The archive keypair is always freshly generated and used for nothing
+	// else. AGE_RECIPIENTS_FILE is not consulted, precisely so that turning
+	// this on can never publish a key that other archives were encrypted to.
+	PublicArchive bool
 	// DiscType selects the media capacity (DISC_TYPE).
 	DiscType disc.Type
 	// DiscCapacityBytes overrides DiscType for unusual media
@@ -361,6 +376,7 @@ func Keys() []string {
 		"PAR2_MEMORY_MB",
 		"PAR2_REDUNDANCY",
 		"PRUNE_DIRS",
+		"PUBLIC_ARCHIVE",
 		"RESERVE_BYTES",
 		"SOURCE_DIR",
 		"STAGING",
@@ -495,6 +511,8 @@ func (c *Config) set(key string, v Value) error {
 		return v.f64(key, &c.PackRatio)
 	case "PACK_RATIO_ADAPT":
 		return v.boolInt(key, &c.PackRatioAdapt)
+	case "PUBLIC_ARCHIVE":
+		return v.boolInt(key, &c.PublicArchive)
 	case "PACK_RATIO_WINDOW":
 		return v.int(key, &c.PackRatioWindow)
 	case "PACK_RATIO_MARGIN":
@@ -667,7 +685,9 @@ func (c *Config) Validate() error {
 	if c.Staging == "" {
 		errs = append(errs, errors.New("STAGING is empty"))
 	}
-	if c.AgeRecipientsFile == "" {
+	// A public archive mints its own keypair and never reads this file, so an
+	// empty setting is only a problem for the ordinary case.
+	if c.AgeRecipientsFile == "" && !c.PublicArchive {
 		errs = append(errs, errors.New("AGE_RECIPIENTS_FILE is empty"))
 	}
 	if c.LabelPrefix == "" {

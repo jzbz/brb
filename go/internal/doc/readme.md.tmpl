@@ -3,7 +3,13 @@
 Created {{.Date}} from `{{.Source}}`.
 Written by brb (Blu-ray Backup) {{.Version}}.
 
-**This disc is self-contained.** It holds a complete, independent SquashFS
+{{if .PublicIdentity}}> **This archive is deliberately NOT confidential.** The key that opens it is
+> on this disc, in `{{.PublicIdentityFile}}`, and printed again in
+> `MANIFEST.txt` and near the bottom of this file. Anyone holding this disc
+> can read it. That was the intent: a key that must survive decades is a
+> second way to lose an archive, and this set was made to outlive its author.
+
+{{end}}**This disc is self-contained.** It holds a complete, independent SquashFS
 filesystem image containing a subset of the backup. You do not need the other
 discs to read this one. If another disc in the set is lost or destroyed, you
 lose only the files that were stored on *that* disc — everything on this one
@@ -21,7 +27,8 @@ files that live on that disc present and the rest absent.
 README.md                  this file
 MANIFEST.txt               the whole set, and the tool versions used
 SHA512SUMS                 hashes of every file here
-{{range .Tools}}{{.Line}}
+{{if .PublicIdentity}}{{.PublicIdentityFile}}               the key to this archive — see the notice above
+{{end}}{{range .Tools}}{{.Line}}
 {{end}}data/
   disc{{.Disc02}}.squashfs.age          the filesystem image, encrypted with age
   disc{{.Disc02}}.squashfs.age.sha512   hash of the encrypted image
@@ -70,9 +77,13 @@ index destroys the whole map of which disc holds what.
 You do **not** need this program, and you do **not** need Python. The final step
 of a restore is a kernel mount.
 
-**You do need the age secret key.** One line beginning `AGE-SECRET-KEY-1...`.
+{{if .PublicIdentity}}**The age secret key is on this disc**, in `{{.PublicIdentityFile}}`. You need
+nothing that did not come in the case with it. Every `-i /path/to/identity.txt`
+below can be `-i /mnt/{{.PublicIdentityFile}}`, or wherever you mounted this disc.
+{{else}}**You do need the age secret key.** One line beginning `AGE-SECRET-KEY-1...`.
 It is not on this disc and never will be. `MANIFEST.txt` lists the public keys
 this archive was encrypted to, so you can tell which of your keys is the one.
+{{end}}
 
 ---
 
@@ -216,7 +227,22 @@ Replace `{{.Disc}}` above with the number of the disc you lost.
 
 ---
 
-## Quick reference
+{{if .PublicIdentity}}## The key to this archive
+
+`{{.PublicIdentityFile}}` on this disc holds the key. If that file is unreadable,
+this is the same key, and so is the one in `MANIFEST.txt`:
+
+```
+{{.PublicIdentity}}
+```
+
+It is 74 characters and carries its own checksum, so a copy retyped by hand is
+either right or rejected outright — `age` will not accept a near miss and
+silently produce rubbish. Save it to a file and use `age -d -i thatfile`.
+
+---
+
+{{end}}## Quick reference
 
 ```sh
 sha512sum -c SHA512SUMS                        # is this disc still good?

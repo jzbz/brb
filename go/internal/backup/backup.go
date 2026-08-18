@@ -195,6 +195,13 @@ type runner struct {
 	recipients []age.Recipient
 	pubkeys    []string
 	identities []age.Identity
+
+	// publicIdentity is the archive's own secret key under PUBLIC_ARCHIVE, and
+	// nil otherwise. It is minted in preflight and written onto every disc as
+	// identity.txt; see mintPublicIdentity. Its presence is what the manifest
+	// and the on-disc README key their public-archive wording off, so that a
+	// set can never say it carries its key without actually carrying it.
+	publicIdentity *age.X25519Identity
 }
 
 // newRunner validates the options common to Plan and Run.

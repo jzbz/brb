@@ -202,15 +202,22 @@ func dispatch(ctx context.Context, g globals, cfg *config.Config, cfgPath string
 		return err
 
 	case "backup":
-		var resume, roundTrip bool
+		var resume, roundTrip, public bool
 		f := newFlags("backup")
 		f.Bool(&resume, "--resume")
 		f.Bool(&roundTrip, "--verify-roundtrip")
+		f.Bool(&public, "--public-archive")
 		if err := f.parse(g.args); err != nil {
 			return err
 		}
-		if err := f.need(0, 0, "backup [--resume] [--verify-roundtrip]"); err != nil {
+		if err := f.need(0, 0,
+			"backup [--resume] [--verify-roundtrip] [--public-archive]"); err != nil {
 			return err
+		}
+		// The flag turns it on; the config file can too. Neither can turn the
+		// other off, so a set is public only if something said so explicitly.
+		if public {
+			cfg.PublicArchive = true
 		}
 		return backup.Run(ctx, backup.Options{
 			Cfg:             cfg,

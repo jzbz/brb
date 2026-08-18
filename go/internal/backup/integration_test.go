@@ -19,6 +19,7 @@ import (
 
 	"github.com/jzbz/brb/internal/agecrypt"
 	"github.com/jzbz/brb/internal/config"
+	"github.com/jzbz/brb/internal/doc"
 	"github.com/jzbz/brb/internal/iso"
 	"github.com/jzbz/brb/internal/tools"
 	"github.com/jzbz/brb/internal/ui"
@@ -1133,4 +1134,140 @@ func TestResumeOverStaleRecoveryData(t *testing.T) {
 	if got := readIndex(t, ctx, cfg); len(got) != len(index) {
 		t.Errorf("after resuming the index has %d line(s), want %d", len(got), len(index))
 	}
+}
+
+// TestRunPublicArchive covers PUBLIC_ARCHIVE end to end: the set is encrypted
+// to a keypair minted for it alone, that key is written onto every disc, and
+// the images decrypt with nothing but what the disc carries.
+//
+// The point of the mode is that the archive keeps no secret, so the assertions
+// are about the key being present and usable rather than protected.
+func TestRunPublicArchive(t *testing.T) {
+	ctx := context.Background()
+	set := realTools(t, ctx)
+	noSystemDist(t)
+
+	cfg := integrationConfig(t, 4, 4<<20)
+	enoughSpace(t, cfg)
+	cfg.PackRatio = 1.05
+	cfg.PublicArchive = true
+	// Deliberately not keysFor(t, cfg): a public archive must not need a
+	// recipients file to exist, and must not read one if it does.
+	cfg.AgeRecipientsFile = filepath.Join(t.TempDir(), "no-such-recipients.txt")
+
+	var log bytes.Buffer
+	p := ui.New(&log, false)
+	p.SetAssumeYes(true)
+	if err := Run(ctx, Options{Cfg: cfg, UI: p, Tools: set}); err != nil {
+		t.Fatalf("Run: %v\n%s", err, log.String())
+	}
+	if _, err := os.Lstat(cfg.AgeRecipientsFile); err == nil {
+		t.Error("the run created a recipients file; a public archive must not need one")
+	}
+	if !strings.Contains(log.String(), "NOT be confidential") {
+		t.Errorf("the run did not warn that the set is not confidential:\n%s", log.String())
+	}
+
+	dirs := cfg.Dirs()
+	total := discCount(t, dirs.Discs)
+	if total < 1 {
+		t.Fatalf("no discs were produced")
+	}
+
+	var first string
+	for n := 1; n <= total; n++ {
+		dd := filepath.Join(dirs.Discs, discDirName(n))
+		key := filepath.Join(dd, doc.PublicIdentityName)
+		st, err := os.Stat(key)
+		if err != nil {
+			t.Fatalf("disc %d carries no %s: %v", n, doc.PublicIdentityName, err)
+		}
+		// World-readable on purpose: 0400 would imply a confidentiality this
+		// file does not have, and it is about to be pressed onto a disc.
+		if got := st.Mode().Perm(); got != 0o644 {
+			t.Errorf("disc %d: %s has mode %04o, want 0644", n, doc.PublicIdentityName, got)
+		}
+		if n == 1 {
+			first = dd
+		}
+	}
+
+	// The same key must appear in all three places, so that one of them
+	// rotting does not cost the reader the archive.
+	keyRe := regexp.MustCompile(`AGE-SECRET-KEY-1[A-Z0-9]{20,}`)
+	fromFile := keyRe.FindString(readFileString(t, filepath.Join(first, doc.PublicIdentityName)))
+	if fromFile == "" {
+		t.Fatal("no secret key in the on-disc identity file")
+	}
+	for _, name := range []string{"MANIFEST.txt", "README.md"} {
+		if got := keyRe.FindString(readFileString(t, filepath.Join(first, name))); got != fromFile {
+			t.Errorf("%s carries key %q, want the same one as %s (%q)",
+				name, got, doc.PublicIdentityName, fromFile)
+		}
+	}
+
+	// And the README must not still tell the reader the key is elsewhere.
+	readme := readFileString(t, filepath.Join(first, "README.md"))
+	if strings.Contains(readme, "never will be") {
+		t.Error("the public README still claims the key is not on the disc")
+	}
+
+	// The whole point: decrypt using only the disc's own key.
+	ids, err := agecrypt.ParseIdentityFile(filepath.Join(first, doc.PublicIdentityName))
+	if err != nil {
+		t.Fatalf("the on-disc identity does not parse: %v", err)
+	}
+	img := filepath.Join(first, "data", imageName(1)+".age")
+	out := filepath.Join(t.TempDir(), "disc01.squashfs")
+	if _, err := agecrypt.Decrypt(ctx, img, out, ids, nil); err != nil {
+		t.Fatalf("decrypting with the disc's own key: %v", err)
+	}
+}
+
+// TestRunOrdinaryArchivePublishesNoKey is the other half of the public-archive
+// contract: with the mode off, nothing about a set changes. Without this, the
+// assertions above could be satisfied by code that published a key always.
+func TestRunOrdinaryArchivePublishesNoKey(t *testing.T) {
+	ctx := context.Background()
+	set := realTools(t, ctx)
+	noSystemDist(t)
+
+	cfg := integrationConfig(t, 4, 4<<20)
+	keysFor(t, cfg)
+	enoughSpace(t, cfg)
+	cfg.PackRatio = 1.05
+	if cfg.PublicArchive {
+		t.Fatal("PublicArchive defaults to true; it must be opt-in")
+	}
+
+	var log bytes.Buffer
+	p := ui.New(&log, false)
+	p.SetAssumeYes(true)
+	if err := Run(ctx, Options{Cfg: cfg, UI: p, Tools: set}); err != nil {
+		t.Fatalf("Run: %v\n%s", err, log.String())
+	}
+
+	dirs := cfg.Dirs()
+	keyRe := regexp.MustCompile(`AGE-SECRET-KEY-1[A-Z0-9]{20,}`)
+	for n := 1; n <= discCount(t, dirs.Discs); n++ {
+		dd := filepath.Join(dirs.Discs, discDirName(n))
+		if _, err := os.Lstat(filepath.Join(dd, doc.PublicIdentityName)); err == nil {
+			t.Errorf("disc %d carries %s but PUBLIC_ARCHIVE was off", n, doc.PublicIdentityName)
+		}
+		for _, name := range []string{"MANIFEST.txt", "README.md"} {
+			if got := keyRe.FindString(readFileString(t, filepath.Join(dd, name))); got != "" {
+				t.Errorf("disc %d: %s leaks a secret key (%q)", n, name, got)
+			}
+		}
+	}
+}
+
+// readFileString reads a file the test cannot proceed without.
+func readFileString(t *testing.T, path string) string {
+	t.Helper()
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("reading %s: %v", path, err)
+	}
+	return string(b)
 }

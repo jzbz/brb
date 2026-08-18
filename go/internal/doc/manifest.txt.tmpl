@@ -27,7 +27,23 @@ age recipients (public keys — harmless on their own)
 {{range .Recipients}}  {{.}}
 {{else}}  (none recorded — this set cannot be decrypted without the key that made it)
 {{end}}
-disc contents
+{{if .PublicIdentity}}THIS SET IS PUBLIC — IT KEEPS NO SECRET
+----------------------------------------
+  The key below opens every disc in this set, and it is ON every disc, in
+  identity.txt beside this file. Anyone holding one disc can read the whole
+  archive. That is deliberate. This set was made to outlive the person who
+  made it, and a key that has to survive for decades is a second way to lose
+  an archive: media that outlasts its key is still landfill.
+
+  It was generated for this archive alone and is used for nothing else.
+
+  secret key: {{.PublicIdentity}}
+
+  This is one of three copies on the disc — identity.txt, here, and README.md
+  — so that one of them rotting does not end the archive. Any copy works:
+  save the line above to a file and pass it to `age -d -i`.
+
+{{end}}disc contents
 -------------
 {{range .Discs}}  disc {{printf "%02d" .Number}} of {{printf "%02d" $.Total}}
 {{range .Files}}      {{.Name}}  ({{.Size}} bytes)

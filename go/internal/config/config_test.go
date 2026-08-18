@@ -215,6 +215,7 @@ func TestApplyAllKeys(t *testing.T) {
 		"BLOCK_SIZE":          {Scalar: "128K", Line: 10},
 		"PACK_RATIO":          {Scalar: "0.65", Line: 11},
 		"PACK_RATIO_ADAPT":    {Scalar: "0", Line: 26},
+		"PUBLIC_ARCHIVE":      {Scalar: "0", Line: 27},
 		"PACK_RATIO_WINDOW":   {Scalar: "5", Line: 27},
 		"PACK_RATIO_MARGIN":   {Scalar: "1.20", Line: 28},
 		"PAR2_REDUNDANCY":     {Scalar: "5", Line: 12},

@@ -95,7 +95,23 @@ func GenerateIdentity() (*age.X25519Identity, error) {
 // WriteIdentityFile writes id to path in the format age-keygen produces: a
 // "# created:" comment, a "# public key:" comment, then the secret key. The
 // file is created with mode 0400 and an existing file is never overwritten.
-func WriteIdentityFile(path string, id *age.X25519Identity) (err error) {
+func WriteIdentityFile(path string, id *age.X25519Identity) error {
+	return writeIdentityFile(path, id, 0o400)
+}
+
+// WritePublicIdentityFile is WriteIdentityFile with a world-readable mode, for
+// the one case where a secret key is meant to be read by strangers: the
+// published identity of a public archive, which brb writes onto every disc so
+// the set can be opened with nothing but the disc itself.
+//
+// The mode is the whole difference, and it is deliberate. 0400 on a key that is
+// about to be pressed onto read-only optical media and handed to whoever finds
+// it would imply a confidentiality this file does not have.
+func WritePublicIdentityFile(path string, id *age.X25519Identity) error {
+	return writeIdentityFile(path, id, 0o644)
+}
+
+func writeIdentityFile(path string, id *age.X25519Identity, mode os.FileMode) (err error) {
 	if id == nil {
 		return errors.New("agecrypt: nil identity")
 	}
@@ -104,7 +120,7 @@ func WriteIdentityFile(path string, id *age.X25519Identity) (err error) {
 			return fmt.Errorf("agecrypt: create key directory: %w", err)
 		}
 	}
-	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o400)
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, mode)
 	if err != nil {
 		return fmt.Errorf("agecrypt: create identity file %s: %w", path, err)
 	}
@@ -127,7 +143,7 @@ func WriteIdentityFile(path string, id *age.X25519Identity) (err error) {
 		return fmt.Errorf("agecrypt: sync identity file %s: %w", path, err)
 	}
 	// The mode passed to OpenFile is masked by the umask; force it.
-	if err := os.Chmod(path, 0o400); err != nil {
+	if err := os.Chmod(path, mode); err != nil {
 		return fmt.Errorf("agecrypt: chmod identity file %s: %w", path, err)
 	}
 	return nil

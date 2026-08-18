@@ -501,6 +501,12 @@ func (r *runner) buildDiscDirs(ctx context.Context, total int) error {
 		// and long before writeSums, so SHA512SUMS covers it.
 		r.protectSidecars(ctx, n, data)
 
+		// Likewise before writeSums, so the published key is hashed with
+		// everything else rather than sitting on the disc unaccounted for.
+		if err := r.writePublicIdentity(n); err != nil {
+			return err
+		}
+
 		size, err := dirBytes(ctx, data)
 		if err != nil {
 			return err
@@ -511,6 +517,45 @@ func (r *runner) buildDiscDirs(ctx context.Context, total int) error {
 		}
 	}
 	r.p.OK("%d disc directory(ies)", total)
+	return nil
+}
+
+// The published key lives at the disc root rather than in data/, which is
+// where both readers' find_identity looks and where each README's restore
+// recipe points, so it needs no special handling on the way back in.
+//
+// Being outside data/ also means it is not a member of sidecars.par2 — par2
+// will not take a path above its own working directory. It is protected
+// instead by being written three times per disc: as doc.PublicIdentityName,
+// in MANIFEST.txt and in README.md. An age secret key is 74 bech32 characters
+// with a checksum, so a surviving copy can be retyped and verified even if the
+// other two rot.
+
+// publicIdentityText is the archive's secret key as a string under
+// PUBLIC_ARCHIVE, and "" otherwise. Every public-archive passage in the
+// manifest and the on-disc READMEs is conditioned on it, so those documents
+// cannot describe a published key for a set that does not carry one.
+func (r *runner) publicIdentityText() string {
+	if r.publicIdentity == nil {
+		return ""
+	}
+	return r.publicIdentity.String()
+}
+
+// writePublicIdentity puts the archive's secret key on disc n. It is a no-op
+// unless PUBLIC_ARCHIVE minted one.
+func (r *runner) writePublicIdentity(n int) error {
+	if r.publicIdentity == nil {
+		return nil
+	}
+	path := filepath.Join(r.dirs.Discs, discDirName(n), doc.PublicIdentityName)
+	// A resumed run reaches discs an earlier run already laid out.
+	if _, err := os.Lstat(path); err == nil {
+		return nil
+	}
+	if err := agecrypt.WritePublicIdentityFile(path, r.publicIdentity); err != nil {
+		return fmt.Errorf("backup: disc %d: %w", n, err)
+	}
 	return nil
 }
 
@@ -626,22 +671,23 @@ func (r *runner) writeManifest(ctx context.Context, total int) error {
 		host = "unknown"
 	}
 	text := doc.RenderManifest(doc.ManifestData{
-		Archive:      r.cfg.ArchiveName,
-		Created:      r.started.Format(time.RFC3339),
-		Host:         host,
-		Source:       r.cfg.SourceDir,
-		Total:        total,
-		DiscType:     r.cfg.DiscType.String(),
-		Compression:  r.cfg.Compression,
-		Level:        r.cfg.CompressionLevel,
-		BlockSize:    r.cfg.BlockSize,
-		Redundancy:   r.cfg.Par2Redundancy,
-		Version:      Version,
-		ToolVersions: r.toolVersions(),
-		Recipients:   r.pubkeys,
-		DiscFiles:    discFiles,
-		PruneDirs:    r.cfg.PruneDirs,
-		ExcludeMasks: r.cfg.ExcludeMasks,
+		Archive:        r.cfg.ArchiveName,
+		Created:        r.started.Format(time.RFC3339),
+		Host:           host,
+		Source:         r.cfg.SourceDir,
+		Total:          total,
+		DiscType:       r.cfg.DiscType.String(),
+		Compression:    r.cfg.Compression,
+		Level:          r.cfg.CompressionLevel,
+		BlockSize:      r.cfg.BlockSize,
+		Redundancy:     r.cfg.Par2Redundancy,
+		Version:        Version,
+		ToolVersions:   r.toolVersions(),
+		Recipients:     r.pubkeys,
+		PublicIdentity: r.publicIdentityText(),
+		DiscFiles:      discFiles,
+		PruneDirs:      r.cfg.PruneDirs,
+		ExcludeMasks:   r.cfg.ExcludeMasks,
 	})
 
 	mf := filepath.Join(r.cfg.Staging, "MANIFEST.txt")
@@ -692,6 +738,7 @@ func (r *runner) writeReadmes(ctx context.Context, total int) error {
 			SidecarRedundancy: SidecarRedundancy,
 			Version:           Version,
 			Tools:             discToolArtifacts(dd),
+			PublicIdentity:    r.publicIdentityText(),
 		})
 		if err := os.WriteFile(filepath.Join(dd, "README.md"), []byte(text), 0o644); err != nil {
 			return fmt.Errorf("backup: writing %s/README.md: %w", dd, err)

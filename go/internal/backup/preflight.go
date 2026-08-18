@@ -10,6 +10,8 @@ import (
 	"path/filepath"
 	"strings"
 
+	"filippo.io/age"
+
 	"github.com/jzbz/brb/internal/agecrypt"
 	"github.com/jzbz/brb/internal/config"
 	"github.com/jzbz/brb/internal/tools"
@@ -94,7 +96,12 @@ func (r *runner) requireTools(ctx context.Context) error {
 }
 
 // loadRecipients reads the age public keys every image will be encrypted to.
+//
+// Under PUBLIC_ARCHIVE it does not read them at all; see mintPublicIdentity.
 func (r *runner) loadRecipients() error {
+	if r.cfg.PublicArchive {
+		return r.mintPublicIdentity()
+	}
 	path := r.cfg.AgeRecipientsFile
 	recs, err := agecrypt.ParseRecipientsFile(path)
 	if err != nil {
@@ -109,6 +116,36 @@ func (r *runner) loadRecipients() error {
 	}
 	r.recipients, r.pubkeys = recs, keys
 	r.p.OK("recipients: %d key(s) from %s", len(recs), path)
+	return nil
+}
+
+// mintPublicIdentity generates the keypair a public archive is encrypted to and
+// keeps the secret half on the runner, for writeDiscDirs to put on every disc.
+//
+// The key is generated here and used for this one archive. AGE_RECIPIENTS_FILE
+// is deliberately not consulted, and neither is AGE_IDENTITY: publishing a key
+// the operator already uses would retroactively expose every other set
+// encrypted to it, turning one flag into a disclosure of unrelated backups.
+// A fresh key can only ever disclose the archive it was made for.
+//
+// Encrypting to a key that is then shipped in the clear is, in cryptographic
+// terms, no encryption at all. That is the intent — the ciphertext, par2 layout
+// and both readers stay exactly as they are, so a public set is an ordinary set
+// that happens to carry its own key, rather than a second on-disc format.
+func (r *runner) mintPublicIdentity() error {
+	id, err := agecrypt.GenerateIdentity()
+	if err != nil {
+		return fmt.Errorf("backup: public archive: %w", err)
+	}
+	r.publicIdentity = id
+	r.recipients = []age.Recipient{id.Recipient()}
+	r.pubkeys = []string{id.Recipient().String()}
+
+	r.p.Warn("PUBLIC_ARCHIVE: this set will NOT be confidential")
+	r.p.Step("a keypair was generated for this archive alone, and its secret key")
+	r.p.Step("is written to identity.txt on every disc, so anyone holding a disc")
+	r.p.Step("can read it. Nothing here protects the contents.")
+	r.p.Step("public key: %s", id.Recipient())
 	return nil
 }
 

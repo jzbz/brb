@@ -54,7 +54,23 @@ type DiscData struct {
 	// nothing at all. Empty is fine and means the disc carries no copy of the
 	// tool; the manual restore recipe never needed one.
 	Tools []string
+	// PublicIdentity is the archive's secret key, verbatim, when the set was
+	// made with PUBLIC_ARCHIVE — and empty otherwise, which is what every
+	// public-archive passage in the README is conditioned on.
+	//
+	// Writing a secret key into a document is the point rather than an
+	// oversight: the same key is in identity.txt beside this file, and a
+	// second legible copy is what lets a restorer recover from the first one
+	// rotting. It is only ever set for archives that are deliberately not
+	// confidential.
+	PublicIdentity string
 }
+
+// PublicIdentityName is the file a public archive's secret key is written to,
+// at the root of every disc. It lives here, with the other on-disc format
+// facts, because both the README that points a restorer at it and the backup
+// code that writes it have to agree on the name.
+const PublicIdentityName = "identity.txt"
 
 // FileEntry is one file in a disc's data/ directory, as listed by the manifest.
 type FileEntry struct {
@@ -94,6 +110,10 @@ type ManifestData struct {
 	ToolVersions []string
 	// Recipients holds the age public keys the images were encrypted to.
 	Recipients []string
+	// PublicIdentity is the archive's secret key when the set was made with
+	// PUBLIC_ARCHIVE, else "". See DiscData.PublicIdentity: the manifest holds
+	// a second legible copy of the key on purpose.
+	PublicIdentity string
 	// DiscFiles maps a 1-based disc number to the files in that disc's
 	// data/ directory.
 	DiscFiles map[int][]FileEntry
@@ -131,6 +151,13 @@ type readmeView struct {
 	// Run is the artifact the worked examples invoke, else "". The portable
 	// script is preferred over a binary that only runs on one architecture.
 	Run string
+
+	// PublicIdentity is the archive's secret key when the set is a public
+	// archive, else "". Every public-archive passage in the template is
+	// guarded on it, so an ordinary set renders exactly as it did before.
+	PublicIdentity string
+	// PublicIdentityFile is the name that key is stored under on the disc.
+	PublicIdentityFile string
 }
 
 // toolFile is one copy of brb on a disc, as the README renders it.
@@ -308,6 +335,10 @@ func RenderDiscREADME(d DiscData) string {
 	v.Redundancy = d.Redundancy
 	v.SidecarRedundancy = d.SidecarRedundancy
 	v.Version = d.Version
+	v.PublicIdentity = d.PublicIdentity
+	if d.PublicIdentity != "" {
+		v.PublicIdentityFile = PublicIdentityName
+	}
 	return render("readme", v)
 }
 

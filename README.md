@@ -791,6 +791,54 @@ to its own passphrase, or on the media it unlocks, is one secret, not two.
 `brb doctor` reports whether a rescue key is present, and which identity a
 restore on this machine would use.
 
+### A public archive, with no secret at all
+
+```bash
+brb backup --public-archive
+```
+
+Encryption is a second way to lose an archive. Media that outlives its key is
+still landfill, and for a set meant to be mounted by a stranger in forty years —
+a family photo archive, a public record, anything where there is nobody left to
+ask for the key — that risk can outweigh confidentiality entirely.
+
+`--public-archive` (or `PUBLIC_ARCHIVE=1`) makes a set that **keeps no secret**.
+brb mints a keypair for that archive, encrypts to it exactly as usual, and
+writes the secret key onto every disc as `identity.txt`. The set opens with
+nothing but the disc in hand:
+
+```bash
+age -d -i /mnt/identity.txt -o disc01.squashfs /mnt/data/disc01.squashfs.age
+```
+
+Two things are worth being explicit about.
+
+**It is not encryption.** Shipping the key alongside the ciphertext is, in
+cryptographic terms, no protection at all, and that is the intent. What it buys
+is that nothing else about the format changes: same age container, same par2
+over the same ciphertext, same `SHA512SUMS`, same two readers. A public set is
+an ordinary set that happens to carry its own key, not a second on-disc format —
+which is why it costs no new code on the restore side and no new way for a
+restore to go wrong.
+
+**The key is always freshly generated.** `AGE_RECIPIENTS_FILE` is not consulted
+and neither is `AGE_IDENTITY`, deliberately: publishing a key you already use
+would retroactively expose every other archive encrypted to it. One flag must
+never be able to disclose unrelated backups, so the published key belongs to
+that one archive and to nothing else.
+
+The key is written three times per disc — `identity.txt`, `MANIFEST.txt` and
+`README.md` — because it is not in `sidecars.par2` (par2 will not reach above
+its own working directory, and the key sits at the disc root where both readers
+look for it). An age secret key is 74 bech32 characters with a checksum, so if
+one copy rots another can be retyped and will be either accepted or rejected
+outright, never silently wrong.
+
+Each disc's README says plainly, at the top, that the archive is not
+confidential. An ordinary set is completely unaffected: no `identity.txt`, no
+key in its documents, and its README still says the key is not on the disc and
+never will be.
+
 ---
 
 ## Security notes
