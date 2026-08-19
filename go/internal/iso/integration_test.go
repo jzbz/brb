@@ -257,3 +257,54 @@ func TestEnsureBuildsOnlyWhatIsMissing(t *testing.T) {
 		t.Error("Ensure accepted a zero-length ISO")
 	}
 }
+
+// TestEnsureRebuildsATruncatedISO is the power-loss case: xorriso died part-way
+// through and left a file that is non-empty but shorter than the disc directory
+// it was made from. Such a file passes every "is it there" test, and Ensure
+// used to hand it straight to the burner. It must be rebuilt instead, to the
+// same bound BuildOne holds a fresh image to.
+func TestEnsureRebuildsATruncatedISO(t *testing.T) {
+	ctx := context.Background()
+	o := testOptions(t)
+	needXorriso(t, o)
+	stageDiscs(t, o, 1)
+
+	path, err := o.Ensure(ctx, 1, 1)
+	if err != nil {
+		t.Fatalf("Ensure: %v", err)
+	}
+	whole, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	srcSize, err := fsx.DirBytes(ctx, o.sourceDir(1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Cut it to well under the tree it was built from: the payload alone is
+	// 64 KiB, so 4 KiB of ISO cannot be complete.
+	if err := os.Truncate(path, 4096); err != nil {
+		t.Fatal(err)
+	}
+
+	var log bytes.Buffer
+	o.UI = ui.New(&log, false)
+	again, err := o.Ensure(ctx, 1, 1)
+	if err != nil {
+		t.Fatalf("Ensure over a truncated ISO: %v", err)
+	}
+	rebuilt, err := os.Stat(again)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rebuilt.Size() < srcSize {
+		t.Fatalf("Ensure returned a %d-byte ISO for a %d-byte disc directory: the truncated file was "+
+			"handed back instead of rebuilt", rebuilt.Size(), srcSize)
+	}
+	if rebuilt.Size() != whole.Size() {
+		t.Errorf("rebuilt ISO is %d bytes, the original was %d", rebuilt.Size(), whole.Size())
+	}
+	if !strings.Contains(log.String(), "truncated") {
+		t.Errorf("the rebuild was not explained to the operator:\n%s", log.String())
+	}
+}

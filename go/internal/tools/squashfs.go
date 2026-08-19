@@ -22,6 +22,15 @@ import (
 // nowhere else: brb.sh's img="$(build_one_image ...)" captured the tool's
 // chatter into what it then treated as a path, and that must never happen here.
 // A partial image is removed when the build fails or the context is cancelled.
+//
+// The exit status is not the whole verdict. mksquashfs exits 0 on a source
+// file it cannot open — it prints "Failed to read file X, creating empty file"
+// and writes a zero-byte X into the image — so a build that "succeeded" can be
+// missing data with nothing downstream able to tell: every hash is taken over
+// the image as written. The scan refuses unreadable files before they get
+// here; this watches the tool's own output for that message, so a file that
+// became unreadable between the scan and the build fails the build instead of
+// being backed up as nothing.
 func (s *Set) BuildImage(ctx context.Context, o MkOptions) error {
 	path, err := s.bin(Mksquashfs)
 	if err != nil {
@@ -56,12 +65,13 @@ func (s *Set) BuildImage(ctx context.Context, o MkOptions) error {
 	}()
 
 	files := o.Files
+	watch := &readFailureWatch{out: o.Log}
 	err = run(ctx, runSpec{
 		name: Mksquashfs,
 		path: path,
 		args: MksquashfsArgs(o),
 		dir:  o.SourceDir,
-		log:  o.Log,
+		log:  watch,
 		stdin: func(w io.Writer) error {
 			bw := bufio.NewWriterSize(w, 128<<10)
 			for _, f := range files {
@@ -78,6 +88,10 @@ func (s *Set) BuildImage(ctx context.Context, o MkOptions) error {
 	if err != nil {
 		return err
 	}
+	watch.flush()
+	if failed := watch.failed(); len(failed) > 0 {
+		return readFailureError(failed)
+	}
 
 	st, err := os.Stat(o.Out)
 	if err != nil {
@@ -88,6 +102,111 @@ func (s *Set) BuildImage(ctx context.Context, o MkOptions) error {
 	}
 	done = true
 	return nil
+}
+
+// readFailurePrefix and readFailureSuffix frame the message mksquashfs prints
+// when it cannot read a source file and substitutes an empty one — verbatim
+// from mksquashfs.c, where it has read "Failed to read file %s, creating empty
+// file" for as long as -cpiostyle0 has existed. The file name sits between the
+// two, unquoted, so a name holding a comma is still recovered whole: the
+// suffix is matched at the end of the line, not at the first comma.
+const (
+	readFailurePrefix = "Failed to read file "
+	readFailureSuffix = ", creating empty file"
+)
+
+// MksquashfsReadFailure recognises the line mksquashfs prints when it has
+// silently replaced a source file with an empty one, and returns the file's
+// name as the tool printed it. It is exported so the recogniser is testable
+// against a captured line without running mksquashfs.
+//
+// Two shapes are accepted. The complete message yields the name between its
+// two fixed halves. A line that merely begins with the prefix, or ends with
+// the suffix, is also a failure — a future mksquashfs may reword one half, and
+// a build that continued past an unreadable file is a build with a hole in it
+// whichever way it was phrased — but the name is then the best-effort remainder
+// of the line rather than an exact extraction.
+func MksquashfsReadFailure(line string) (file string, ok bool) {
+	line = strings.TrimRight(line, "\r\n")
+	hasPrefix := strings.HasPrefix(line, readFailurePrefix)
+	hasSuffix := strings.HasSuffix(line, readFailureSuffix)
+	switch {
+	case hasPrefix && hasSuffix && len(line) >= len(readFailurePrefix)+len(readFailureSuffix):
+		return line[len(readFailurePrefix) : len(line)-len(readFailureSuffix)], true
+	case hasPrefix:
+		return strings.TrimSpace(strings.TrimPrefix(line, readFailurePrefix)), true
+	case hasSuffix:
+		return strings.TrimSpace(strings.TrimSuffix(line, readFailureSuffix)), true
+	}
+	return "", false
+}
+
+// readFailureWatch sits between run's line splitter and the caller's log:
+// every line is forwarded to out untouched, and the ones that announce a
+// silently-emptied file are collected. It does its own line splitting rather
+// than trusting each Write to be one line, so it stays correct if the writer
+// upstream ever changes how it batches.
+type readFailureWatch struct {
+	out   io.Writer
+	part  []byte
+	files []string
+}
+
+// Write implements io.Writer. It never reports an error: losing a log line
+// must not fail a build — but a line it did see and recognise is never lost,
+// which is the one property BuildImage relies on.
+func (w *readFailureWatch) Write(p []byte) (int, error) {
+	if w.out != nil {
+		_, _ = w.out.Write(p)
+	}
+	w.part = append(w.part, p...)
+	for {
+		i := bytes.IndexByte(w.part, '\n')
+		if i < 0 {
+			break
+		}
+		w.check(string(w.part[:i]))
+		w.part = w.part[i+1:]
+	}
+	return len(p), nil
+}
+
+// flush examines a trailing line that never got its newline.
+func (w *readFailureWatch) flush() {
+	if len(w.part) > 0 {
+		w.check(string(w.part))
+		w.part = w.part[:0]
+	}
+}
+
+func (w *readFailureWatch) check(line string) {
+	if f, ok := MksquashfsReadFailure(line); ok {
+		w.files = append(w.files, f)
+	}
+}
+
+// failed returns the files mksquashfs reported it could not read.
+func (w *readFailureWatch) failed() []string { return w.files }
+
+// readFailureError names every file mksquashfs emptied and says what to do:
+// the scan already refuses unreadable files, so reaching here means a file
+// changed between the scan and the build, and the honest fix is to make it
+// readable or exclude it and run again — never to keep an image with holes.
+func readFailureError(files []string) error {
+	var b strings.Builder
+	fmt.Fprintf(&b, "mksquashfs could not read %d source file(s) and wrote EMPTY files in their place; "+
+		"the image was discarded because it would have been missing data while every hash still passed:",
+		len(files))
+	for i, f := range files {
+		if i == 20 {
+			fmt.Fprintf(&b, "\n  ... and %d more", len(files)-20)
+			break
+		}
+		fmt.Fprintf(&b, "\n  %s", f)
+	}
+	b.WriteString("\n  make them readable (or exclude them via EXCLUDE_MASKS / PRUNE_DIRS) and re-run; " +
+		"the scan checks readability up front, so these became unreadable after it ran")
+	return errors.New(b.String())
 }
 
 // ImageStats returns the superblock summary printed by "unsquashfs -s". It is

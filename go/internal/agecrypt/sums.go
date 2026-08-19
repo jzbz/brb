@@ -208,9 +208,26 @@ func knownSum(known map[string]KnownSum, name, path string) (string, error) {
 	return k.Digest, nil
 }
 
+// partSuffix marks a file this package is in the middle of writing: every
+// stream lands in "<name>.part" and is renamed into place once complete. See
+// createPart.
+const partSuffix = ".part"
+
 // sumCandidates returns the slash-separated "./name" paths of every regular
-// file below dir, excluding any file named SHA512SUMS. Symlinks, directories
-// and other non-regular entries are skipped, matching find -type f.
+// file below dir, excluding any file named SHA512SUMS and any file whose name
+// ends in ".part". Symlinks, directories and other non-regular entries are
+// skipped, matching find -type f.
+//
+// The ".part" exclusion is what keeps a disc verifiable after a crash. A run
+// killed inside writeSums leaves "SHA512SUMS.part" beside the files it was
+// hashing; the resumed run then hashed that remnant into the new SHA512SUMS as
+// a phantom "./SHA512SUMS.part" entry, and the rename that installs the new
+// sums file takes the .part name away — so the disc carried a checksum line
+// for a file that is not on it, and every verify of it failed forever. Nothing
+// legitimate on a disc ends in .part: it is this package's own in-progress
+// marker, so any such file anywhere under the disc directory is either the
+// remains of an interrupted write or about to be renamed away, and in neither
+// case is it a file to attest.
 func sumCandidates(ctx context.Context, dir string) ([]string, error) {
 	var names []string
 	err := filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
@@ -220,7 +237,7 @@ func sumCandidates(ctx context.Context, dir string) ([]string, error) {
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return ctxErr
 		}
-		if d.Name() == SumsName && !d.IsDir() {
+		if !d.IsDir() && (d.Name() == SumsName || strings.HasSuffix(d.Name(), partSuffix)) {
 			return nil
 		}
 		if !d.Type().IsRegular() {

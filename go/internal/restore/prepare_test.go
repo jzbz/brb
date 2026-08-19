@@ -177,24 +177,84 @@ func TestPrepareImageHashGood(t *testing.T) {
 	}
 }
 
+// A plaintext already in the restore directory is reused only after it has
+// been hashed against the recorded plaintext hash. Here it matches, so it is
+// reused: the ciphertext is deleted first to prove nothing was decrypted.
 func TestPrepareImageReusesAnAlreadyDecryptedImage(t *testing.T) {
 	e := newEnv(t)
-	enc, _ := e.writeImage(1, []byte("payload"))
+	payload := []byte("payload")
+	enc, _ := e.writeImage(1, payload)
 
 	plain := filepath.Join(e.cfg.Dirs().Restore, "disc01.squashfs")
-	if err := os.WriteFile(plain, []byte("already here"), 0o600); err != nil {
+	if err := os.WriteFile(plain, payload, 0o600); err != nil {
 		t.Fatalf("seed plaintext: %v", err)
+	}
+	if err := os.Remove(enc); err != nil {
+		t.Fatal(err)
 	}
 	got, err := PrepareImage(context.Background(), e.opts(), enc)
 	if err != nil {
-		t.Fatalf("PrepareImage: %v", err)
+		t.Fatalf("PrepareImage: %v\n%s", err, e.log())
 	}
 	if got != plain {
 		t.Fatalf("path = %q, want %q", got, plain)
 	}
-	body, _ := os.ReadFile(plain)
-	if string(body) != "already here" {
-		t.Fatalf("existing image was rewritten: %q", body)
+	for _, want := range []string{"verifying the decrypted disc01.squashfs", "reusing the decrypted " + plain} {
+		if !strings.Contains(e.log(), want) {
+			t.Errorf("the run did not say %q:\n%s", want, e.log())
+		}
+	}
+}
+
+// The restore directory is shared by every set that passes through the staging
+// area, so a disc01.squashfs left there by some other archive — --keep-images,
+// or a run that stopped early — must not be handed over as this set's disc 1.
+// It fails the recorded plaintext hash, is discarded, and the image is
+// decrypted afresh.
+func TestPrepareImageDoesNotReuseAPlaintextThatFailsItsHash(t *testing.T) {
+	e := newEnv(t)
+	payload := bytes.Repeat([]byte("this set's image\n"), 100)
+	enc, _ := e.writeImage(1, payload)
+
+	plain := filepath.Join(e.cfg.Dirs().Restore, "disc01.squashfs")
+	if err := os.WriteFile(plain, []byte("some other set's disc 1"), 0o600); err != nil {
+		t.Fatalf("seed plaintext: %v", err)
+	}
+	got, err := PrepareImage(context.Background(), e.opts(), enc)
+	if err != nil {
+		t.Fatalf("PrepareImage: %v\n%s", err, e.log())
+	}
+	body, err := os.ReadFile(got)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(body, payload) {
+		t.Fatalf("the stale plaintext was reused: %q", body)
+	}
+	if !strings.Contains(e.log(), "does not match the recorded plaintext hash") {
+		t.Errorf("the discard was silent:\n%s", e.log())
+	}
+}
+
+// With no plaintext sidecar there is nothing to check a leftover against, and
+// an unchecked leftover is not reused either.
+func TestPrepareImageDoesNotReuseAPlaintextWithoutASidecar(t *testing.T) {
+	e := newEnv(t)
+	payload := []byte("payload")
+	enc, _ := e.writeImage(1, payload)
+	if err := os.Remove(filepath.Join(e.cfg.Dirs().Enc, "disc01.squashfs"+sumExt)); err != nil {
+		t.Fatal(err)
+	}
+	plain := filepath.Join(e.cfg.Dirs().Restore, "disc01.squashfs")
+	if err := os.WriteFile(plain, []byte("unverifiable leftover"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	got, err := PrepareImage(context.Background(), e.opts(), enc)
+	if err != nil {
+		t.Fatalf("PrepareImage: %v\n%s", err, e.log())
+	}
+	if body, _ := os.ReadFile(got); !bytes.Equal(body, payload) {
+		t.Fatalf("the unverifiable leftover was reused: %q", body)
 	}
 }
 

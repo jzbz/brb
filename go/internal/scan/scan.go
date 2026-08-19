@@ -1,9 +1,11 @@
 // Package scan walks a source tree natively, replacing the `find -xdev … -prune`
 // invocation used by brb.sh.
 //
-// The walk never follows symbolic links, records unreadable directories as
-// problems instead of failing, and charges hard-linked files exactly once
-// towards the raw byte total. Paths are kept as native Go strings end-to-end so
+// The walk never follows symbolic links, records unreadable directories and
+// unreadable files as problems instead of failing (and keeps the unreadable
+// files out of the entry list, so nothing downstream backs them up as empty),
+// and charges hard-linked files exactly once towards the raw byte total. Paths
+// are kept as native Go strings end-to-end so
 // that a name containing a tab or a newline cannot corrupt the pipeline the way
 // the shell version's NUL/tab-delimited scan file could; such names are still a
 // hazard for the tab-separated on-disc index, so every path holding a control
@@ -111,6 +113,14 @@ type Result struct {
 	// holding both kinds, "sheet\tone\r" say, belongs to the raw group, since
 	// escaping its tab does nothing about its carriage return.
 	OddPaths []string
+	// SkippedMounts holds the relative paths of the directories that
+	// Options.OneFileSystem stopped the walk at: mount points beneath the
+	// root, each of which is reported as an empty directory while everything
+	// underneath it is left out. They are listed here, in walk order, so a
+	// caller can say so out loud. Without this the omission was silent — no
+	// problem, no warning — and a NAS mounted under the source tree simply
+	// never made it onto a disc.
+	SkippedMounts []string
 }
 
 // Options configures [Walk].
@@ -132,7 +142,9 @@ type Options struct {
 	ExcludeMasks []string
 	// OneFileSystem stops the walk from descending into a directory whose
 	// device differs from the root's, like find -xdev. The directory itself is
-	// still reported, so the mount point survives into the skeleton.
+	// still reported, so the mount point survives into the skeleton, and its
+	// path is added to Result.SkippedMounts so the caller can report what was
+	// left behind.
 	OneFileSystem bool
 	// OnEntry, when non-nil, is called for every kept entry in walk order.
 	OnEntry func(Entry)
@@ -152,8 +164,16 @@ const cancelCheckInterval = 256
 // Walk scans opts.Root, never following symbolic links.
 //
 // Unreadable directories are recorded as problems and skipped rather than
-// aborting the walk. Walk returns an error only when the root itself cannot be
-// used or when ctx is cancelled; the error then wraps ctx.Err().
+// aborting the walk. So is every regular file that cannot be opened for
+// reading: it is recorded as a problem and left out of Entries, rather than
+// reported as a file and left for the image builder to trip over. That is not
+// an optimisation but a correctness guard — mksquashfs exits 0 on a source
+// file it cannot open and writes a zero-byte file in its place, so a file that
+// reached it unreadable was silently backed up as nothing. Every other kind of
+// entry is never opened: opening a fifo would block the walk and opening a
+// device node could have side effects. Walk returns an error only when the
+// root itself cannot be used or when ctx is cancelled; the error then wraps
+// ctx.Err().
 func Walk(ctx context.Context, opts Options) (*Result, error) {
 	if strings.TrimSpace(opts.Root) == "" {
 		return nil, ErrNoRoot
@@ -177,7 +197,7 @@ func Walk(ctx context.Context, opts Options) (*Result, error) {
 	if !fi.IsDir() {
 		return nil, fmt.Errorf("scan: root %s is not a directory", root)
 	}
-	rootDev, _, _ := fileIDs(fi)
+	rootDev, _, _ := statIDs(fi)
 
 	w := &walker{
 		opts:    opts,
@@ -197,6 +217,13 @@ func Walk(ctx context.Context, opts Options) (*Result, error) {
 type fileID struct {
 	dev, ino uint64
 }
+
+// statIDs is how the walker reads a device number, inode and link count. It is
+// a variable purely so a test can pretend a directory sits on another device:
+// a real mount point under a temp dir needs root, and the OneFileSystem
+// behaviour would otherwise be untestable. Nothing outside the tests assigns
+// it.
+var statIDs = fileIDs
 
 type walker struct {
 	opts    Options
@@ -244,7 +271,7 @@ func (w *walker) dir(ctx context.Context, abs, rel string) error {
 			w.problem(filepath.Join(abs, name), err)
 			continue
 		}
-		dev, ino, nlink := fileIDs(info)
+		dev, ino, nlink := statIDs(info)
 
 		e := Entry{Rel: childRel, Kind: kindOf(info), Inode: ino, Nlink: nlink}
 		if e.Kind == KindFile {
@@ -262,11 +289,24 @@ func (w *walker) dir(ctx context.Context, abs, rel string) error {
 		if e.Kind != KindDir && w.excluded(name) {
 			continue
 		}
+		// A regular file the walker cannot open is a problem, not an entry.
+		// See Walk: mksquashfs would otherwise replace it with an empty file
+		// and exit 0, and nothing downstream could tell. Only regular files
+		// are opened — see readable.
+		if e.Kind == KindFile {
+			if err := readable(filepath.Join(abs, name)); err != nil {
+				w.problem(filepath.Join(abs, name), err)
+				continue
+			}
+		}
 		w.emit(e, dev)
 
 		if e.Kind == KindDir {
 			if w.opts.OneFileSystem && dev != w.rootDev {
-				continue // like find -xdev: report the mount point, do not descend
+				// Like find -xdev: report the mount point, do not descend —
+				// and remember it, so the caller can say what was left out.
+				w.res.SkippedMounts = append(w.res.SkippedMounts, childRel)
+				continue
 			}
 			if err := w.dir(ctx, filepath.Join(abs, name), childRel); err != nil {
 				return err

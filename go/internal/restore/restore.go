@@ -47,6 +47,7 @@ import (
 
 	"github.com/jzbz/brb/internal/agecrypt"
 	"github.com/jzbz/brb/internal/config"
+	"github.com/jzbz/brb/internal/doc"
 	"github.com/jzbz/brb/internal/tools"
 	"github.com/jzbz/brb/internal/ui"
 )
@@ -252,32 +253,6 @@ func (o Options) check() error {
 // dirs returns the staging subdirectories.
 func (o Options) dirs() config.Dirs { return o.Cfg.Dirs() }
 
-// secureStaging creates the staging directory and shuts it, the way brb.sh's
-// secure_staging does before every read command.
-//
-// MkdirAll(sub, 0o700) only propagates the mode to directories it creates, so a
-// staging directory the operator made by hand keeps whatever the umask gave it
-// — and the README's default STAGING lives under /var/tmp, which is 1777. The
-// chmod is therefore unconditional: for as long as a restore runs, this
-// directory holds the whole archive in the clear.
-//
-// A failure is a warning, not a refusal: a restore is what someone reaches for
-// when things have already gone wrong, and refusing to decrypt because a mode
-// could not be tightened would be the wrong trade.
-func (o Options) secureStaging() {
-	if o.Cfg.Staging == "" {
-		return
-	}
-	if err := os.MkdirAll(o.Cfg.Staging, 0o700); err != nil {
-		o.UI.Warn("could not create %s: %v", o.Cfg.Staging, err)
-		return
-	}
-	if err := os.Chmod(o.Cfg.Staging, 0o700); err != nil {
-		o.UI.Warn("could not tighten the permissions of %s, which holds plaintext: %v",
-			o.Cfg.Staging, err)
-	}
-}
-
 // discFile is one numbered per-disc file found in the staging area: an
 // encrypted image in the enc directory, or an ISO in the iso directory.
 type discFile struct {
@@ -411,10 +386,32 @@ func identityIsEncrypted(path string) (bool, error) {
 		strings.HasPrefix(first, "-----BEGIN AGE ENCRYPTED FILE-----"), nil
 }
 
+// stagedPublicIdentity is where a public archive's key sits in the staging
+// area: <STAGING>/enc/identity.txt. The writer leaves the key it minted there
+// (backup's publicIdentityPath), and ingest copies the identity.txt from a
+// public set's disc root to the same place, so a public set is restorable by
+// either route without the operator being asked to set AGE_IDENTITY to a file
+// on a disc. brb.sh's find_identity looks in the same place.
+func (o Options) stagedPublicIdentity() string {
+	return filepath.Join(o.dirs().Enc, doc.PublicIdentityName)
+}
+
 // identities loads the age identities used to decrypt. It is called before any
 // expensive work so that a missing key fails in a second rather than after an
 // hour of hashing. A passphrase-protected identity is unlocked here, once —
 // see the ids field for why once matters.
+//
+// Two sources are consulted. The primary identity is found exactly as before:
+// AGE_IDENTITY, its age container, then the rescue key, and a
+// passphrase-protected one is unlocked. Then, if the staging area holds a
+// public archive's key (see stagedPublicIdentity), that key is added to the
+// list — age tries each identity in turn, so a set encrypted to either opens.
+// When there is no primary identity at all but the staged key is there, it is
+// used alone, with no error and no passphrase prompt: a public archive is
+// exactly the set that has no key beside the recipients file, and the disc
+// itself brought the only one there is. A staged key that exists but does not
+// parse is an error naming the file: it is the key to whatever was ingested,
+// and silently ignoring it would turn "cannot decrypt" into a mystery.
 //
 // A copy of Options that already carries loaded identities reuses them; see the
 // ids field.
@@ -422,14 +419,33 @@ func (o Options) identities() ([]age.Identity, error) {
 	if len(o.ids) > 0 {
 		return o.ids, nil
 	}
+	staged := o.stagedPublicIdentity()
+	var pub []age.Identity
+	switch _, err := os.Stat(staged); {
+	case err == nil:
+		pub, err = agecrypt.ParseIdentityFile(staged)
+		if err != nil {
+			return nil, fmt.Errorf("restore: %s is not a usable age identity — it should be the public archive's key, "+
+				"copied from the disc root by ingest; re-ingest a disc of the set, or copy identity.txt from any of its discs there: %w",
+				staged, err)
+		}
+	case !errors.Is(err, fs.ErrNotExist):
+		return nil, fmt.Errorf("restore: %s: %w", staged, err)
+	}
+
 	path, found := findIdentity(o.Cfg)
 	if !found {
+		if len(pub) > 0 {
+			o.UI.Step("using the public archive's key %s", staged)
+			return pub, nil
+		}
 		want := o.Cfg.AgeIdentity
 		if want == "" {
 			want = "identity.txt"
 		}
-		return nil, fmt.Errorf("restore: no age identity found: looked for %s, %s%s and rescue-identity.txt.age near %s (set AGE_IDENTITY=/path/to/identity.txt)",
-			want, want, ageExt, o.Cfg.AgeRecipientsFile)
+		return nil, fmt.Errorf("restore: no age identity found: looked for %s, %s%s and rescue-identity.txt.age near %s, "+
+			"and for a public archive's key at %s (set AGE_IDENTITY=/path/to/identity.txt, or ingest a disc of a public set)",
+			want, want, ageExt, o.Cfg.AgeRecipientsFile, staged)
 	}
 	// Say so when the file used is not the one asked for: falling back to the
 	// rescue key is a decision the operator should see, not discover from a
@@ -437,16 +453,32 @@ func (o Options) identities() ([]age.Identity, error) {
 	if path != o.Cfg.AgeIdentity {
 		o.UI.Step("using identity %s", path)
 	}
-	enc, err := identityIsEncrypted(path)
-	if err != nil {
-		return nil, fmt.Errorf("restore: age identity %s is not usable (set AGE_IDENTITY=/path/to/identity.txt): %w", path, err)
+	var ids []age.Identity
+	if path == staged {
+		// AGE_IDENTITY was pointed at the staged key itself; it is already
+		// loaded, and loading it twice would only ask age to try it twice.
+		ids = pub
+		pub = nil
+	} else {
+		enc, err := identityIsEncrypted(path)
+		if err != nil {
+			return nil, fmt.Errorf("restore: age identity %s is not usable (set AGE_IDENTITY=/path/to/identity.txt): %w", path, err)
+		}
+		if enc {
+			ids, err = o.unlockIdentity(path)
+		} else {
+			ids, err = agecrypt.ParseIdentityFile(path)
+			if err != nil {
+				err = fmt.Errorf("restore: age identity %s is not usable (set AGE_IDENTITY=/path/to/identity.txt): %w", path, err)
+			}
+		}
+		if err != nil {
+			return nil, err
+		}
 	}
-	if enc {
-		return o.unlockIdentity(path)
-	}
-	ids, err := agecrypt.ParseIdentityFile(path)
-	if err != nil {
-		return nil, fmt.Errorf("restore: age identity %s is not usable (set AGE_IDENTITY=/path/to/identity.txt): %w", path, err)
+	if len(pub) > 0 {
+		o.UI.Step("also using the public archive's key %s", staged)
+		ids = append(ids, pub...)
 	}
 	return ids, nil
 }
@@ -527,7 +559,9 @@ const armorHeader = "-----BEGIN AGE ENCRYPTED FILE-----"
 // The sequence is deliberate, and every step of it exists because skipping it
 // would let corrupted data reach a restored file tree:
 //
-//  1. An already decrypted image in the restore directory is reused as is.
+//  1. An already decrypted image in the restore directory is reused — but
+//     only after it has been hashed and matched against the recorded
+//     plaintext hash. Anything else there is discarded and decrypted afresh.
 //  2. The ciphertext is hashed and compared with the hash recorded beside it.
 //  3. On a mismatch par2 repairs it — and the hash is checked again. If it
 //     still does not match, this refuses to decrypt garbage rather than
@@ -551,21 +585,21 @@ func PrepareImage(ctx context.Context, o Options, encPath string) (string, error
 	}
 	encDir := filepath.Dir(encPath)
 
-	o.secureStaging()
+	// Both staging directories this touches have to be real directories of
+	// ours: restore/ receives the plaintext, and enc/ is where a par2 repair
+	// rewrites the ciphertext — and where a planted link could substitute
+	// ciphertext of somebody else's choosing for this set's.
 	restoreDir := o.dirs().Restore
-	if err := os.MkdirAll(restoreDir, 0o700); err != nil {
-		return "", fmt.Errorf("restore: creating %s: %w", restoreDir, err)
+	if err := o.secureStaging(o.dirs().Enc, restoreDir); err != nil {
+		return "", err
 	}
 	plain := filepath.Join(restoreDir, base)
 
-	switch _, err := os.Stat(plain); {
-	case err == nil:
-		// Already decrypted and, because a failed hash check removes it below,
-		// already verified.
-		o.UI.Step("reusing the decrypted %s", plain)
+	switch reused, err := o.reuseDecrypted(ctx, encDir, base, plain); {
+	case err != nil:
+		return "", err
+	case reused:
 		return plain, nil
-	case !errors.Is(err, fs.ErrNotExist):
-		return "", fmt.Errorf("restore: %s: %w", plain, err)
 	}
 
 	st, err := os.Stat(encPath)
@@ -661,10 +695,62 @@ func PrepareImage(ctx context.Context, o Options, encPath string) (string, error
 	return plain, nil
 }
 
+// reuseDecrypted decides whether a plaintext image already sitting at plain
+// can stand in for decrypting encDir/base.age again. It can only when it
+// hashes to the plaintext digest recorded in encDir/base.sha512.
+//
+// This used to trust anything at that path, on the strength of every failed
+// check removing what it had decrypted. That reasoning covered this program's
+// own leftovers and nothing else: the restore directory is shared by every set
+// that passes through this staging area, so a disc02.squashfs left by an
+// earlier restore of a different archive — KeepImages, or a run that stopped
+// before it deleted its images — was handed over as this set's disc 2 and
+// extracted over the destination without a byte of it being checked. Hashing
+// costs one read of the image, which is what the decryption it saves would
+// have cost anyway.
+//
+// A mismatch is not an error and neither is a sidecar that is missing or
+// unreadable: in every such case the leftover is removed and the caller
+// decrypts afresh, and the fresh plaintext meets the same sidecar and the same
+// verdict PrepareImage has always given it.
+func (o Options) reuseDecrypted(ctx context.Context, encDir, base, plain string) (bool, error) {
+	switch _, err := os.Lstat(plain); {
+	case errors.Is(err, fs.ErrNotExist):
+		return false, nil
+	case err != nil:
+		return false, fmt.Errorf("restore: %s: %w", plain, err)
+	}
+	o.UI.Step("verifying the decrypted %s already in %s", base, filepath.Dir(plain))
+	want, ok, err := recordedSum(filepath.Join(encDir, base+sumExt), base, "")
+	if err != nil || !ok {
+		o.UI.Warn("no usable recorded plaintext hash to check the existing %s against; discarding it and decrypting again", base)
+		o.removeUnverified(plain)
+		return false, nil
+	}
+	got, err := agecrypt.SumFile(ctx, plain)
+	if err != nil {
+		if ctx.Err() != nil {
+			return false, err
+		}
+		o.UI.Warn("could not hash the existing %s (%v); discarding it and decrypting again", base, err)
+		o.removeUnverified(plain)
+		return false, nil
+	}
+	if !strings.EqualFold(got, want) {
+		o.UI.Warn("the existing %s does not match the recorded plaintext hash of this set's %s — "+
+			"it is left over from something else; discarding it and decrypting again", base, base+ageExt)
+		o.removeUnverified(plain)
+		return false, nil
+	}
+	o.UI.Step("reusing the decrypted %s — it matches its recorded plaintext hash", plain)
+	return true, nil
+}
+
 // removeUnverified deletes a decrypted image that no check has vouched for.
-// PrepareImage's fast path reuses whatever plaintext it finds, on the strength
-// of a failed check having removed it, so every path that fails after the
-// decryption must actually do so.
+// Every path that fails after the decryption must actually do so, so that
+// nothing unverified is left where the next run finds it — reuseDecrypted
+// re-hashes whatever it finds, but a plaintext known to be wrong has no
+// business waiting around for that.
 func (o Options) removeUnverified(plain string) {
 	if err := os.Remove(plain); err != nil && !errors.Is(err, fs.ErrNotExist) {
 		o.UI.Warn("could not remove the unverified %s: %v", plain, err)
@@ -782,9 +868,13 @@ func (o Options) decryptVerifying(ctx context.Context, encPath, dst, wantCipher 
 		// 0600: this is the decrypted image, in a staging directory whose
 		// default lives under /var/tmp. The ciphertext, its sidecars and the
 		// par2 volumes stay 0644 — those modes end up on a disc.
-		out, err = os.OpenFile(part, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+		//
+		// createFresh, never O_TRUNC: a symlink another local user planted at
+		// the .part path would otherwise have the plaintext streamed into a
+		// file of their choosing with this process's privileges.
+		out, err = createFresh(part, 0o600)
 		if err != nil {
-			return "", fmt.Errorf("restore: create %s: %w", part, err)
+			return "", fmt.Errorf("restore: %w", err)
 		}
 		defer func() {
 			if !promoted {

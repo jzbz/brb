@@ -1,6 +1,7 @@
 package backup
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -77,6 +78,9 @@ func Run(ctx context.Context, o Options) error {
 		return err
 	}
 	entries := r.resumeFilter(res)
+	if err := r.checkIndexCovers(entries); err != nil {
+		return err
+	}
 
 	total, err := r.buildDiscs(ctx, entries)
 	if err != nil {
@@ -148,6 +152,39 @@ func (r *runner) resumeFilter(res *scan.Result) []scan.Entry {
 	}
 	r.p.Step("resume: %d file(s) already on disc, %d still to write", done, todo)
 	return out
+}
+
+// checkIndexCovers refuses a resume that would build discs the encrypted index
+// can never list. A run that got as far as buildIndex deleted the plaintext
+// index, and prepareState marks such a resume indexBuilt: the encrypted index
+// is kept as it is and copied onto every disc. That is only right if there is
+// nothing left to write. If the source tree grew since — files added under
+// SOURCE_DIR, or files that were unreadable then and are readable now — the
+// scan hands buildDiscs those files, it packs them onto NEW discs, and the
+// index on every disc, including the new ones, says nothing about them: a
+// restore of the whole set would never look for them, and `restore --only`
+// could not name them. There is no way to extend a finished index short of
+// rebuilding it, and the plaintext it was built from is gone, so the honest
+// answer is to refuse.
+//
+// entries is the scan after resumeFilter, so every KindFile left in it is a
+// file no finished disc holds.
+func (r *runner) checkIndexCovers(entries []scan.Entry) error {
+	if !r.indexBuilt {
+		return nil
+	}
+	pending := 0
+	for _, e := range entries {
+		if e.Kind == scan.KindFile {
+			pending++
+		}
+	}
+	if pending == 0 {
+		return nil
+	}
+	return fmt.Errorf("backup: --resume: the encrypted index was already built for the %d finished disc(s), "+
+		"but %d file(s) are not on any disc (the source tree changed since); the index cannot be "+
+		"extended — start over", r.st.DiscsDone, pending)
 }
 
 // buildDiscs runs the per-disc loop until every file is on a disc.
@@ -339,13 +376,21 @@ func (r *runner) protect(ctx context.Context, n int, img string, size int64) err
 	// protectSidecars does for its own set. Only discs being rebuilt reach
 	// protect(), so this can never delete a finished disc's parity. Unlike the
 	// sidecar set, this one is mandatory: a removal that fails is fatal.
-	stale, err := filepath.Glob(filepath.Join(r.dirs.Enc, base+".age*.par2"))
+	//
+	// The names are matched one by one, never through filepath.Glob with the
+	// directory in the pattern: a STAGING path holding '[', '*' or '?' would
+	// make such a glob match nothing, and the stale set would survive to make
+	// par2 refuse. The predicate is the same one discPayload uses to collect
+	// the set later, so nothing this sweep leaves can be picked up as payload.
+	stale, err := filesMatching(r.dirs.Enc, func(nm string) bool {
+		return strings.HasPrefix(nm, base+".age") && strings.HasSuffix(nm, ".par2")
+	})
 	if err != nil {
 		return fmt.Errorf("backup: disc %d: looking for stale recovery data: %w", n, err)
 	}
 	for _, f := range stale {
-		if err := os.Remove(f); err != nil && !errors.Is(err, fs.ErrNotExist) {
-			return fmt.Errorf("backup: disc %d: removing stale %s: %w", n, filepath.Base(f), err)
+		if err := os.Remove(filepath.Join(r.dirs.Enc, f)); err != nil && !errors.Is(err, fs.ErrNotExist) {
+			return fmt.Errorf("backup: disc %d: removing stale %s: %w", n, f, err)
 		}
 	}
 	par2Started := time.Now()
@@ -512,20 +557,38 @@ func (r *runner) buildDiscDirs(ctx context.Context, total int) error {
 			return err
 		}
 		if size > r.budget.Usable {
-			return fmt.Errorf("backup: disc %d needs %s of payload but the media holds about %s",
-				n, ui.HumanBytes(size), ui.HumanBytes(r.budget.Usable))
+			return r.oversizedDisc(n, "data/ payload", size)
 		}
 	}
 	r.p.OK("%d disc directory(ies)", total)
 	return nil
 }
 
+// oversizedDisc is the refusal for a disc directory that has outgrown the
+// media, with advice that is actually true. The old advice was "raise
+// RESERVE_BYTES and re-run", which cannot help a resume: Usable is
+// capacity*98/100 and ignores the reserve, and the images already built were
+// sized for the old reserve, so nothing about them shrinks. Raising the
+// reserve does work — a larger reserve makes a smaller image budget, and the
+// next disc built under it leaves that much more room for the files every
+// disc carries — but only for images built after the change, which means
+// starting the set over. Say so, and say how much: the reserve has to grow
+// by at least the overshoot.
+func (r *runner) oversizedDisc(n int, what string, size int64) error {
+	over := size - r.budget.Usable
+	return fmt.Errorf("backup: disc %d needs %s for its %s but the media holds about %s (%s over); "+
+		"the files every disc carries outgrew RESERVE_BYTES=%d — set RESERVE_BYTES to at least %d "+
+		"and start the set over: the images already built were sized for the old reserve, so "+
+		"--resume cannot shrink them", n, ui.HumanBytes(size), what, ui.HumanBytes(r.budget.Usable),
+		ui.HumanBytes(over), r.cfg.ReserveBytes, r.cfg.ReserveBytes+over)
+}
+
 // The published key lives at the disc root rather than in data/, beside
 // README.md, which is where that README's manual restore recipe points
-// (age -d -i /mnt/identity.txt). Neither reader's identity search looks at a
-// disc root or at ingested staging on its own — a brb-driven restore of a
-// public set needs AGE_IDENTITY pointed at a copy of this file, and the
-// on-disc README says so.
+// (age -d -i /mnt/identity.txt). Both readers' ingest copy it from there into
+// <staging>/enc/identity.txt — the same place this writer keeps it — and their
+// identity search uses that file in addition to any configured identity, so a
+// public set opens with nothing configured on either reader.
 //
 // Being outside data/ also means it is not a member of sidecars.par2 — par2
 // will not take a path above its own working directory. It is protected
@@ -552,21 +615,34 @@ func (r *runner) writePublicIdentity(n int) error {
 		return nil
 	}
 	path := filepath.Join(r.dirs.Discs, discDirName(n), doc.PublicIdentityName)
+	// The disc's copy is the staging copy's bytes, not a fresh rendering.
+	// WriteIdentityFile stamps "# created:" with the moment it runs, so
+	// rendering per disc gave every disc a different file for the same key
+	// whenever the layout crossed a second boundary — and a reader that had
+	// staged disc 1's copy could not tell disc 2's from a second public set's.
+	// Copying the one persisted file makes the key genuinely one file on every
+	// disc, which is also what SHA512SUMS, MANIFEST.txt and README.md say it is.
+	canonical, err := os.ReadFile(r.publicIdentityPath())
+	if err != nil {
+		return fmt.Errorf("backup: disc %d: reading the set's key: %w", n, err)
+	}
 	// A resumed run reaches discs an earlier run already laid out. Keep the
-	// file only if it really is this set's key: a run killed between the
+	// file only if it is byte-for-byte the set's key: a run killed between the
 	// create and the write leaves a truncated one, and keeping that would put
-	// a disc on the shelf whose "key" is an empty file. The key is stable
-	// across a resume now (see preparePublicIdentity), so anything that is
-	// not byte-for-byte the expected key is simply wrong and is rewritten.
-	if existing, err := agecrypt.ReadX25519IdentityFile(path); err == nil &&
-		existing.String() == r.publicIdentity.String() {
+	// a disc on the shelf whose "key" is an empty file.
+	if existing, err := os.ReadFile(path); err == nil && bytes.Equal(existing, canonical) {
 		return nil
 	}
 	if err := os.Remove(path); err != nil && !errors.Is(err, fs.ErrNotExist) {
 		return fmt.Errorf("backup: disc %d: replacing %s: %w", n, path, err)
 	}
-	if err := agecrypt.WritePublicIdentityFile(path, r.publicIdentity); err != nil {
-		return fmt.Errorf("backup: disc %d: %w", n, err)
+	if err := os.WriteFile(path, canonical, 0o644); err != nil {
+		return fmt.Errorf("backup: disc %d: writing %s: %w", n, path, err)
+	}
+	// The mode passed to WriteFile is masked by the umask; the disc copy is
+	// meant to be world-readable, that being the point of a public archive.
+	if err := os.Chmod(path, 0o644); err != nil {
+		return fmt.Errorf("backup: disc %d: chmod %s: %w", n, path, err)
 	}
 	return nil
 }
@@ -628,15 +704,18 @@ func (r *runner) protectSidecars(ctx context.Context, n int, data string) {
 	}
 	// A resumed run finds the previous run's set here, and par2 will not
 	// overwrite one. Removing it first also means a set that is left behind is
-	// always one that matches the files beside it.
-	stale, err := filepath.Glob(filepath.Join(data, "sidecars*.par2"))
+	// always one that matches the files beside it. Matched by name, not by a
+	// glob over the full path, so a STAGING holding '[' or '*' still sweeps.
+	stale, err := filesMatching(data, func(nm string) bool {
+		return strings.HasPrefix(nm, "sidecars") && strings.HasSuffix(nm, ".par2")
+	})
 	if err != nil {
 		r.p.Warn("could not protect the sidecar files on disc %d: %v", n, err)
 		return
 	}
 	for _, f := range stale {
-		if err := os.Remove(f); err != nil && !errors.Is(err, fs.ErrNotExist) {
-			r.p.Warn("could not remove the previous %s: %v", filepath.Base(f), err)
+		if err := os.Remove(filepath.Join(data, f)); err != nil && !errors.Is(err, fs.ErrNotExist) {
+			r.p.Warn("could not remove the previous %s: %v", f, err)
 			return
 		}
 	}
@@ -698,7 +777,7 @@ func (r *runner) writeManifest(ctx context.Context, total int) error {
 		Recipients:     r.pubkeys,
 		PublicIdentity: r.publicIdentityText(),
 		DiscFiles:      discFiles,
-		PruneDirs:      r.cfg.PruneDirs,
+		PruneDirs:      r.manifestPrunes(),
 		ExcludeMasks:   r.cfg.ExcludeMasks,
 	})
 
@@ -714,6 +793,23 @@ func (r *runner) writeManifest(ctx context.Context, total int) error {
 	}
 	r.p.OK("manifest on every disc")
 	return nil
+}
+
+// manifestPrunes is the "excluded from this backup" list the manifest prints
+// under "prune:": the configured PRUNE_DIRS, followed by every mount point the
+// scan refused to cross, each marked as such. A mount point is not a
+// configured prune, but the effect on the set is identical — the directory is
+// there and everything under it is not — and the manifest is the one document
+// that outlives the terminal the warning was printed to.
+func (r *runner) manifestPrunes() []string {
+	if len(r.skippedMounts) == 0 {
+		return r.cfg.PruneDirs
+	}
+	out := append([]string(nil), r.cfg.PruneDirs...)
+	for _, m := range r.skippedMounts {
+		out = append(out, m+"  (mount point: not crossed, its contents are not on this set)")
+	}
+	return out
 }
 
 // toolVersions collects the version banners of the programs that built this
@@ -878,8 +974,7 @@ func (r *runner) checkDiscSizes(ctx context.Context, total int) error {
 			return err
 		}
 		if size > r.budget.Usable {
-			return fmt.Errorf("backup: disc %d needs %s but the media holds about %s; "+
-				"raise RESERVE_BYTES and re-run", n, ui.HumanBytes(size), ui.HumanBytes(r.budget.Usable))
+			return r.oversizedDisc(n, "files", size)
 		}
 		r.p.Step("%s: %s / %s", discDirName(n), ui.HumanBytes(size), ui.HumanBytes(r.budget.Usable))
 	}

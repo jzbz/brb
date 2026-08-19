@@ -1,7 +1,10 @@
 package restore
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha512"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -13,7 +16,10 @@ import (
 	"sync"
 	"time"
 
+	"filippo.io/age"
+
 	"github.com/jzbz/brb/internal/agecrypt"
+	"github.com/jzbz/brb/internal/doc"
 	"github.com/jzbz/brb/internal/tools"
 	"github.com/jzbz/brb/internal/ui"
 )
@@ -35,10 +41,9 @@ func Ingest(ctx context.Context, o Options, mountPoint string) error {
 	if err := o.check(); err != nil {
 		return err
 	}
-	o.secureStaging()
 	encDir := o.dirs().Enc
-	if err := os.MkdirAll(encDir, 0o700); err != nil {
-		return fmt.Errorf("restore: creating %s: %w", encDir, err)
+	if err := o.secureStaging(encDir); err != nil {
+		return err
 	}
 	// A .part from an interrupted copy must never be mistaken for a finished
 	// file, and nothing resumes from one — ddrescue keys its resume off the
@@ -214,7 +219,21 @@ func (ig *ingester) ingestDisc(ctx context.Context) (staged bool, err error) {
 	}
 	ig.prevDisc = disc
 
+	// A public archive's key comes off the disc root, ahead of the data files:
+	// a disc that belongs to a different public set than the one already in
+	// staging is refused whole, before any of its images land beside the other
+	// set's.
 	encDir := o.dirs().Enc
+	switch st, err := o.ingestPublicIdentity(mp, sums[doc.PublicIdentityName]); {
+	case err == nil:
+		staged = staged || st
+	case errors.Is(err, ErrIncompleteCopy):
+		o.UI.Warn("%v", err)
+		ig.incomplete++
+	default:
+		return staged, err
+	}
+
 	for _, name := range names {
 		if err := ctx.Err(); err != nil {
 			return staged, err
@@ -553,4 +572,161 @@ func (o Options) copyManifest(ctx context.Context, mp string) error {
 	}
 	o.UI.Step("%s copied to %s", manifestName, dst)
 	return nil
+}
+
+// ingestPublicIdentity stages a public archive's key. A set built with
+// --public-archive carries its secret key as identity.txt at the root of every
+// disc, and until the key is somewhere a restore looks, the set cannot be
+// restored by brb without the operator finding that file and setting
+// AGE_IDENTITY to it by hand. So ingest copies it to <STAGING>/enc/identity.txt
+// — the very path the writer leaves its own copy of the key at while it
+// builds the set — and identities() picks it up from there. brb.sh does the
+// same, to the same path, so a staging area is interchangeable between the two
+// readers.
+//
+// The copy is checked against the disc's SHA512SUMS entry for ./identity.txt
+// like every other file taken off a disc: a key with a rotted character
+// decrypts nothing, and it is better to hear that at ingest, with the disc in
+// hand and the same key printed in MANIFEST.txt and README.md, than at restore.
+// A mismatch is reported the way a damaged data file is, as an incomplete
+// copy, and nothing is staged: a wrong key beside the images would only send
+// the restore down the wrong path.
+//
+// A staged key that already exists is compared, not overwritten. Identical
+// contents are the ordinary case — every disc of a public set carries the same
+// key, and so does the writer's leftover. Different contents mean the discs of
+// two different public archives are being ingested into one staging area, and
+// their images would end up interleaved in one enc/ under one key that opens
+// half of them; that disc is refused rather than staged.
+//
+// A disc without an identity.txt is a private set, and nothing happens. want
+// is the digest the disc's SHA512SUMS records for the file, or "" when the
+// disc carries no sums.
+func (o Options) ingestPublicIdentity(mp, want string) (staged bool, err error) {
+	src := filepath.Join(mp, doc.PublicIdentityName)
+	body, err := os.ReadFile(src)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return false, nil
+		}
+		return false, fmt.Errorf("restore: reading %s: %w", src, err)
+	}
+	name := doc.PublicIdentityName
+	if want != "" {
+		sum := sha512.Sum512(body)
+		if got := hex.EncodeToString(sum[:]); !strings.EqualFold(got, want) {
+			return false, &CopyProblem{
+				Name:    name,
+				Missing: -1,
+				Reason: "the public archive's key on this disc does not match the hash this disc records for it, " +
+					"so it was not staged; the same key is printed in the disc's MANIFEST.txt and README.md — " +
+					"check it against those, and set AGE_IDENTITY to a corrected copy",
+			}
+		}
+	}
+
+	// This disc's copy has to be a usable identity before it is compared with
+	// anything or staged: a file that merely passed the disc's hash could still
+	// be an empty or foreign file if the set was mastered by hand.
+	thisKey, err := parseX25519Identity(body)
+	if err != nil {
+		return false, &CopyProblem{
+			Name:    name,
+			Missing: -1,
+			Reason:  fmt.Sprintf("the file on this disc is not an age identity (%v); the same key is printed in the disc's MANIFEST.txt and README.md", err),
+		}
+	}
+
+	dst := o.stagedPublicIdentity()
+	switch have, err := os.ReadFile(dst); {
+	case err == nil:
+		// "The same key" is judged by the key, not by the bytes. The writer
+		// stamps every identity file it renders with a "# created:" line, so a
+		// set whose discs were laid out across a second boundary can carry the
+		// same key under different bytes; brb.sh's ingest compares the
+		// AGE-SECRET-KEY- line for the same reason. Two different KEYS, on the
+		// other hand, really are two different sets.
+		haveKey, perr := parseX25519Identity(have)
+		if perr == nil && haveKey.String() == thisKey.String() {
+			o.UI.Step("already have the public archive's key %s, and this disc's matches it", name)
+			return false, nil
+		}
+		if perr != nil {
+			return false, fmt.Errorf("restore: the staged public archive key %s is not an age identity (%v); "+
+				"remove it and ingest again", dst, perr)
+		}
+		return false, fmt.Errorf("restore: this disc carries a public archive's key that differs from the one already staged at %s — "+
+			"two different public sets are being ingested into one staging area, and their images would end up "+
+			"under one key that opens only some of them; finish or clear %s before ingesting the other set",
+			dst, o.Cfg.Staging)
+	case !errors.Is(err, fs.ErrNotExist):
+		return false, fmt.Errorf("restore: %s: %w", dst, err)
+	}
+
+	// Written .part-then-rename like every other staged file, so an ingest
+	// interrupted here leaves no half-written key for identities() to choke on.
+	if err := writeStagedFile(dst, body, 0o600); err != nil {
+		return true, fmt.Errorf("restore: staging the public archive's key: %w", err)
+	}
+	if want != "" {
+		o.UI.Step("%s copied and verified — the public archive's key is now in %s", name, filepath.Dir(dst))
+	} else {
+		o.UI.Step("%s copied — the public archive's key is now in %s", name, filepath.Dir(dst))
+	}
+	return true, nil
+}
+
+// writeStagedFile writes body to dst through a ".part" sibling that is
+// created fresh (see createFresh — never through a symlink planted at the
+// name), fsynced, and renamed into place, so dst is either whole or absent.
+func writeStagedFile(dst string, body []byte, mode os.FileMode) error {
+	part := dst + partExt
+	f, err := createFresh(part, mode)
+	if err != nil {
+		return err
+	}
+	if _, err := f.Write(body); err != nil {
+		f.Close()
+		os.Remove(part)
+		return fmt.Errorf("writing %s: %w", part, err)
+	}
+	if err := f.Sync(); err != nil {
+		f.Close()
+		os.Remove(part)
+		return fmt.Errorf("syncing %s: %w", part, err)
+	}
+	if err := f.Close(); err != nil {
+		os.Remove(part)
+		return fmt.Errorf("closing %s: %w", part, err)
+	}
+	if err := os.Rename(part, dst); err != nil {
+		os.Remove(part)
+		return fmt.Errorf("renaming %s: %w", part, err)
+	}
+	return nil
+}
+
+// parseX25519Identity reads the one X25519 identity an identity-file body
+// holds, in the format age-keygen and brb write: comment lines beginning "#",
+// blank lines, and exactly one AGE-SECRET-KEY-1... line.
+func parseX25519Identity(body []byte) (*age.X25519Identity, error) {
+	ids, err := age.ParseIdentities(bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	var found *age.X25519Identity
+	for _, id := range ids {
+		x, ok := id.(*age.X25519Identity)
+		if !ok {
+			return nil, errors.New("holds a key that is not X25519")
+		}
+		if found != nil {
+			return nil, errors.New("holds more than one key")
+		}
+		found = x
+	}
+	if found == nil {
+		return nil, errors.New("holds no key")
+	}
+	return found, nil
 }

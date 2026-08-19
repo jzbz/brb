@@ -203,6 +203,26 @@ func run(ctx context.Context, spec runSpec) error {
 	return nil
 }
 
+// ExitCode reports the exit status a subprocess ended with, read out of an
+// error returned by this package's runners. It returns -1 when err carries no
+// exit status: the child never started, it was killed by a signal, the context
+// was cancelled first, or the error is about something else entirely — so a
+// caller can only ever match a specific status, never mistake "no status" for
+// one.
+//
+// It exists because not every non-zero status means the same thing. unsquashfs
+// exits 2 when it extracted everything and merely could not restore an owner
+// or an xattr — routine as non-root, and on NFS, CIFS or exFAT — and exits 1
+// when it aborted; a caller that treats both as fatal throws away a restore
+// whose files are all present and correct.
+func ExitCode(err error) int {
+	var ee *exec.ExitError
+	if errors.As(err, &ee) {
+		return ee.ExitCode()
+	}
+	return -1
+}
+
 // tailSuffix renders captured output for an error message, or "" when there was
 // none.
 func tailSuffix(t *tailBuffer) string {

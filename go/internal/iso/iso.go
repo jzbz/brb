@@ -193,9 +193,17 @@ func (o Options) remove(path string) {
 // successful burn it has been deleted again; either way the disc directory is
 // still in staging, so this builds from that rather than refusing.
 //
-// A zero-length file counts as missing. It can only be the remains of a run
-// that died between creating the file and writing to it, and rebuilding it is
-// strictly better than burning it.
+// A file that is there is held to the same completeness bound BuildOne holds a
+// fresh one to: an ISO is never smaller than the disc directory it was built
+// from. A zero-length file, or one that is shorter than its tree, is the
+// remains of a run that died while writing it — power loss part-way through a
+// 22 GiB xorriso run leaves 6 GiB that passes every "is it there" test — and
+// rebuilding it is strictly better than burning it. It used to be enough for
+// the file to be non-empty, which is how a truncated ISO got burned.
+//
+// When the disc directory is gone the bound cannot be measured and the ISO
+// cannot be rebuilt either; a non-empty file is then taken as it is, since
+// refusing would only leave the operator with nothing at all.
 func (o Options) Ensure(ctx context.Context, n, total int) (string, error) {
 	if err := o.check(); err != nil {
 		return "", err
@@ -203,7 +211,13 @@ func (o Options) Ensure(ctx context.Context, n, total int) (string, error) {
 	path := o.Path(n)
 	switch st, err := os.Stat(path); {
 	case err == nil && st.Mode().IsRegular() && st.Size() > 0:
-		return path, nil
+		complete, err := o.complete(ctx, n, st.Size())
+		if err != nil {
+			return "", err
+		}
+		if complete {
+			return path, nil
+		}
 	case err != nil && !errors.Is(err, fs.ErrNotExist):
 		return "", fmt.Errorf("iso: %s: %w", path, err)
 	}
@@ -211,6 +225,27 @@ func (o Options) Ensure(ctx context.Context, n, total int) (string, error) {
 		return "", err
 	}
 	return path, nil
+}
+
+// complete reports whether an existing ISO of size bytes is at least as large
+// as the disc directory it was built from, which is the bound BuildOne applies
+// to a fresh one. A missing disc directory counts as complete — see Ensure —
+// and a short file is reported, with why it will be rebuilt.
+func (o Options) complete(ctx context.Context, n int, size int64) (bool, error) {
+	src := o.sourceDir(n)
+	if st, err := os.Stat(src); err != nil || !st.IsDir() {
+		return true, nil
+	}
+	srcSize, err := fsx.DirBytes(ctx, src)
+	if err != nil {
+		return false, fmt.Errorf("iso: %w", err)
+	}
+	if size >= srcSize {
+		return true, nil
+	}
+	o.UI.Warn("%s is %s but its disc directory holds %s — the file is truncated (a run died while "+
+		"writing it); rebuilding it rather than burning it", Name(n), ui.HumanBytes(size), ui.HumanBytes(srcSize))
+	return false, nil
 }
 
 // BuildAll builds the ISOs of discs 1..total, which is what ISO_MODE=eager does

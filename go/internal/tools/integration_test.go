@@ -483,3 +483,39 @@ func TestDetectCapturesVersions(t *testing.T) {
 		t.Errorf("version string spans lines: %q", got.Version)
 	}
 }
+
+// TestBuildImageFailsWhenMksquashfsEmptiesAFile runs the real tool over a file
+// it cannot read. mksquashfs exits 0 and writes a zero-byte file in its place;
+// BuildImage must not accept that as success, must name the file, and must not
+// leave the image behind — an image that passes every hash while missing data
+// is the worst artefact a backup tool can produce.
+func TestBuildImageFailsWhenMksquashfsEmptiesAFile(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("running as root: permission bits do not apply")
+	}
+	s := realSet(t, Mksquashfs)
+	src, files := makeTree(t)
+	locked := filepath.Join(src, "docs", "b.txt")
+	if err := os.Chmod(locked, 0o000); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(locked, 0o644) })
+
+	img := filepath.Join(t.TempDir(), "disc01.squashfs")
+	var log bytes.Buffer
+	err := s.BuildImage(t.Context(), MkOptions{
+		SourceDir: src, Out: img, Files: files, Compression: "none", Log: &log,
+	})
+	if err == nil {
+		t.Fatalf("BuildImage() = nil over an unreadable file, want a failure\nlog: %s", log.String())
+	}
+	if !strings.Contains(err.Error(), "docs/b.txt") || !strings.Contains(err.Error(), "EMPTY") {
+		t.Errorf("error does not name the emptied file and the consequence: %v", err)
+	}
+	if _, statErr := os.Stat(img); statErr == nil {
+		t.Errorf("an image with an emptied file in it was left behind at %s", img)
+	}
+	if !strings.Contains(log.String(), "creating empty file") {
+		t.Errorf("mksquashfs's own message was not forwarded to the log:\n%s", log.String())
+	}
+}

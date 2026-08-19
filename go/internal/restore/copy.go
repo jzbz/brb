@@ -73,10 +73,14 @@ func copyStream(ctx context.Context, src, dst string, prog io.Writer) (string, e
 	}
 	defer in.Close()
 
+	// createFresh: O_EXCL, never O_TRUNC, so a symlink planted at the .part
+	// path cannot redirect the copy; and a stale .part from a run that was
+	// killed mid-copy is removed first, so an interrupted ingest of
+	// MANIFEST.txt, which nothing reaps, can be repeated.
 	part := dst + partExt
-	out, err := os.OpenFile(part, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
+	out, err := createFresh(part, 0o644)
 	if err != nil {
-		return "", fmt.Errorf("creating %s: %w", part, err)
+		return "", err
 	}
 	ok := false
 	defer func() {

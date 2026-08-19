@@ -73,6 +73,115 @@ type State struct {
 	// written before the mode existed, which reads correctly as "not public".
 	PublicArchive bool   `json:"public_archive,omitempty"`
 	PublicKey     string `json:"public_key,omitempty"`
+	// Recipients holds the age public keys of AGE_RECIPIENTS_FILE as they were
+	// when the set was started, sorted. A resume re-reads that file, and a
+	// file that changed in between — `init-key --rescue-key` appending a key
+	// mid-campaign is the likely way — would split the set: discs 1..N open
+	// with the old keys only, discs N+1.. with the new, while MANIFEST.txt
+	// attributes the current keys to every disc. Recording them lets the resume
+	// notice and refuse. Absent for a public archive, whose single recipient
+	// is PublicKey, and from every state file written before the field
+	// existed, which a resume then cannot check and does not pretend to.
+	Recipients []string `json:"recipients,omitempty"`
+	// DiscType, CapacityBytes, ReserveBytes and Par2Redundancy pin the disc
+	// geometry the finished discs were packed to. Every one of them feeds the
+	// image budget, and a resume that silently accepted a change went on to
+	// build the remaining discs to a different size — a DISC_TYPE=bd50 disc in
+	// a bd25 set is discovered by the drive, and a raised PAR2_REDUNDANCY fails
+	// hours later at the disc-directory size check with no way back. Recorded
+	// as CapacityBytes rather than DISC_CAPACITY_BYTES so a set built with an
+	// override and one built with the equivalent DISC_TYPE compare equal, which
+	// is the only equality that matters. CapacityBytes is always positive when
+	// the four were recorded, so it doubles as the "was recorded" flag for a
+	// state file written before they existed.
+	DiscType       string `json:"disc_type,omitempty"`
+	CapacityBytes  int64  `json:"capacity_bytes,omitempty"`
+	ReserveBytes   int64  `json:"reserve_bytes,omitempty"`
+	Par2Redundancy int    `json:"par2_redundancy,omitempty"`
+}
+
+// Geometry is the disc geometry a State pins; see State.DiscType. It is a
+// value type so the runner can build one from its configuration and the state
+// can compare it with the one it recorded.
+type Geometry struct {
+	DiscType       string
+	CapacityBytes  int64
+	ReserveBytes   int64
+	Par2Redundancy int
+}
+
+// setGeometry records the geometry a fresh set is packed to.
+func (s *State) setGeometry(g Geometry) {
+	s.DiscType, s.CapacityBytes = g.DiscType, g.CapacityBytes
+	s.ReserveBytes, s.Par2Redundancy = g.ReserveBytes, g.Par2Redundancy
+}
+
+// checkGeometry rejects a resume whose disc geometry differs from the one the
+// finished discs were packed to. Every difference is named with both values,
+// because the fix is to put the setting back, not to guess which one moved.
+// A state file that recorded no geometry (CapacityBytes == 0: written before
+// the fields existed) cannot be checked and is accepted.
+func (s *State) checkGeometry(g Geometry) error {
+	if s.CapacityBytes == 0 {
+		return nil
+	}
+	var diffs []string
+	if s.DiscType != g.DiscType {
+		diffs = append(diffs, fmt.Sprintf("DISC_TYPE was %s, is now %s", s.DiscType, g.DiscType))
+	}
+	if s.CapacityBytes != g.CapacityBytes {
+		diffs = append(diffs, fmt.Sprintf("disc capacity was %d bytes, is now %d bytes "+
+			"(DISC_TYPE or DISC_CAPACITY_BYTES changed)", s.CapacityBytes, g.CapacityBytes))
+	}
+	if s.ReserveBytes != g.ReserveBytes {
+		diffs = append(diffs, fmt.Sprintf("RESERVE_BYTES was %d, is now %d", s.ReserveBytes, g.ReserveBytes))
+	}
+	if s.Par2Redundancy != g.Par2Redundancy {
+		diffs = append(diffs, fmt.Sprintf("PAR2_REDUNDANCY was %d, is now %d", s.Par2Redundancy, g.Par2Redundancy))
+	}
+	if len(diffs) == 0 {
+		return nil
+	}
+	return fmt.Errorf("%w: the disc geometry changed since this set was started (%s); the %d disc(s) "+
+		"already written were packed to the recorded settings and cannot be re-sized, so the set "+
+		"cannot be continued under the new ones — restore the recorded settings to resume, or start over",
+		ErrStateMismatch, strings.Join(diffs, "; "), s.DiscsDone)
+}
+
+// setRecipients records the sorted public keys a fresh ordinary set is
+// encrypted to; see State.Recipients.
+func (s *State) setRecipients(pubkeys []string) {
+	s.Recipients = sortedStrings(pubkeys)
+}
+
+// checkRecipients rejects a resume whose AGE_RECIPIENTS_FILE no longer holds
+// exactly the keys the finished discs were encrypted to. The comparison is
+// order-insensitive — the file's line order is not part of the set — but a key
+// added or removed is: either way the discs still to be written would open
+// with a different set of keys from the ones already on the shelf, while the
+// manifest lists one set for all of them. A state that recorded no keys (a
+// public archive, or a file written before the field existed) is accepted.
+func (s *State) checkRecipients(pubkeys []string) error {
+	if len(s.Recipients) == 0 {
+		return nil
+	}
+	now := sortedStrings(pubkeys)
+	if strings.Join(now, "\n") == strings.Join(s.Recipients, "\n") {
+		return nil
+	}
+	return fmt.Errorf("%w: AGE_RECIPIENTS_FILE changed since this set was started; the %d disc(s) already "+
+		"written are encrypted to:\n    %s\n  and the file now holds:\n    %s\n  continuing would encrypt the "+
+		"remaining discs to a different set of keys while MANIFEST.txt attributes the current keys to every "+
+		"disc; restore the recipients file to the recorded keys and resume, or start over",
+		ErrStateMismatch, s.DiscsDone, strings.Join(s.Recipients, "\n    "), joinOrNone(now))
+}
+
+// joinOrNone renders a key list for a message, saying so when it is empty.
+func joinOrNone(keys []string) string {
+	if len(keys) == 0 {
+		return "(no keys)"
+	}
+	return strings.Join(keys, "\n    ")
 }
 
 // newState returns the state a fresh run starts from.

@@ -10,6 +10,7 @@ import (
 	"strings"
 	"syscall"
 	"testing"
+	"time"
 )
 
 // mkTree materialises a small tree under a fresh temp dir. The spec strings are
@@ -488,6 +489,163 @@ func TestOneFileSystem(t *testing.T) {
 	without := mustWalk(t, Options{Root: root})
 	if !reflect.DeepEqual(rels(with), rels(without)) {
 		t.Fatalf("-xdev changed a single-filesystem walk: %v vs %v", rels(with), rels(without))
+	}
+	if len(with.SkippedMounts) != 0 {
+		t.Fatalf("SkippedMounts = %v on a single-filesystem tree, want none", with.SkippedMounts)
+	}
+}
+
+// TestOneFileSystemReportsTheMountPointsItSkipped fakes a mount point: the
+// directory "mnt" is made to report a device number different from the root's,
+// which is exactly what a real mount does. The walker must then leave "mnt" in
+// the skeleton, drop everything under it, and NAME it in SkippedMounts — the
+// silent version of this is how a NAS mounted under SOURCE_DIR was left off
+// every disc without a word.
+func TestOneFileSystemReportsTheMountPointsItSkipped(t *testing.T) {
+	root := mkTree(t,
+		"f:a:x",
+		"d:mnt",
+		"f:mnt/onthemount:12345",
+		"d:mnt/deeper",
+		"f:mnt/deeper/c:678",
+		"d:sub",
+		"f:sub/b:xy",
+		"d:sub/mnt2",
+		"f:sub/mnt2/d:9",
+	)
+	// The fake: any directory whose base name starts with "mnt" is on device
+	// rootDev+1. os.FileInfo has no path, but the temp dir is ours, so the
+	// name is enough to tell them apart.
+	real := statIDs
+	statIDs = func(fi os.FileInfo) (dev, ino, nlink uint64) {
+		dev, ino, nlink = real(fi)
+		if fi.IsDir() && strings.HasPrefix(fi.Name(), "mnt") {
+			dev++
+		}
+		return dev, ino, nlink
+	}
+	t.Cleanup(func() { statIDs = real })
+
+	res := mustWalk(t, Options{Root: root, OneFileSystem: true})
+	want := []string{"a", "mnt", "sub", "sub/b", "sub/mnt2"}
+	if got := rels(res); !reflect.DeepEqual(got, want) {
+		t.Fatalf("entries = %v, want %v (mount points kept, subtrees dropped)", got, want)
+	}
+	if got := res.SkippedMounts; !reflect.DeepEqual(got, []string{"mnt", "sub/mnt2"}) {
+		t.Fatalf("SkippedMounts = %v, want [mnt sub/mnt2]", got)
+	}
+	if res.RawBytes != 3 {
+		t.Fatalf("RawBytes = %d, want 3 (nothing under a mount point is charged)", res.RawBytes)
+	}
+
+	// Without -xdev the same tree is walked whole and nothing is reported.
+	all := mustWalk(t, Options{Root: root})
+	if len(all.SkippedMounts) != 0 {
+		t.Fatalf("SkippedMounts = %v without OneFileSystem, want none", all.SkippedMounts)
+	}
+	if len(all.Entries) != 9 {
+		t.Fatalf("entries without OneFileSystem = %v, want all 9", rels(all))
+	}
+}
+
+// TestUnreadableFileIsAProblemAndNotAnEntry pins the guard against silent data
+// loss: mksquashfs exits 0 on a source file it cannot open and writes an empty
+// file in its place, so an unreadable file must never reach it. The walker
+// reports it as a problem and leaves it out of Entries, Files and RawBytes.
+func TestUnreadableFileIsAProblemAndNotAnEntry(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("running as root: permission bits do not apply")
+	}
+	root := mkTree(t, "f:visible:aa", "d:sub", "f:sub/secret:aaaa", "f:sub/ok:a")
+	secret := filepath.Join(root, "sub", "secret")
+	if err := os.Chmod(secret, 0o000); err != nil {
+		t.Fatalf("chmod: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(secret, 0o644) })
+
+	res, err := Walk(context.Background(), Options{Root: root})
+	if err != nil {
+		t.Fatalf("Walk returned a fatal error: %v", err)
+	}
+	if got := rels(res); !reflect.DeepEqual(got, []string{"sub", "sub/ok", "visible"}) {
+		t.Fatalf("entries = %v, want [sub sub/ok visible] — the unreadable file must not be listed", got)
+	}
+	if len(res.Errors) != 1 {
+		t.Fatalf("Errors = %v, want exactly one", res.Errors)
+	}
+	if res.Errors[0].Path != secret {
+		t.Fatalf("problem path = %q, want %q", res.Errors[0].Path, secret)
+	}
+	if !errors.Is(res.Errors[0], os.ErrPermission) {
+		t.Fatalf("problem error = %v, want a permission error", res.Errors[0].Err)
+	}
+	if res.Files != 2 || res.RawBytes != 3 {
+		t.Fatalf("Files=%d RawBytes=%d, want 2 and 3 (the unreadable file is not counted)", res.Files, res.RawBytes)
+	}
+}
+
+// TestUnreadableFileGoesToOnError is the same guard through the callback path,
+// which is what a caller that streams problems relies on.
+func TestUnreadableFileGoesToOnError(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("running as root: permission bits do not apply")
+	}
+	root := mkTree(t, "f:a:x", "f:locked:xyz")
+	locked := filepath.Join(root, "locked")
+	if err := os.Chmod(locked, 0o000); err != nil {
+		t.Fatalf("chmod: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(locked, 0o644) })
+
+	var seen, problems []string
+	res, err := Walk(context.Background(), Options{
+		Root:    root,
+		OnEntry: func(e Entry) { seen = append(seen, e.Rel) },
+		OnError: func(path string, err error) { problems = append(problems, path) },
+	})
+	if err != nil {
+		t.Fatalf("Walk: %v", err)
+	}
+	if !reflect.DeepEqual(seen, []string{"a"}) {
+		t.Fatalf("OnEntry saw %v, want [a]", seen)
+	}
+	if !reflect.DeepEqual(problems, []string{locked}) {
+		t.Fatalf("OnError saw %v, want [%s]", problems, locked)
+	}
+	if len(res.Errors) != 0 {
+		t.Fatalf("Errors = %v, want none when OnError is set", res.Errors)
+	}
+}
+
+// TestNonRegularEntriesAreNeverOpened: the readability check opens regular
+// files only. A fifo with no writer would block an open forever, and the walk
+// with it, so it must be classified and reported without ever being opened.
+// The test would hang, not fail, if that rule were broken — hence the timeout.
+func TestNonRegularEntriesAreNeverOpened(t *testing.T) {
+	root := mkTree(t, "p:pipe", "f:a:x")
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	done := make(chan *Result, 1)
+	go func() {
+		res, err := Walk(ctx, Options{Root: root})
+		if err != nil {
+			t.Errorf("Walk: %v", err)
+		}
+		done <- res
+	}()
+	select {
+	case res := <-done:
+		if res == nil {
+			return
+		}
+		if got := rels(res); !reflect.DeepEqual(got, []string{"a", "pipe"}) {
+			t.Fatalf("entries = %v, want [a pipe]", got)
+		}
+		if len(res.Errors) != 0 {
+			t.Fatalf("Errors = %v, want none", res.Errors)
+		}
+	case <-ctx.Done():
+		t.Fatal("Walk blocked on a fifo: it must not open non-regular entries")
 	}
 }
 

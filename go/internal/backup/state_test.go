@@ -197,6 +197,159 @@ func TestCheckResume(t *testing.T) {
 	}
 }
 
+// TestCheckGeometryRefusesAChangedSetting pins the mid-set geometry refusal:
+// every setting that feeds the image budget is recorded when the set starts,
+// and a resume that finds any of them changed stops in preflight, naming the
+// setting and both values, instead of building discs to a different size and
+// failing hours later at the size check.
+func TestCheckGeometryRefusesAChangedSetting(t *testing.T) {
+	t.Parallel()
+	rec := Geometry{DiscType: "bd25", CapacityBytes: 25025314816, ReserveBytes: 104857600, Par2Redundancy: 10}
+	st := &State{Version: StateVersion, DiscsDone: 3}
+	st.setGeometry(rec)
+	if err := st.checkGeometry(rec); err != nil {
+		t.Fatalf("checkGeometry against the recorded geometry: %v", err)
+	}
+
+	tests := []struct {
+		name string
+		now  Geometry
+		want []string
+	}{
+		{
+			name: "disc type and capacity",
+			now:  Geometry{DiscType: "bd50", CapacityBytes: 50050629632, ReserveBytes: 104857600, Par2Redundancy: 10},
+			want: []string{"DISC_TYPE was bd25, is now bd50", "25025314816", "50050629632", "3 disc(s)"},
+		},
+		{
+			name: "capacity override alone",
+			now:  Geometry{DiscType: "bd25", CapacityBytes: 24000000000, ReserveBytes: 104857600, Par2Redundancy: 10},
+			want: []string{"DISC_CAPACITY_BYTES", "25025314816", "24000000000"},
+		},
+		{
+			name: "reserve",
+			now:  Geometry{DiscType: "bd25", CapacityBytes: 25025314816, ReserveBytes: 209715200, Par2Redundancy: 10},
+			want: []string{"RESERVE_BYTES was 104857600, is now 209715200"},
+		},
+		{
+			name: "redundancy",
+			now:  Geometry{DiscType: "bd25", CapacityBytes: 25025314816, ReserveBytes: 104857600, Par2Redundancy: 15},
+			want: []string{"PAR2_REDUNDANCY was 10, is now 15"},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			err := st.checkGeometry(tc.now)
+			if err == nil {
+				t.Fatal("checkGeometry accepted a changed geometry")
+			}
+			if !errors.Is(err, ErrStateMismatch) {
+				t.Errorf("error %v does not wrap ErrStateMismatch", err)
+			}
+			for _, w := range tc.want {
+				if !strings.Contains(err.Error(), w) {
+					t.Errorf("error %q does not mention %q", err, w)
+				}
+			}
+			for _, w := range []string{"start over", "restore the recorded settings"} {
+				if !strings.Contains(err.Error(), w) {
+					t.Errorf("error %q does not offer %q", err, w)
+				}
+			}
+		})
+	}
+
+	// A state file that recorded no geometry — written before the fields
+	// existed — cannot be checked and must not be refused for it.
+	old := &State{Version: StateVersion, DiscsDone: 1}
+	if err := old.checkGeometry(rec); err != nil {
+		t.Errorf("checkGeometry against a state without geometry: %v", err)
+	}
+}
+
+// TestCheckRecipientsRefusesAChangedFile pins the recipients refusal: a key
+// added (init-key --rescue-key mid-campaign) or removed splits the set between
+// two recipient sets while the manifest attributes one set to every disc, so
+// a resume that finds the file changed stops and says which keys the finished
+// discs are encrypted to and which the file holds now.
+func TestCheckRecipientsRefusesAChangedFile(t *testing.T) {
+	t.Parallel()
+	const (
+		k1 = "age1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq1"
+		k2 = "age1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq2"
+		k3 = "age1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq3"
+	)
+	st := &State{Version: StateVersion, DiscsDone: 2}
+	st.setRecipients([]string{k2, k1})
+	if got := st.Recipients; len(got) != 2 || got[0] != k1 || got[1] != k2 {
+		t.Fatalf("setRecipients recorded %v, want them sorted", got)
+	}
+
+	// Same keys, either order: the file's line order is not part of the set.
+	for _, same := range [][]string{{k1, k2}, {k2, k1}} {
+		if err := st.checkRecipients(same); err != nil {
+			t.Errorf("checkRecipients(%v) = %v, want nil", same, err)
+		}
+	}
+	tests := []struct {
+		name string
+		now  []string
+	}{
+		{"a key appended", []string{k1, k2, k3}},
+		{"a key removed", []string{k1}},
+		{"a key replaced", []string{k1, k3}},
+		{"the file emptied", nil},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			err := st.checkRecipients(tc.now)
+			if err == nil {
+				t.Fatal("checkRecipients accepted a changed recipient set")
+			}
+			if !errors.Is(err, ErrStateMismatch) {
+				t.Errorf("error %v does not wrap ErrStateMismatch", err)
+			}
+			for _, w := range append([]string{k1, k2, "2 disc(s)", "restore the recipients file", "start over"}, tc.now...) {
+				if !strings.Contains(err.Error(), w) {
+					t.Errorf("error %q does not mention %q", err, w)
+				}
+			}
+		})
+	}
+
+	// A public archive records its one key as PublicKey and no Recipients, and
+	// so does a state file from before the field existed: nothing to compare.
+	if err := (&State{Version: StateVersion, DiscsDone: 1}).checkRecipients([]string{k1}); err != nil {
+		t.Errorf("checkRecipients against a state without recipients: %v", err)
+	}
+}
+
+// TestStateRoundTripsRecipientsAndGeometry: the pins are only worth anything
+// if they survive the trip through state.json.
+func TestStateRoundTripsRecipientsAndGeometry(t *testing.T) {
+	t.Parallel()
+	path := filepath.Join(t.TempDir(), "state.json")
+	st := newState("arch", "/src", 1.0, time.Now())
+	st.DiscsDone, st.Assigned = 1, []string{"a"}
+	st.setGeometry(Geometry{DiscType: "bdxl100", CapacityBytes: 100103356416, ReserveBytes: 5, Par2Redundancy: 7})
+	st.setRecipients([]string{"age1zzz", "age1aaa"})
+	if err := SaveState(path, st); err != nil {
+		t.Fatalf("SaveState: %v", err)
+	}
+	got, err := LoadState(path)
+	if err != nil {
+		t.Fatalf("LoadState: %v", err)
+	}
+	if got.DiscType != "bdxl100" || got.CapacityBytes != 100103356416 || got.ReserveBytes != 5 || got.Par2Redundancy != 7 {
+		t.Errorf("geometry did not round-trip: %+v", got)
+	}
+	if len(got.Recipients) != 2 || got.Recipients[0] != "age1aaa" || got.Recipients[1] != "age1zzz" {
+		t.Errorf("recipients did not round-trip: %v", got.Recipients)
+	}
+}
+
 func TestAssignedSet(t *testing.T) {
 	t.Parallel()
 	st := &State{Assigned: []string{"a", "b", "a"}}

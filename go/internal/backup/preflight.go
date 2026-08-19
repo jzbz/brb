@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -53,8 +54,12 @@ func (r *runner) preflight(ctx context.Context) error {
 	}
 	r.warnPar2Cost()
 	if os.Geteuid() != 0 {
-		r.p.Warn("not running as root: files you cannot read will be skipped, " +
-			"and ownership is recorded as yours")
+		// Precisely what happens: the scan opens every regular file, reports the
+		// ones it cannot read, and leaves them out of the set. Nothing is
+		// "skipped" quietly — mksquashfs would have written an empty file in
+		// place of each and said nothing, which is why the scan checks first.
+		r.p.Warn("not running as root: files you cannot read are reported by the scan and left " +
+			"out of the set (they will NOT be on any disc), and ownership is recorded as yours")
 	}
 	if err := r.prepareState(ctx); err != nil {
 		return err
@@ -123,9 +128,33 @@ func (r *runner) loadRecipients() error {
 	if err != nil {
 		return err
 	}
+	if err := probeRecipients(recs); err != nil {
+		return fmt.Errorf("backup: recipients file %s: age refuses to encrypt to this set of keys: %w — "+
+			"a set may not mix post-quantum (age1pq1...) and classic (age1...) recipients; edit the file so "+
+			"it holds one kind only, and re-run", path, err)
+	}
 	r.recipients, r.pubkeys = recs, keys
 	r.p.OK("recipients: %d key(s) from %s", len(recs), path)
 	return nil
+}
+
+// probeRecipients encrypts a few bytes to recs, in memory and to nowhere, and
+// returns whatever age refuses with. It exists because parsing a recipients
+// file proves each key well-formed and nothing about the set: age (1.3 on)
+// refuses to encrypt to a set that mixes post-quantum and classic recipients,
+// AppendRecipient and ParseRecipientsFile both accept such a file, and the
+// refusal used to land in protect() — after disc 1's mksquashfs, an hour in.
+// The probe is the same call Encrypt makes, so anything age will object to
+// about the set is objected to here, in preflight, at the cost of one header.
+func probeRecipients(recs []age.Recipient) error {
+	w, err := age.Encrypt(io.Discard, recs...)
+	if err != nil {
+		return err
+	}
+	if _, err := w.Write([]byte("brb")); err != nil {
+		return err
+	}
+	return w.Close()
 }
 
 // preparePublicIdentity establishes the keypair a public archive is encrypted
@@ -376,6 +405,17 @@ func (r *runner) prepareState(ctx context.Context) error {
 	if err := old.checkPublicMode(r.cfg.PublicArchive); err != nil {
 		return err
 	}
+	// Likewise the keys and the geometry: both are fixed by the discs already
+	// on the shelf, and neither can be changed for the ones still to come
+	// without splitting the set. loadRecipients has already read the file this
+	// run would encrypt to (r.pubkeys is empty for a public archive, whose
+	// state recorded no Recipients, so that comparison is vacuous there).
+	if err := old.checkRecipients(r.pubkeys); err != nil {
+		return err
+	}
+	if err := old.checkGeometry(r.geometry()); err != nil {
+		return err
+	}
 	if _, err := os.Stat(indexPath); errors.Is(err, fs.ErrNotExist) {
 		// A run that got as far as encrypting the index deletes the plaintext
 		// one; resuming such a set only has the later steps left to do.
@@ -430,7 +470,28 @@ func (r *runner) startFresh(indexPath string) error {
 		return fmt.Errorf("backup: removing stale public-archive key %s: %w", r.publicIdentityPath(), err)
 	}
 	r.st = newState(r.cfg.ArchiveName, r.cfg.SourceDir, r.packRatio, r.started)
+	// Pin what a resume must not be allowed to change: the disc geometry the
+	// images are packed to, and — for an ordinary set — the keys they are
+	// encrypted to. A public archive records its one key as PublicKey instead,
+	// in preparePublicIdentity, which runs after this.
+	r.st.setGeometry(r.geometry())
+	if !r.cfg.PublicArchive {
+		r.st.setRecipients(r.pubkeys)
+	}
 	return nil
+}
+
+// geometry is the disc geometry this run packs to, in the form the resume
+// state records and checks. Capacity is the effective one (DISC_CAPACITY_BYTES
+// when set, else the media type's), so an override and its equivalent media
+// type compare equal.
+func (r *runner) geometry() Geometry {
+	return Geometry{
+		DiscType:       r.cfg.DiscType.String(),
+		CapacityBytes:  r.cfg.Capacity(),
+		ReserveBytes:   r.cfg.ReserveBytes,
+		Par2Redundancy: r.cfg.Par2Redundancy,
+	}
 }
 
 // confirmStaging makes the operator acknowledge that staging holds plaintext.

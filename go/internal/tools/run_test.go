@@ -281,3 +281,38 @@ func TestSplitLogSegment(t *testing.T) {
 		})
 	}
 }
+
+// ExitCode is what lets a caller tell unsquashfs's "finished with non-fatal
+// errors" (2) from "aborted" (1). It has to read the status out of run()'s
+// wrapped error, and answer -1 for every error that carries no status — a
+// child that never started, one killed by cancellation — so that no caller
+// can mistake "no status" for the one it is looking for.
+func TestExitCode(t *testing.T) {
+	sh := shell(t)
+	for _, want := range []int{1, 2, 3} {
+		err := run(context.Background(), runSpec{
+			name: "sh", path: sh, args: []string{"-c", "exit " + strconv.Itoa(want)},
+		})
+		if got := ExitCode(err); got != want {
+			t.Errorf("ExitCode(exit %d) = %d", want, got)
+		}
+	}
+	if got := ExitCode(nil); got != -1 {
+		t.Errorf("ExitCode(nil) = %d, want -1", got)
+	}
+	if got := ExitCode(errors.New("something else")); got != -1 {
+		t.Errorf("ExitCode(plain error) = %d, want -1", got)
+	}
+	err := run(context.Background(), runSpec{name: "nope", path: filepath.Join(t.TempDir(), "missing")})
+	if got := ExitCode(err); got != -1 {
+		t.Errorf("ExitCode(start failure) = %d, want -1", got)
+	}
+	// A cancelled child exits by signal, and the error reports the cause, not
+	// a status: -1 again, never something a caller would act on.
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	err = run(ctx, runSpec{name: "sh", path: sh, args: []string{"-c", "sleep 30"}})
+	if got := ExitCode(err); got != -1 {
+		t.Errorf("ExitCode(cancelled) = %d, want -1", got)
+	}
+}

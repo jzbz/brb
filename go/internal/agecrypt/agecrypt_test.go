@@ -480,3 +480,47 @@ func TestWriteEncryptedIdentityFileRefusals(t *testing.T) {
 		t.Errorf("a failed write left %s behind", fresh)
 	}
 }
+
+// createPart, which every encrypt, decrypt and sum-file write goes through,
+// must never open through a symlink planted at the .part path: the staging
+// directory's default lives under /var/tmp. The link is removed and the
+// output lands under the intended name, with the link's target untouched.
+func TestCreatePartDoesNotFollowAPlantedSymlink(t *testing.T) {
+	dir := t.TempDir()
+	victim := filepath.Join(dir, "victim")
+	writeFile(t, victim, []byte("theirs"))
+	dst := filepath.Join(dir, "disc01.squashfs")
+	if err := os.Symlink(victim, dst+".part"); err != nil {
+		t.Fatal(err)
+	}
+	f, finish, err := createPart(dst, partModePrivate)
+	if err != nil {
+		t.Fatalf("createPart: %v", err)
+	}
+	if _, err := f.WriteString("plaintext"); err != nil {
+		t.Fatal(err)
+	}
+	if err := finish(nil); err != nil {
+		t.Fatalf("finish: %v", err)
+	}
+	if got, _ := os.ReadFile(victim); string(got) != "theirs" {
+		t.Fatalf("the planted symlink was followed: victim holds %q", got)
+	}
+	if got, _ := os.ReadFile(dst); string(got) != "plaintext" {
+		t.Fatalf("dst holds %q, want the written data", got)
+	}
+	// And a stale .part from an interrupted run is simply replaced, which is
+	// what the writer's --resume relies on.
+	writeFile(t, dst+".part", []byte("half-written"))
+	f, finish, err = createPart(dst, partModePrivate)
+	if err != nil {
+		t.Fatalf("createPart over a stale .part: %v", err)
+	}
+	f.WriteString("fresh")
+	if err := finish(nil); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := os.ReadFile(dst); string(got) != "fresh" {
+		t.Fatalf("dst holds %q, want the fresh data", got)
+	}
+}

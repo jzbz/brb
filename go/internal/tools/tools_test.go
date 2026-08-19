@@ -268,3 +268,94 @@ func TestRemovePar2CleansUpBothNamingForms(t *testing.T) {
 		})
 	}
 }
+
+// TestRemovePar2InADirectoryNamedLikeAGlob is the regression for the bug that
+// motivated Par2VolumeNames: the directory used to be pasted into a
+// filepath.Glob pattern, so a staging path containing '[' — here, literally
+// "a[1]" — matched nothing and a failed create left its half-written volumes
+// behind for the next run to trip over.
+func TestRemovePar2InADirectoryNamedLikeAGlob(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "a[1]")
+	if err := os.Mkdir(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	remove := []string{"disc01.squashfs.age.par2", "disc01.squashfs.age.vol000+30.par2"}
+	keep := []string{"disc01.squashfs.age", "disc01.squashfs.age.sha512", "disc02.squashfs.age.par2"}
+	for _, n := range append(append([]string{}, keep...), remove...) {
+		if err := os.WriteFile(filepath.Join(dir, n), []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := Par2VolumeNames(dir, "disc01.squashfs.age"); !slices.Equal(got, remove) {
+		t.Fatalf("Par2VolumeNames = %v, want %v", got, remove)
+	}
+	removePar2(dir, "disc01.squashfs.age")
+	for _, n := range remove {
+		if _, err := os.Stat(filepath.Join(dir, n)); !errors.Is(err, fs.ErrNotExist) {
+			t.Errorf("%s survived removePar2 in a directory named like a glob: %v", n, err)
+		}
+	}
+	for _, n := range keep {
+		if _, err := os.Stat(filepath.Join(dir, n)); err != nil {
+			t.Errorf("removePar2 deleted %s, which it does not own: %v", n, err)
+		}
+	}
+}
+
+// TestMksquashfsReadFailure pins the recogniser for the one mksquashfs message
+// that means "I backed this file up as nothing and exited 0". The exact text
+// is the one mksquashfs 4.7 prints; the partial shapes guard against a reword.
+func TestMksquashfsReadFailure(t *testing.T) {
+	tests := []struct {
+		line string
+		file string
+		ok   bool
+	}{
+		{"Failed to read file locked, creating empty file", "locked", true},
+		{"Failed to read file sub/dir/secret.txt, creating empty file\n", "sub/dir/secret.txt", true},
+		{"Failed to read file odd, name.txt, creating empty file", "odd, name.txt", true},
+		{"Failed to read file x", "x", true},
+		{"file y, creating empty file", "file y", true},
+		{"Parallel mksquashfs: Using 32 processors", "", false},
+		{"Creating 4.0 filesystem on out.sqfs, block size 131072.", "", false},
+		{"Number of files 2", "", false},
+		{"", "", false},
+	}
+	for _, tc := range tests {
+		file, ok := MksquashfsReadFailure(tc.line)
+		if ok != tc.ok || file != tc.file {
+			t.Errorf("MksquashfsReadFailure(%q) = (%q, %v), want (%q, %v)", tc.line, file, ok, tc.file, tc.ok)
+		}
+	}
+}
+
+// TestReadFailureWatchSplitsLinesItself feeds the watcher the way a writer that
+// batches several lines per Write would, and one that dribbles a line across
+// several Writes: it must find every failure either way, and forward the bytes
+// untouched to the caller's log.
+func TestReadFailureWatchSplitsLinesItself(t *testing.T) {
+	var log strings.Builder
+	w := &readFailureWatch{out: &log}
+	chunks := []string{
+		"Parallel mksquashfs: Using 4 processors\nFailed to read file a, creating empty file\nCreating 4.0",
+		" filesystem\nFailed to read file dir/b, crea",
+		"ting empty file\n",
+		"Failed to read file c, creating empty file", // no trailing newline
+	}
+	for _, c := range chunks {
+		if _, err := w.Write([]byte(c)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	w.flush()
+	if got := w.failed(); !slices.Equal(got, []string{"a", "dir/b", "c"}) {
+		t.Fatalf("failed = %v, want [a dir/b c]", got)
+	}
+	if got := log.String(); got != strings.Join(chunks, "") {
+		t.Fatalf("log was altered:\n%q\nwant\n%q", got, strings.Join(chunks, ""))
+	}
+	if err := readFailureError(w.failed()); !strings.Contains(err.Error(), "EMPTY files") ||
+		!strings.Contains(err.Error(), "dir/b") {
+		t.Fatalf("readFailureError = %v, want it to name the files and the consequence", err)
+	}
+}

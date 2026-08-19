@@ -10,6 +10,7 @@ import (
 	"io"
 	"io/fs"
 	"os"
+	"path"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -83,6 +84,12 @@ func Restore(ctx context.Context, o Options, ro RestoreOptions) error {
 	if ro.Dest == "" {
 		return errors.New("restore: no destination given")
 	}
+	// Cleaned before any check looks at it. A destination spelled with a
+	// trailing slash — "dest/" — is resolved by the kernel before Lstat ever
+	// sees it, so refuseSymlinkedDirs handed "dest/" walks the link's TARGET,
+	// finds nothing to refuse, and the whole archive lands outside the
+	// destination. brb.sh strips the slash first; so does this.
+	ro.Dest = filepath.Clean(ro.Dest)
 	if err := o.Tools.Require(tools.Unsquashfs); err != nil {
 		return fmt.Errorf("restore: %w", err)
 	}
@@ -90,6 +97,23 @@ func Restore(ctx context.Context, o Options, ro RestoreOptions) error {
 		if strings.TrimSpace(p) == "" {
 			return fmt.Errorf("restore: --only path %d is empty", i+1)
 		}
+		// "." names the archive root, and so does "./", "/" or anything that
+		// cleans to nothing. covers() treats that as matching every entry, so
+		// the pre-check says every disc holds it, and unsquashfs handed "." as
+		// an extraction operand extracts nothing at all — leaving a run that
+		// reports success having restored not one file. Whoever typed it meant
+		// the whole tree, and that is what a restore without --only does.
+		if isArchiveRoot(p) {
+			return fmt.Errorf("restore --only %s: that is the whole tree — run restore without --only", p)
+		}
+	}
+	// The restore directory is about to receive every disc's plaintext, and
+	// the enc directory is what the images, their hashes and a public set's
+	// staged key are read from; both have to be real directories of ours
+	// before anything is read from, reaped from or written into them.
+	// PrepareImage checks again per image, cheaply.
+	if err := o.secureStaging(o.dirs().Enc, o.dirs().Restore); err != nil {
+		return err
 	}
 	// Fail on a missing key now rather than after hours of hashing, and hold on
 	// to what was loaded: this command decrypts the index and then one image
@@ -201,17 +225,16 @@ func Restore(ctx context.Context, o Options, ro RestoreOptions) error {
 			}
 		}
 
-		log := o.logWriter()
-		err = o.Tools.Unsquashfs(ctx, tools.UnsqOptions{
-			Image:         plain,
-			Dest:          ro.Dest,
-			Only:          here,
-			Force:         true,
-			Xattrs:        true,
-			XattrsInclude: restorableXattrs(),
-			Log:           log,
-		})
-		log.Close()
+		// The destination may already hold a symlink at a path this image
+		// holds as a directory — planted, or an honest one under a live $HOME
+		// — and unsquashfs -f applies the archive directory's mode, owner and
+		// times through it to whatever it points at. Refused per image,
+		// against this image's own directory list.
+		if err := o.refuseSymlinksAtImageDirs(ctx, plain, ro.Dest, here); err != nil {
+			return err
+		}
+
+		err = o.extractImage(ctx, plain, ro.Dest, here)
 		switch {
 		case err == nil:
 			extracted++
@@ -373,11 +396,14 @@ func (o Options) confirmNonEmptyDest(dest string) error {
 // refuseSymlinkedDirs fails when anything already under dest is a symlink that
 // resolves to a directory. unsquashfs -f traverses such a link — at any depth,
 // not just the top level — and writes the archive's files through it, outside
-// the destination. A symlink to a file is safe (unsquashfs unlinks and
-// replaces it as an entry) and is left alone. Within one run this needs
-// checking only before the first image: the skeleton on every disc makes a
-// path either a directory or a leaf across the whole set, so nothing a disc
-// extracts turns into a traversal for the next one.
+// the destination. A symlink to a file, or a dangling one, is left alone here:
+// at a path the archive holds as a file unsquashfs unlinks and replaces it as
+// an entry, which is safe, and at a path the archive holds as a directory it
+// is caught per image by refuseSymlinksAtImageDirs, which knows which paths
+// those are. Within one run this needs checking only before the first image:
+// the skeleton on every disc makes a path either a directory or a leaf across
+// the whole set, so nothing a disc extracts turns into a traversal for the
+// next one.
 func refuseSymlinkedDirs(dest string) error {
 	var bad []string
 	err := filepath.WalkDir(dest, func(p string, d fs.DirEntry, err error) error {
@@ -405,6 +431,196 @@ func refuseSymlinkedDirs(dest string) error {
 		return fmt.Errorf("restore: %s contains symlink(s) to directories (%s); unsquashfs -f would follow them and "+
 			"write the backup's files OUTSIDE the destination — remove them, or restore into an empty directory and merge by hand",
 			dest, strings.Join(bad, ", "))
+	}
+	return nil
+}
+
+// isArchiveRoot reports whether a --only path names the archive root rather
+// than something in it: ".", "./", "/", "" and anything that cleans to one of
+// those. covers() treats such a path as matching every entry, so it passes the
+// index and the per-image pre-check, and unsquashfs handed "." as an extraction
+// operand extracts nothing — the combination that once reported success with
+// an empty destination.
+func isArchiveRoot(p string) bool {
+	return path.Clean("/"+strings.TrimSpace(p)) == "/"
+}
+
+// unsquashfsLogName is the file the restore staging directory keeps
+// unsquashfs's output in while an image is extracted, and afterwards when it
+// exited non-fatally: "unsquashfs.disc03.squashfs.log", brb.sh's name for the
+// same file, so an operator told to look at one finds it under either reader.
+func unsquashfsLogName(image string) string {
+	return "unsquashfs." + filepath.Base(image) + ".log"
+}
+
+// extractImage runs unsquashfs over one decrypted image, keeping its output in
+// a log file under the restore staging directory as well as on the terminal.
+//
+// unsquashfs distinguishes two failures. Exit 1 means it aborted; exit 2 means
+// it extracted everything and could not restore some attribute — an owner as
+// non-root, an xattr on NFS, CIFS or exFAT, a mode a filesystem cannot hold —
+// which is routine and leaves every file present and correct. This used to
+// treat both as fatal, throwing away a multi-disc restore over the second, and
+// brb.sh does not: it warns, keeps the log, and goes on to the next disc. So
+// does this. On a clean exit the log is removed; on exit 2 it is kept and the
+// warning names it; on anything else it is kept and the error names it, since
+// unsquashfs's own words are the diagnosis.
+func (o Options) extractImage(ctx context.Context, image, dest string, only []string) error {
+	name := filepath.Base(image)
+	logPath := filepath.Join(o.dirs().Restore, unsquashfsLogName(image))
+	lf, err := createFresh(logPath, 0o600)
+	if err != nil {
+		return fmt.Errorf("restore: %w", err)
+	}
+	steps := o.logWriter()
+	err = o.Tools.Unsquashfs(ctx, tools.UnsqOptions{
+		Image:         image,
+		Dest:          dest,
+		Only:          only,
+		Force:         true,
+		Xattrs:        true,
+		XattrsInclude: restorableXattrs(),
+		Log:           io.MultiWriter(lf, steps),
+	})
+	steps.Close()
+	if cerr := lf.Close(); cerr != nil && err == nil {
+		o.UI.Warn("could not finish writing %s: %v", logPath, cerr)
+	}
+	switch {
+	case err == nil:
+		os.Remove(logPath)
+		return nil
+	case ctx.Err() != nil:
+		os.Remove(logPath)
+		return err
+	case tools.ExitCode(err) == 2:
+		o.UI.Warn("unsquashfs reported non-fatal errors on %s — see %s", name, logPath)
+		return nil
+	default:
+		return fmt.Errorf("%w (its output is in %s)", err, logPath)
+	}
+}
+
+// listedDir turns one line of an "unsquashfs -ll" listing into an
+// archive-relative directory path, or ok=false for any other line — a file, a
+// symlink, the archive root, or the chatter some versions print first.
+//
+// The long listing's line is "<mode> <user>/<group> <size> <date> <time>
+// <path>", with the size right-aligned in a padded field and exactly one space
+// before the path — so the path is everything after the fifth field's single
+// trailing space, whatever it contains. Nothing is trimmed off the end: a
+// trailing '\r' is part of a name. A name holding '\n' cannot survive a
+// line-based listing; the second half of it will fail to parse and be skipped.
+func listedDir(line string) (string, bool) {
+	if !strings.HasPrefix(line, "d") {
+		return "", false
+	}
+	rest := line
+	for i := 0; i < 5; i++ {
+		rest = strings.TrimLeft(rest, " ")
+		j := strings.IndexByte(rest, ' ')
+		if j < 0 {
+			return "", false
+		}
+		rest = rest[j:]
+	}
+	if len(rest) < 2 {
+		return "", false
+	}
+	return archivePath(rest[1:])
+}
+
+// extractionTouches reports whether unsquashfs, asked for only these paths,
+// will create or re-attribute the archive directory dir: it does when dir is
+// one of them, is under one of them, or is an ancestor it has to pass through
+// — unsquashfs sets attributes on every directory it descends into, not only
+// on the ones named. An empty only extracts everything and touches every one.
+func extractionTouches(only []string, dir string) bool {
+	if len(only) == 0 {
+		return true
+	}
+	for _, p := range only {
+		if covers(p, dir) || strings.HasPrefix(strings.Trim(p, "/"), dir+"/") {
+			return true
+		}
+	}
+	return false
+}
+
+// refuseSymlinksAtImageDirs fails when the destination already holds a symlink
+// — to anything, or to nothing — at a path this image holds as a directory
+// and is about to extract.
+//
+// refuseSymlinkedDirs catches a link that resolves to a directory, which is the
+// traversal case. This is the other case: a link that resolves to a file, or
+// dangles. unsquashfs -f finds the path taken, carries on, and at the end of
+// the directory applies the archive's mode, owner, mtime and xattrs to the
+// path — through the link, onto whatever it points at. Reproduced: a planted
+// "Documents -> /etc/shadow" under a restore run as root left /etc/shadow
+// world-readable with the backup's timestamp. Where the archive directory has
+// children unsquashfs aborts instead, which is safe but no better a message
+// than this one.
+//
+// The image itself is asked which paths are directories, via its long listing,
+// because a directory that is empty in the archive — the empty skeleton
+// directories every disc carries, most of all — is in no index and casts no
+// shadow in the destination until it is created. It is checked per image
+// rather than once, and only against the archive's directories: the symlinks
+// disc 1 itself extracted, at paths the archive holds as symlinks or files,
+// are the very thing that must not stop disc 2. With --only, only the
+// directories that extraction will actually touch are checked, so a live
+// $HOME's unrelated symlinks do not block fetching one file back into it.
+func (o Options) refuseSymlinksAtImageDirs(ctx context.Context, image, dest string, only []string) error {
+	pr, pw := io.Pipe()
+	done := make(chan error, 1)
+	go func() {
+		err := o.Tools.UnsquashfsList(ctx, image, pw)
+		pw.CloseWithError(err)
+		done <- err
+	}()
+
+	var bad []string
+	sc := bufio.NewScanner(pr)
+	sc.Buffer(make([]byte, 0, 64<<10), maxIndexLine)
+	sc.Split(scanLinesKeepCR)
+	for i := 0; sc.Scan(); i++ {
+		if i%4096 == 0 {
+			if err := ctx.Err(); err != nil {
+				pr.CloseWithError(err)
+				<-done
+				return err
+			}
+		}
+		rel, ok := listedDir(sc.Text())
+		if !ok || !extractionTouches(only, rel) {
+			continue
+		}
+		p := filepath.Join(dest, filepath.FromSlash(rel))
+		fi, err := os.Lstat(p)
+		if err != nil || fi.Mode()&fs.ModeSymlink == 0 {
+			continue
+		}
+		target, _ := os.Readlink(p)
+		bad = append(bad, fmt.Sprintf("%s -> %s", p, target))
+		if len(bad) >= 5 {
+			break
+		}
+	}
+	// Drain and close so the child is never left writing into a full pipe, then
+	// take its exit status: a listing that failed has vouched for nothing.
+	_, _ = io.Copy(io.Discard, pr)
+	pr.Close()
+	if err := <-done; err != nil {
+		return fmt.Errorf("restore: listing the directories of %s: %w", filepath.Base(image), err)
+	}
+	if err := sc.Err(); err != nil {
+		return fmt.Errorf("restore: reading the listing of %s: %w", filepath.Base(image), err)
+	}
+	if len(bad) > 0 {
+		return fmt.Errorf("restore: %s holds symlink(s) where %s has directories (%s); unsquashfs -f would apply the "+
+			"backup's directory mode, owner and times THROUGH them to whatever they point at — "+
+			"remove them, or restore into an empty directory and merge by hand",
+			dest, filepath.Base(image), strings.Join(bad, ", "))
 	}
 	return nil
 }

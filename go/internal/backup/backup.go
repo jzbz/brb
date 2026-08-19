@@ -185,6 +185,12 @@ type runner struct {
 	// written, so the plaintext index it was built from is legitimately gone.
 	indexBuilt bool
 
+	// skippedMounts holds the mount points the scan stopped at, relative to
+	// SOURCE_DIR. They are warned about when the scan reports them and listed
+	// again in MANIFEST.txt's "excluded from this backup" section, so a disc
+	// read years later still says what was under the tree and not on the set.
+	skippedMounts []string
+
 	// discCipher and indexCipher hold the ciphertext digests this run measured
 	// while encrypting, so SHA512SUMS does not re-read twenty gigabytes per
 	// disc to arrive at the same numbers. A disc finished by an earlier run is
@@ -340,7 +346,7 @@ func (r *runner) scan(ctx context.Context) (*scan.Result, error) {
 		len(res.Entries), ui.HumanBytes(res.RawBytes))
 
 	if n := len(res.Errors); n > 0 {
-		r.p.Warn("%d path(s) could not be read and were skipped", n)
+		r.p.Warn("%d path(s) could not be read and were skipped — they will NOT be on any disc", n)
 		for i, e := range res.Errors {
 			if i == 10 {
 				r.p.Step("... and %d more", n-10)
@@ -348,6 +354,18 @@ func (r *runner) scan(ctx context.Context) (*scan.Result, error) {
 			}
 			r.p.Step("%s", e.Error())
 		}
+	}
+	// A mount point under SOURCE_DIR is kept as an empty directory and its whole
+	// subtree left out, because the scan does not cross filesystems (find -xdev
+	// in brb.sh, OneFileSystem here). That is deliberate — a backup of /home
+	// must not swallow the NAS mounted under it — but it used to be silent, and
+	// a silent omission of an entire subtree is a data-loss report waiting to
+	// happen. Say so, name the paths, and carry them into the manifest.
+	r.skippedMounts = res.SkippedMounts
+	if n := len(res.SkippedMounts); n > 0 {
+		r.p.Warn("%d mounted subtree(s) under %s are NOT included — brb does not cross filesystem "+
+			"boundaries; back each one up as its own SOURCE_DIR if you want it:", n, r.cfg.SourceDir)
+		reportPaths(r.p, res.SkippedMounts)
 	}
 	// Two groups, because only one of them is handled: the index escapes tab and
 	// newline, and passes every other control byte through verbatim. Saying

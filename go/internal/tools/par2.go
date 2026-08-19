@@ -69,18 +69,48 @@ func (s *Set) Par2Create(ctx context.Context, o Par2Options) error {
 // disc01.squashfs.age.par2) or the set's own name ("sidecars.par2"); par2
 // derives both from the same base, so the trailing ".par2" is stripped first
 // and "sidecars.par2.par2" is never looked for.
+//
+// The directory is listed and each base name matched on its own, rather than
+// handing dir+pattern to filepath.Glob: Glob treats the whole string as a
+// pattern, so a staging directory whose path holds '[', ']', '*' or '?' —
+// "/mnt/backup [2026]" is not far-fetched — made every pattern match nothing
+// and the half-written set was left behind. Only the volume names are ever
+// patterns here; the directory never is.
 func removePar2(dir, file string) {
 	base := strings.TrimSuffix(file, ".par2")
-	patterns := []string{base + ".par2", base + ".vol*.par2"}
-	for _, pat := range patterns {
-		matches, err := filepath.Glob(filepath.Join(dir, pat))
-		if err != nil {
+	for _, name := range Par2VolumeNames(dir, base) {
+		_ = os.Remove(filepath.Join(dir, name))
+	}
+}
+
+// Par2VolumeNames lists the entries of dir that belong to the par2 set with the
+// given base name: "<base>.par2" and "<base>.vol*.par2". base is a bare file
+// name and is matched literally except for that one wildcard, and dir is never
+// interpreted as a pattern — see removePar2 for why that matters. A directory
+// that cannot be read yields nothing.
+func Par2VolumeNames(dir, base string) []string {
+	ents, err := os.ReadDir(dir)
+	if err != nil {
+		return nil
+	}
+	var out []string
+	for _, e := range ents {
+		if e.IsDir() {
 			continue
 		}
-		for _, m := range matches {
-			_ = os.Remove(m)
+		n := e.Name()
+		if n == base+".par2" || isPar2Volume(n, base) {
+			out = append(out, n)
 		}
 	}
+	return out
+}
+
+// isPar2Volume reports whether name is a recovery volume of the set base:
+// "<base>.vol<anything>.par2", the shape par2cmdline writes ("vol000+30").
+func isPar2Volume(name, base string) bool {
+	rest, ok := strings.CutPrefix(name, base+".vol")
+	return ok && strings.HasSuffix(rest, ".par2")
 }
 
 // Par2Verify checks a file against its recovery set. A damaged file makes par2

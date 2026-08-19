@@ -23,6 +23,7 @@ import (
 	"fmt"
 	"hash"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -124,18 +125,6 @@ func GenerateIdentity() (*age.X25519Identity, error) {
 // file is created with mode 0400 and an existing file is never overwritten.
 func WriteIdentityFile(path string, id *age.X25519Identity) error {
 	return writeIdentityFile(path, id, 0o400)
-}
-
-// WritePublicIdentityFile is WriteIdentityFile with a world-readable mode, for
-// the one case where a secret key is meant to be read by strangers: the
-// published identity of a public archive, which brb writes onto every disc so
-// the set can be opened with nothing but the disc itself.
-//
-// The mode is the whole difference, and it is deliberate. 0400 on a key that is
-// about to be pressed onto read-only optical media and handed to whoever finds
-// it would imply a confidentiality this file does not have.
-func WritePublicIdentityFile(path string, id *age.X25519Identity) error {
-	return writeIdentityFile(path, id, 0o644)
 }
 
 func writeIdentityFile(path string, id *age.X25519Identity, mode os.FileMode) (err error) {
@@ -491,9 +480,29 @@ const (
 // including context cancellation — it closes and removes the partial file and
 // returns the original error. The returned error of finish is the error to
 // report.
+//
+// The partial file is created with O_EXCL and never O_TRUNC. O_TRUNC follows
+// whatever is already at the path, and in a staging directory the default of
+// which lives under /var/tmp, "whatever is already there" can be a symlink
+// another local user planted: opening through it would stream a decrypted
+// image — or a ciphertext, or a checksum file — into a file of that user's
+// choosing, with this process's privileges. O_EXCL refuses to open through a
+// symlink at all, dangling or not; the kernel guarantees that, with no window
+// between a check and the open.
+//
+// The stale-.part case O_TRUNC used to cover silently — a run killed
+// mid-write, then repeated: a backup that is --resumed re-encrypts the disc it
+// was on, and the writer reaps nothing beforehand — is handled by removing
+// the leftover first. Removing a path removes the link itself and never what
+// it points to, so that step is safe on a symlink too, and anything planted
+// between the Remove and the open still meets O_EXCL. Doing it here rather
+// than in every caller keeps the writer's callers working unchanged.
 func createPart(dst string, mode os.FileMode) (*os.File, func(error) error, error) {
 	part := dst + ".part"
-	f, err := os.OpenFile(part, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, mode)
+	if err := os.Remove(part); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return nil, nil, fmt.Errorf("agecrypt: removing the stale %s: %w", part, err)
+	}
+	f, err := os.OpenFile(part, os.O_WRONLY|os.O_CREATE|os.O_EXCL, mode)
 	if err != nil {
 		return nil, nil, fmt.Errorf("agecrypt: create %s: %w", part, err)
 	}

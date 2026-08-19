@@ -234,6 +234,50 @@ func TestWriteSumsSkipsNonRegularFiles(t *testing.T) {
 	}
 }
 
+// TestWriteSumsSkipsPartFiles is the crash-recovery case: a run killed inside
+// writeSums leaves SHA512SUMS.part behind, and the resumed run used to hash it
+// into the new SHA512SUMS as a phantom "./SHA512SUMS.part" — a line for a file
+// the install rename then takes away, so the disc never verifies. Any .part
+// file, at any depth, is this package's own in-progress marker and must never
+// be attested. VerifyDir over the result is the proof: it must pass, which it
+// cannot if a phantom line names a file that is not there.
+func TestWriteSumsSkipsPartFiles(t *testing.T) {
+	dir := buildDiscDir(t)
+	sumPath := filepath.Join(dir, SumsName)
+	stale := []string{
+		filepath.Join(dir, SumsName+".part"),
+		filepath.Join(dir, "data", "disc01.squashfs.age.part"),
+	}
+	for _, p := range stale {
+		if err := os.WriteFile(p, []byte("half-written remains of a dead run\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := WriteSums(t.Context(), dir, sumPath); err != nil {
+		t.Fatalf("WriteSums: %v", err)
+	}
+	sums, err := ReadSumFile(sumPath)
+	if err != nil {
+		t.Fatalf("ReadSumFile: %v", err)
+	}
+	for name := range sums {
+		if strings.HasSuffix(name, ".part") {
+			t.Errorf("SHA512SUMS attests %q, an in-progress remnant that is not a file on the disc", name)
+		}
+	}
+	if len(sums) != 5 {
+		t.Errorf("got %d entries, want 5: %v", len(sums), sums)
+	}
+	// The stale sums remnant is gone (writeFileAtomic wrote over and renamed
+	// it); the other one is still lying there, and the disc must still verify.
+	if _, err := os.Stat(stale[0]); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("%s survived the install rename: %v", stale[0], err)
+	}
+	if bad, err := VerifyDir(t.Context(), dir, sumPath); err != nil || len(bad) != 0 {
+		t.Errorf("VerifyDir over sums written beside .part remnants: bad=%v err=%v", bad, err)
+	}
+}
+
 func TestWriteSumsEmptyDir(t *testing.T) {
 	dir := t.TempDir()
 	sumPath := filepath.Join(dir, SumsName)

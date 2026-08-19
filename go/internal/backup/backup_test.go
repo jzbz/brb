@@ -12,6 +12,8 @@ import (
 	"testing"
 	"time"
 
+	"filippo.io/age"
+
 	"github.com/jzbz/brb/internal/config"
 	"github.com/jzbz/brb/internal/disc"
 	"github.com/jzbz/brb/internal/iso"
@@ -635,5 +637,255 @@ func TestPlanWarnsAboutAConfigurationBackupWouldRefuse(t *testing.T) {
 		if strings.Contains(quiet.String(), unwanted) {
 			t.Errorf("a valid configuration was accused of %s:\n%s", unwanted, quiet.String())
 		}
+	}
+}
+
+// TestCheckIndexCoversRefusesFilesTheIndexCannotList pins the resume refusal
+// for a set whose encrypted index is already built: the plaintext index is
+// gone, the encrypted one is kept as it is and copied onto every disc, so any
+// file still to be written would land on a disc the index knows nothing about.
+func TestCheckIndexCoversRefusesFilesTheIndexCannotList(t *testing.T) {
+	t.Parallel()
+	skeleton := []scan.Entry{{Rel: "sub", Kind: scan.KindDir}, {Rel: "sub/link", Kind: scan.KindSymlink}}
+	files := []scan.Entry{{Rel: "sub/new1", Kind: scan.KindFile, Size: 5}, {Rel: "sub/new2", Kind: scan.KindFile, Size: 5}}
+
+	r := &runner{p: quiet(), indexBuilt: true, st: &State{Version: StateVersion, DiscsDone: 3}}
+	// Nothing but skeleton left: every file is on a disc, and the index covers
+	// them all, so the resume may go on to lay the discs out.
+	if err := r.checkIndexCovers(skeleton); err != nil {
+		t.Fatalf("checkIndexCovers with no files pending: %v", err)
+	}
+	err := r.checkIndexCovers(append(skeleton, files...))
+	if err == nil {
+		t.Fatal("checkIndexCovers accepted 2 files the built index cannot list")
+	}
+	for _, w := range []string{"3 finished disc(s)", "2 file(s) are not on any disc", "cannot be extended", "start over"} {
+		if !strings.Contains(err.Error(), w) {
+			t.Errorf("error %q does not say %q", err, w)
+		}
+	}
+	// A resume whose index is not built yet appends to the plaintext one, so
+	// pending files are the normal case there.
+	r.indexBuilt = false
+	if err := r.checkIndexCovers(files); err != nil {
+		t.Errorf("checkIndexCovers with the plaintext index still present: %v", err)
+	}
+}
+
+// TestProbeRecipientsRefusesAMixedSet: age refuses to encrypt to a recipient
+// set that mixes post-quantum and classic keys, and neither AppendRecipient
+// nor ParseRecipientsFile objects to such a file — so without the probe the
+// refusal arrived after disc 1's mksquashfs. loadRecipients must catch it in
+// preflight, and must accept an ordinary set.
+func TestProbeRecipientsRefusesAMixedSet(t *testing.T) {
+	t.Parallel()
+	classic, err := age.GenerateX25519Identity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	pq, err := age.GenerateHybridIdentity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := probeRecipients([]age.Recipient{classic.Recipient()}); err != nil {
+		t.Fatalf("probeRecipients over one classic key: %v", err)
+	}
+	if err := probeRecipients([]age.Recipient{pq.Recipient()}); err != nil {
+		t.Fatalf("probeRecipients over one post-quantum key: %v", err)
+	}
+	if err := probeRecipients([]age.Recipient{classic.Recipient(), pq.Recipient()}); err == nil {
+		t.Fatal("probeRecipients accepted a set mixing post-quantum and classic keys; age's Encrypt will not")
+	}
+
+	// Through loadRecipients, from a file, the way preflight sees it.
+	write := func(name string, keys ...string) *runner {
+		path := filepath.Join(t.TempDir(), name)
+		if err := os.WriteFile(path, []byte(strings.Join(keys, "\n")+"\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		cfg := config.Default()
+		cfg.AgeRecipientsFile = path
+		return &runner{cfg: cfg, p: quiet()}
+	}
+	r := write("mixed.txt", classic.Recipient().String(), pq.Recipient().String())
+	err = r.loadRecipients()
+	if err == nil {
+		t.Fatal("loadRecipients accepted a recipients file mixing post-quantum and classic keys")
+	}
+	for _, w := range []string{"post-quantum", "mixed.txt", "one kind only"} {
+		if !strings.Contains(err.Error(), w) {
+			t.Errorf("error %q does not say %q", err, w)
+		}
+	}
+	if len(r.recipients) != 0 {
+		t.Error("loadRecipients kept the recipients of a set it refused")
+	}
+	ok := write("plain.txt", classic.Recipient().String())
+	if err := ok.loadRecipients(); err != nil {
+		t.Fatalf("loadRecipients over an ordinary file: %v", err)
+	}
+	if len(ok.recipients) != 1 || len(ok.pubkeys) != 1 {
+		t.Errorf("loadRecipients kept %d recipient(s) and %d key(s), want 1 and 1", len(ok.recipients), len(ok.pubkeys))
+	}
+}
+
+// resumeRunner builds a runner around a saved state file, ready for
+// prepareState with --resume: the state says one disc is done, and the
+// plaintext index in work/ says the same, so the only thing that can refuse
+// is the check under test.
+func resumeRunner(t *testing.T, mutate func(*State)) *runner {
+	t.Helper()
+	cfg := config.Default()
+	cfg.Staging = t.TempDir()
+	cfg.SourceDir = t.TempDir()
+	cfg.ArchiveName = "pinned"
+	r := &runner{
+		opts:      Options{Resume: true},
+		cfg:       cfg,
+		p:         quiet(),
+		dirs:      cfg.Dirs(),
+		statePath: filepath.Join(cfg.Staging, "state.json"),
+		pubkeys:   []string{"age1recorded"},
+	}
+	for _, d := range []string{r.dirs.Work, r.dirs.Enc} {
+		if err := os.MkdirAll(d, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	st := newState(cfg.ArchiveName, cfg.SourceDir, 1.0, time.Now())
+	st.DiscsDone, st.Assigned = 1, []string{"a"}
+	st.setGeometry(r.geometry())
+	st.setRecipients(r.pubkeys)
+	mutate(st)
+	if err := SaveState(r.statePath, st); err != nil {
+		t.Fatal(err)
+	}
+	if err := appendIndex(filepath.Join(r.dirs.Work, indexFileName), 1, []string{"a"}); err != nil {
+		t.Fatal(err)
+	}
+	return r
+}
+
+// TestPrepareStateRefusesAResumeUnderChangedKeysOrGeometry is the wiring
+// test for the two pins: prepareState must consult them, with --resume, once
+// discs exist, and the state a fresh run starts from must carry them.
+func TestPrepareStateRefusesAResumeUnderChangedKeysOrGeometry(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	same := resumeRunner(t, func(*State) {})
+	if err := same.prepareState(ctx); err != nil {
+		t.Fatalf("prepareState with unchanged keys and geometry: %v", err)
+	}
+
+	keys := resumeRunner(t, func(s *State) { s.setRecipients([]string{"age1recorded", "age1addedlater"}) })
+	err := keys.prepareState(ctx)
+	if !errors.Is(err, ErrStateMismatch) || !strings.Contains(err.Error(), "age1addedlater") {
+		t.Errorf("prepareState under a changed recipients file = %v, want ErrStateMismatch naming the keys", err)
+	}
+
+	geom := resumeRunner(t, func(s *State) { s.Par2Redundancy++ })
+	err = geom.prepareState(ctx)
+	if !errors.Is(err, ErrStateMismatch) || !strings.Contains(err.Error(), "PAR2_REDUNDANCY") {
+		t.Errorf("prepareState under a changed PAR2_REDUNDANCY = %v, want ErrStateMismatch naming it", err)
+	}
+
+	// A fresh start records both, so the next resume has something to check.
+	fresh := resumeRunner(t, func(*State) {})
+	fresh.opts.Resume = false
+	if err := os.Remove(fresh.statePath); err != nil {
+		t.Fatal(err)
+	}
+	if err := fresh.prepareState(ctx); err != nil {
+		t.Fatalf("prepareState for a fresh run: %v", err)
+	}
+	if got := fresh.st.Recipients; len(got) != 1 || got[0] != "age1recorded" {
+		t.Errorf("a fresh state recorded recipients %v, want [age1recorded]", got)
+	}
+	if fresh.st.CapacityBytes != fresh.cfg.Capacity() || fresh.st.DiscType != "bd25" ||
+		fresh.st.ReserveBytes != fresh.cfg.ReserveBytes || fresh.st.Par2Redundancy != fresh.cfg.Par2Redundancy {
+		t.Errorf("a fresh state recorded geometry %+v, want the configuration's", fresh.st)
+	}
+}
+
+// TestManifestPrunesCarriesTheSkippedMounts: the manifest's "excluded from
+// this backup" list is the one record of a skipped mount point that outlives
+// the terminal, so the mount points the scan reported must land there,
+// marked as such, after the configured prunes.
+func TestManifestPrunesCarriesTheSkippedMounts(t *testing.T) {
+	t.Parallel()
+	cfg := config.Default()
+	cfg.PruneDirs = []string{".cache"}
+	r := &runner{cfg: cfg}
+	if got := r.manifestPrunes(); len(got) != 1 || got[0] != ".cache" {
+		t.Fatalf("manifestPrunes without mounts = %v, want [.cache]", got)
+	}
+	r.skippedMounts = []string{"nas", "media/usb"}
+	got := r.manifestPrunes()
+	if len(got) != 3 || got[0] != ".cache" {
+		t.Fatalf("manifestPrunes = %v, want the prune first and both mounts after it", got)
+	}
+	for i, m := range r.skippedMounts {
+		if !strings.HasPrefix(got[i+1], m+" ") || !strings.Contains(got[i+1], "mount point") {
+			t.Errorf("manifestPrunes[%d] = %q, want %q marked as a mount point", i+1, got[i+1], m)
+		}
+	}
+	if len(cfg.PruneDirs) != 1 {
+		t.Error("manifestPrunes appended to the configuration's own slice")
+	}
+}
+
+// TestOversizedDiscAdviceIsTrue: the old message said "raise RESERVE_BYTES and
+// re-run", which a --resume cannot act on — the images already built keep
+// their size, and Usable ignores the reserve. The advice must say by how much,
+// and that the set has to start over.
+func TestOversizedDiscAdviceIsTrue(t *testing.T) {
+	t.Parallel()
+	cfg := config.Default()
+	cfg.ReserveBytes = 1000
+	r := &runner{cfg: cfg, budget: disc.Budget{Usable: 10000}}
+	err := r.oversizedDisc(4, "files", 10250)
+	for _, w := range []string{"disc 4", "RESERVE_BYTES=1000", "at least 1250", "start the set over", "--resume cannot"} {
+		if !strings.Contains(err.Error(), w) {
+			t.Errorf("error %q does not say %q", err, w)
+		}
+	}
+	if strings.Contains(err.Error(), "and re-run") {
+		t.Errorf("error %q still gives the advice a resume cannot act on", err)
+	}
+}
+
+// TestFilesMatchingInADirectoryNamedLikeAGlob pins the sweep helper the
+// stale-par2 removals in protect and protectSidecars rely on: it lists the
+// directory and matches names, so a STAGING path holding '[' — here literally
+// "a[1]" — still finds the set that filepath.Glob would have missed.
+func TestFilesMatchingInADirectoryNamedLikeAGlob(t *testing.T) {
+	t.Parallel()
+	dir := filepath.Join(t.TempDir(), "a[1]")
+	if err := os.Mkdir(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for _, n := range []string{"disc01.squashfs.age", "disc01.squashfs.age.par2",
+		"disc01.squashfs.age.vol000+30.par2", "sidecars.par2", "sidecars.vol00+10.par2"} {
+		if err := os.WriteFile(filepath.Join(dir, n), nil, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	base := "disc01.squashfs"
+	got, err := filesMatching(dir, func(nm string) bool {
+		return strings.HasPrefix(nm, base+".age") && strings.HasSuffix(nm, ".par2")
+	})
+	if err != nil || len(got) != 2 {
+		t.Errorf("image par2 set in a glob-named directory = %v, %v; want 2 names", got, err)
+	}
+	got, err = filesMatching(dir, func(nm string) bool {
+		return strings.HasPrefix(nm, "sidecars") && strings.HasSuffix(nm, ".par2")
+	})
+	if err != nil || len(got) != 2 {
+		t.Errorf("sidecar par2 set in a glob-named directory = %v, %v; want 2 names", got, err)
+	}
+	// And the thing this replaced really does fail there.
+	if m, _ := filepath.Glob(filepath.Join(dir, "sidecars*.par2")); len(m) != 0 {
+		t.Logf("filepath.Glob matched %v in a directory named like a glob; the helper is belt and braces here", m)
 	}
 }
