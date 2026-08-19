@@ -2,6 +2,7 @@ package cli
 
 import (
 	"fmt"
+	"sort"
 	"strconv"
 	"strings"
 )
@@ -50,6 +51,17 @@ func (f *cmdFlags) add(o *opt, names ...string) {
 	for _, n := range names {
 		f.opts[n] = o
 	}
+}
+
+// names returns every flag name registered so far, sorted, so a test can
+// check that each one is documented.
+func (f *cmdFlags) names() []string {
+	out := make([]string, 0, len(f.opts))
+	for n := range f.opts {
+		out = append(out, n)
+	}
+	sort.Strings(out)
+	return out
 }
 
 // Bool registers a boolean flag that sets *p when present.

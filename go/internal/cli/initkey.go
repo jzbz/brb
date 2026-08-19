@@ -48,11 +48,8 @@ func initKey(cfg *config.Config, p *ui.Printer, rescue bool) error {
 	}
 	keyDir := filepath.Dir(keyFile)
 
-	if err := os.MkdirAll(keyDir, 0o700); err != nil {
-		return fmt.Errorf("init-key: creating %s: %w", keyDir, err)
-	}
-	if err := os.Chmod(keyDir, 0o700); err != nil {
-		return fmt.Errorf("init-key: securing %s: %w", keyDir, err)
+	if err := prepareKeyDir(keyDir, p); err != nil {
+		return err
 	}
 	// The recipients file need not live beside the identity once AGE_IDENTITY
 	// points elsewhere, so make sure its directory exists before appending.
@@ -83,6 +80,61 @@ func initKey(cfg *config.Config, p *ui.Printer, rescue bool) error {
 	}
 	p.Step("check it with: brb doctor   (it proves this key decrypts what it encrypts)")
 	return nil
+}
+
+// prepareKeyDir makes sure the directory the identity will be written into
+// exists, and that it is private when it is brb's to make private.
+//
+// The identity file itself is always mode 0400. The directory is a second
+// line: a 0755 directory lets any local user list it, read the recipients
+// file beside the key, and copy a rescue container to guess at offline. So a
+// directory init-key creates, and brb's own default key directory
+// (~/.config/brb, where the default recipients file lives), are made 0700
+// outright — nothing else has any business in either.
+//
+// Any other directory that already exists is not touched. AGE_IDENTITY can name
+// a file anywhere — ~/identity.txt puts the key in $HOME, /srv/keys/brb.txt in
+// a directory shared with other services — and init-key used to chmod that
+// parent to 0700 unasked, locking a home directory or a shared key store away
+// from everything else that used it. For those the operator is warned when the
+// directory is group- or world-accessible, and told the one command that
+// tightens it, so the decision is theirs.
+func prepareKeyDir(keyDir string, p *ui.Printer) error {
+	fi, err := os.Stat(keyDir)
+	created := false
+	switch {
+	case errors.Is(err, fs.ErrNotExist):
+		if err := os.MkdirAll(keyDir, 0o700); err != nil {
+			return fmt.Errorf("init-key: creating %s: %w", keyDir, err)
+		}
+		created = true
+	case err != nil:
+		return fmt.Errorf("init-key: %s: %w", keyDir, err)
+	case !fi.IsDir():
+		return fmt.Errorf("init-key: %s is not a directory", keyDir)
+	}
+	// A directory made just now is at most 0700 already (the umask only ever
+	// removes bits); the chmod is for the default directory an operator made
+	// themselves with mkdir -p at whatever their umask gave, and it is applied
+	// to both so the two cases cannot drift apart.
+	if created || keyDir == defaultKeyDir() {
+		if err := os.Chmod(keyDir, 0o700); err != nil {
+			return fmt.Errorf("init-key: securing %s: %w", keyDir, err)
+		}
+		return nil
+	}
+	if perm := fi.Mode().Perm(); perm&0o077 != 0 {
+		p.Warn("%s is accessible to others (mode %04o); the identity written into it is 0400, but the directory is not brb's to lock down",
+			keyDir, perm)
+		p.Step("tighten it yourself if nothing else needs it: chmod 700 %s", keyDir)
+	}
+	return nil
+}
+
+// defaultKeyDir is where brb keeps keys when nothing says otherwise: the
+// directory of the built-in AGE_RECIPIENTS_FILE, ~/.config/brb.
+func defaultKeyDir() string {
+	return filepath.Dir(config.Default().AgeRecipientsFile)
 }
 
 // initPrimaryKey mints the machine's own keypair and records it. The advice

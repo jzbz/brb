@@ -315,6 +315,58 @@ func TestApplyErrors(t *testing.T) {
 	}
 }
 
+// TestEmptyScalarLeavesTheDefault pins the ${VAR:-default} reading of KEY=:
+// the sample config in `brb help` and the README writes DISC_CAPACITY_BYTES=
+// and DIST_DIR= to mean "not overridden", and a parser that turned that into
+// "invalid integer" rejected its own documentation. Every scalar key gets the
+// same treatment, an unknown key is still refused, and the array keys keep
+// their "empty means none" meaning.
+func TestEmptyScalarLeavesTheDefault(t *testing.T) {
+	setHome(t, "/home/tester")
+	var b strings.Builder
+	for _, k := range Keys() {
+		if isArrayKey(k) {
+			continue
+		}
+		// Both spellings an operator reaches for, alternating.
+		if len(k)%2 == 0 {
+			b.WriteString(k + "=\n")
+		} else {
+			b.WriteString(k + "=\"\"   # left blank on purpose\n")
+		}
+	}
+	vals, err := Parse(b.String(), "test")
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	c := Default()
+	if err := c.Apply(vals); err != nil {
+		t.Fatalf("Apply of every scalar key left empty: %v\n%s", err, b.String())
+	}
+	if !reflect.DeepEqual(c, Default()) {
+		t.Errorf("empty values changed the configuration:\n got %+v\nwant %+v", c, Default())
+	}
+
+	c = Default()
+	err = c.Apply(map[string]Value{"KEEP_IMAGES": {Scalar: "", Line: 4}})
+	if err == nil || !strings.Contains(err.Error(), `unknown configuration key "KEEP_IMAGES"`) {
+		t.Errorf("an empty unknown key was not refused: %v", err)
+	}
+
+	vals, err = Parse("PRUNE_DIRS=\nEXCLUDE_MASKS=()\n", "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	c = Default()
+	if err := c.Apply(vals); err != nil {
+		t.Fatal(err)
+	}
+	if len(c.PruneDirs) != 0 || len(c.ExcludeMasks) != 0 {
+		t.Errorf("empty array settings did not switch the defaults off: prune %q, masks %q",
+			c.PruneDirs, c.ExcludeMasks)
+	}
+}
+
 func TestArrayKeysReplaceRatherThanAppend(t *testing.T) {
 	setHome(t, "/home/tester")
 

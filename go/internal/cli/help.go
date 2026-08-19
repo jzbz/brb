@@ -46,6 +46,19 @@ COMMANDS
                            plaintext is deleted (needs AGE_IDENTITY; doubles the
                            time spent per disc, and is the only way to prove the
                            set decrypts before the plaintext is gone)
+      --public-archive     make a set that keeps NO secret: brb mints a keypair
+                           for this archive alone, encrypts to it as usual, and
+                           writes the secret key onto every disc as identity.txt,
+                           so the discs open with nothing but themselves in hand
+                           (age -d -i /mnt/identity.txt ...; a brb restore wants
+                           AGE_IDENTITY pointed at a copy of that file). Not
+                           encryption in any real sense — it is for a set meant
+                           to outlive anyone who could be asked for the key. The
+                           key is always fresh: AGE_RECIPIENTS_FILE and
+                           AGE_IDENTITY are not read, so this can never publish a
+                           key that other archives were encrypted to. Same as
+                           PUBLIC_ARCHIVE=1 in the config; neither can turn the
+                           other off
   burn <n|n-m|n-|all>    burn discs, confirming before each; builds each ISO
                          first if it is not there, and removes it again once
                          the disc is written (KEEP_ISOS=1 keeps it)
@@ -145,6 +158,12 @@ TYPICAL RUN
 // configLines renders the configuration as the assignments a config file would
 // hold, with the values currently in force, each with the note that explains
 // what it is for.
+//
+// This listing is the authoritative catalogue of settings — the README sends
+// operators here for it — so it has to name every key config.Keys knows, and
+// what it prints has to load back: an operator pastes it into a file and
+// expects both readers to accept it. TestHelpListsEveryConfigKey and
+// TestHelpConfigListingRoundTrips pin both.
 func configLines(cfg *config.Config) []string {
 	capacity := ""
 	if cfg.DiscCapacityBytes > 0 {
@@ -182,6 +201,7 @@ func configLines(cfg *config.Config) []string {
 		assign("KEEP_ISOS", boolInt(cfg.KeepISOs), "1 keeps each ISO after a successful burn"),
 		assign("AGE_RECIPIENTS_FILE", cfg.AgeRecipientsFile, "public keys images are encrypted to"),
 		assign("AGE_IDENTITY", identity, identityNote),
+		assign("PUBLIC_ARCHIVE", boolInt(cfg.PublicArchive), "1 keeps no secret: a fresh key is written onto every disc (see backup --public-archive)"),
 		assign("DIST_DIR", cfg.DistDir, distNote(cfg)),
 	}
 	out = append(out, arrayLines("PRUNE_DIRS", cfg.PruneDirs)...)
@@ -222,9 +242,10 @@ func distNote(cfg *config.Config) string {
 // assignColumn is where the explanatory comments start.
 const assignColumn = 44
 
-// assign renders one KEY=value with its comment lined up.
+// assign renders one KEY=value with its comment lined up. The value is quoted
+// when it has to be, so the line loads back as the value in force.
 func assign(key, value, note string) string {
-	s := key + "=" + value
+	s := key + "=" + shellWord(value)
 	if note == "" {
 		return s
 	}
@@ -256,16 +277,47 @@ func arrayLines(key string, values []string) []string {
 	return append(out, ")")
 }
 
-// quoteAll quotes list elements that contain a space, so the rendered array is
-// something that can be pasted straight into a config file.
+// quoteAll renders list elements as shell words, so the rendered array is
+// something that can be pasted straight into a config file. Quoting matters
+// most here: the default EXCLUDE_MASKS are globs, and a bare *.pyc inside a
+// bash array literal is expanded against the current directory the moment
+// the file is sourced.
 func quoteAll(in []string) []string {
 	out := make([]string, 0, len(in))
 	for _, s := range in {
-		if strings.ContainsAny(s, " \t\"'") {
-			out = append(out, fmt.Sprintf("%q", s))
-			continue
-		}
-		out = append(out, s)
+		out = append(out, shellWord(s))
 	}
 	return out
+}
+
+// shellWord renders one value as a word both readers of a config file take
+// back to the same string: bare when it is made only of characters that mean
+// nothing to bash or to config.Parse, otherwise single-quoted, with an
+// embedded single quote spelled the way the shell does — close the quotes,
+// a backslash-escaped quote, reopen them.
+//
+// Single quotes rather than %q on purpose. Bash does not read \x1b or \t
+// escapes inside double quotes and neither does the Go parser, so a
+// Go-quoted value carrying either would load back as a different string from
+// the one in force; inside single quotes every byte but the quote itself is
+// literal to both. An empty value is rendered bare — KEY= — which both
+// readers take as "leave the default": brb.sh through ${VAR:-default}, the
+// Go parser by the same rule in config.Config.set.
+func shellWord(s string) string {
+	if s == "" || strings.IndexFunc(s, func(r rune) bool { return !bareShellRune(r) }) < 0 {
+		return s
+	}
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
+}
+
+// bareShellRune reports whether r can stand unquoted in a config value for
+// both readers: letters, digits, and the punctuation that neither bash nor
+// config.Parse gives a meaning to. Everything else — space, the globbing and
+// expansion characters, quotes, #, ~ — forces quoting.
+func bareShellRune(r rune) bool {
+	switch {
+	case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9':
+		return true
+	}
+	return strings.ContainsRune("/._-+:,@%=", r)
 }

@@ -3,13 +3,16 @@ package cli
 import (
 	"bytes"
 	"context"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
+	"github.com/jzbz/brb/internal/agecrypt"
 	"github.com/jzbz/brb/internal/config"
 	"github.com/jzbz/brb/internal/tools"
+	"github.com/jzbz/brb/internal/ui"
 )
 
 // isolate points HOME and BRB_CONFIG at a temporary directory and clears every
@@ -36,6 +39,10 @@ func writeConfig(t *testing.T, dir, body string) string {
 	}
 	return p
 }
+
+// newTestPrinter returns an uncoloured Printer writing to w, for calling the
+// pieces of the CLI directly.
+func newTestPrinter(w io.Writer) *ui.Printer { return ui.New(w, false) }
 
 // runMain runs one command line and returns its status and streams.
 func runMain(t *testing.T, args ...string) (int, string, string) {
@@ -89,6 +96,133 @@ func TestMainHelpSurvivesABrokenConfigFile(t *testing.T) {
 	}
 	if !strings.Contains(errOut, "config") {
 		t.Errorf("doctor error does not mention the config file:\n%s", errOut)
+	}
+}
+
+// TestExplicitConfigPathMustExist pins brb.sh's rule for -c: a path that names
+// nothing is a mistyped path, not a first run, and carrying on with the
+// defaults would silently point a restore at /var/tmp/brb — an empty staging
+// directory and a report of no discs at all. The default location, by
+// contrast, is allowed to be absent.
+func TestExplicitConfigPathMustExist(t *testing.T) {
+	home := isolate(t)
+	missing := filepath.Join(home, "no-such-config")
+
+	for _, args := range [][]string{
+		{"-c", missing, "doctor"},
+		{"--config=" + missing, "plan"},
+	} {
+		status, _, errOut := runMain(t, args...)
+		if status != exitError {
+			t.Fatalf("%q exit = %d, want %d: a -c that names no file must not run on defaults\n%s", args, status, exitError, errOut)
+		}
+		if !strings.Contains(errOut, "config file not found: "+missing) {
+			t.Errorf("%q stderr = %q, want it to name the missing file", args, errOut)
+		}
+		if !strings.Contains(errOut, "-c") {
+			t.Errorf("%q stderr = %q, want it to say the path came from -c", args, errOut)
+		}
+	}
+
+	// help must still print — it is what an operator reaches for to find out
+	// what went wrong — and the default path may be absent without complaint.
+	if status, out, _ := runMain(t, "-c", missing, "help"); status != exitOK || !strings.Contains(out, "USAGE") {
+		t.Errorf("help with a missing -c exit = %d; help must always print", status)
+	}
+	src := filepath.Join(home, "src")
+	if err := os.MkdirAll(src, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(src, "a.txt"), []byte("hello"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("SOURCE_DIR", src)
+	if status, _, errOut := runMain(t, "plan"); status != exitOK {
+		t.Errorf("plan with no config at the default path exit = %d, want %d — only an explicit -c is required to exist\n%s", status, exitOK, errOut)
+	}
+}
+
+// TestSymlinkedSourceDirIsFollowed covers a SOURCE_DIR that is itself a
+// symbolic link to a directory. Validate stats through the link, so doctor
+// said ready; the scanner lstats its root and refused it as "not a directory"
+// — hours later, if the operator did not run plan first. The link is resolved
+// once, when the configuration is loaded, and the operator is told.
+func TestSymlinkedSourceDirIsFollowed(t *testing.T) {
+	home := isolate(t)
+	real := filepath.Join(home, "real-photos")
+	if err := os.MkdirAll(real, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(real, "a.txt"), []byte("hello"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(home, "photos")
+	if err := os.Symlink(real, link); err != nil {
+		t.Skipf("cannot create a symlink here: %v", err)
+	}
+	writeConfig(t, home, "SOURCE_DIR="+link+"\n")
+
+	var errOut bytes.Buffer
+	cfg, _, err := loadConfig("", newTestPrinter(&errOut))
+	if err != nil {
+		t.Fatalf("loadConfig: %v", err)
+	}
+	if err := resolveSourceDir(cfg, newTestPrinter(&errOut)); err != nil {
+		t.Fatalf("resolveSourceDir: %v", err)
+	}
+	if cfg.SourceDir != real {
+		t.Errorf("SourceDir = %q, want the link's target %q", cfg.SourceDir, real)
+	}
+	if want := "SOURCE_DIR " + link + " is a symlink to " + real + "; using " + real; !strings.Contains(errOut.String(), want) {
+		t.Errorf("the resolution was not reported: stderr = %q, want it to contain %q", errOut.String(), want)
+	}
+	// The archive is still named after what the operator wrote.
+	if !strings.HasPrefix(cfg.ArchiveName, "photos-") {
+		t.Errorf("ArchiveName = %q, want it derived from the link name %q", cfg.ArchiveName, "photos")
+	}
+
+	// End to end: plan walks the tree, and used to die on the link; doctor
+	// reports the resolved source. Restore-side commands never look at
+	// SOURCE_DIR and say nothing about it.
+	status, _, stderr := runMain(t, "plan")
+	if status != exitOK {
+		t.Fatalf("plan on a symlinked SOURCE_DIR exit = %d, want %d\n%s", status, exitOK, stderr)
+	}
+	if strings.Contains(stderr, "not a directory") {
+		t.Errorf("plan still refused the symlinked SOURCE_DIR:\n%s", stderr)
+	}
+	if !strings.Contains(stderr, "is a symlink to "+real) {
+		t.Errorf("plan did not say it followed the link:\n%s", stderr)
+	}
+	if _, _, stderr := runMain(t, "doctor"); !strings.Contains(stderr, "source          "+real) {
+		t.Errorf("doctor does not report the resolved source:\n%s", stderr)
+	}
+	if _, _, stderr := runMain(t, "index"); strings.Contains(stderr, "symlink") {
+		t.Errorf("a restore-side command mentioned SOURCE_DIR's symlink:\n%s", stderr)
+	}
+
+	// A link to a file is left for Validate to reject as what it is, and a
+	// dangling link is an error that names both ends.
+	file := filepath.Join(home, "a-file")
+	if err := os.WriteFile(file, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	fileLink := filepath.Join(home, "file-link")
+	if err := os.Symlink(file, fileLink); err != nil {
+		t.Fatal(err)
+	}
+	c := config.Default()
+	c.SourceDir = fileLink
+	if err := resolveSourceDir(c, newTestPrinter(&errOut)); err != nil || c.SourceDir != fileLink {
+		t.Errorf("a link to a file: err = %v, SourceDir = %q; want no error and the path left alone for Validate", err, c.SourceDir)
+	}
+	dangling := filepath.Join(home, "dangling")
+	if err := os.Symlink(filepath.Join(home, "gone"), dangling); err != nil {
+		t.Fatal(err)
+	}
+	c.SourceDir = dangling
+	if err := resolveSourceDir(c, newTestPrinter(&errOut)); err == nil || !strings.Contains(err.Error(), dangling) {
+		t.Errorf("a dangling link: err = %v, want an error naming %s", err, dangling)
 	}
 }
 
@@ -242,6 +376,89 @@ func TestDoctorIsHappyWithAFreshKey(t *testing.T) {
 	}
 }
 
+// TestDoctorAcceptsAPassphraseProtectedIdentity: the README says an identity
+// encrypted with `age -p` works anywhere a plain one does, and the restore
+// side honours that. Doctor used to feed the container to the identity
+// parser, get "no secret keys found", and count it as a problem to fix before
+// a backup. Both container spellings — binary and ASCII-armored — are
+// recognised, reported as present and passphrase-protected, and are not a
+// failure; a file that is neither still is.
+func TestDoctorAcceptsAPassphraseProtectedIdentity(t *testing.T) {
+	home := isolate(t)
+	keys := filepath.Join(home, "keys")
+	recips := filepath.Join(keys, "recipients.txt")
+	id, err := agecrypt.GenerateIdentity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := agecrypt.AppendRecipient(recips, id.Recipient().String()); err != nil {
+		t.Fatal(err)
+	}
+
+	containers := map[string]func(path string){
+		"binary": func(path string) {
+			if err := agecrypt.WriteEncryptedIdentityFile(path, id, "correct horse"); err != nil {
+				t.Fatal(err)
+			}
+		},
+		"armored": func(path string) {
+			body := "-----BEGIN AGE ENCRYPTED FILE-----\nYWdlLWVuY3J5cHRpb24ub3JnL3YxCg==\n-----END AGE ENCRYPTED FILE-----\n"
+			if err := os.WriteFile(path, []byte(body), 0o400); err != nil {
+				t.Fatal(err)
+			}
+		},
+	}
+	for name, write := range containers {
+		t.Run(name, func(t *testing.T) {
+			idPath := filepath.Join(home, name+"-identity.txt.age")
+			write(idPath)
+			cfg := config.Default()
+			cfg.AgeRecipientsFile = recips
+			cfg.AgeIdentity = idPath
+
+			var errOut bytes.Buffer
+			problems := checkKeys(context.Background(), cfg, newTestPrinter(&errOut))
+			if problems != 0 {
+				t.Errorf("checkKeys counted %d problem(s) for a passphrase-protected identity; want 0\n%s", problems, errOut.String())
+			}
+			out := errOut.String()
+			if !strings.Contains(out, "  ok identity "+idPath+" is passphrase-protected") {
+				t.Errorf("the identity was not reported as present and passphrase-protected:\n%s", out)
+			}
+			if strings.Contains(out, "fail ") {
+				t.Errorf("doctor reported a failure for a passphrase-protected identity:\n%s", out)
+			}
+		})
+	}
+
+	// The full command agrees, when the tools it also checks are installed.
+	if err := tools.Detect(context.Background()).Require(backupTools...); err == nil {
+		idPath := filepath.Join(home, "binary-identity.txt.age")
+		src := filepath.Join(home, "src")
+		if err := os.MkdirAll(src, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		writeConfig(t, home, "SOURCE_DIR="+src+"\nAGE_RECIPIENTS_FILE="+recips+"\nAGE_IDENTITY="+idPath+"\n")
+		status, _, errOut := runMain(t, "doctor")
+		if status != exitOK || !strings.Contains(errOut, "ready") {
+			t.Errorf("doctor exit = %d with a passphrase-protected AGE_IDENTITY, want %d and ready\n%s", status, exitOK, errOut)
+		}
+	}
+
+	// A file that is neither a key nor a container is still a real problem.
+	junk := filepath.Join(home, "junk-identity.txt")
+	if err := os.WriteFile(junk, []byte("this is not a key\n"), 0o400); err != nil {
+		t.Fatal(err)
+	}
+	cfg := config.Default()
+	cfg.AgeRecipientsFile = recips
+	cfg.AgeIdentity = junk
+	var errOut bytes.Buffer
+	if problems := checkKeys(context.Background(), cfg, newTestPrinter(&errOut)); problems != 1 {
+		t.Errorf("checkKeys counted %d problem(s) for a junk identity; want 1\n%s", problems, errOut.String())
+	}
+}
+
 func TestInitKey(t *testing.T) {
 	home := isolate(t)
 	keys := filepath.Join(home, "keys")
@@ -290,6 +507,118 @@ func TestInitKey(t *testing.T) {
 	if string(after) != string(recips) {
 		t.Errorf("the failed second run changed the recipients file")
 	}
+}
+
+// TestInitKeyLeavesOtherPeoplesDirectoriesAlone pins which directories
+// init-key makes 0700: one it created itself, and brb's default key directory.
+// AGE_IDENTITY=~/identity.txt used to get $HOME chmodded to 0700 unasked; now
+// the directory is left as it is and the operator is warned when it is open
+// to others.
+func TestInitKeyLeavesOtherPeoplesDirectoriesAlone(t *testing.T) {
+	dirMode := func(t *testing.T, path string) os.FileMode {
+		t.Helper()
+		fi, err := os.Stat(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return fi.Mode().Perm()
+	}
+
+	t.Run("identity in the home directory", func(t *testing.T) {
+		home := isolate(t)
+		if err := os.Chmod(home, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		writeConfig(t, home, "AGE_IDENTITY="+filepath.Join(home, "identity.txt")+"\n")
+
+		status, _, errOut := runMain(t, "init-key")
+		if status != exitOK {
+			t.Fatalf("init-key exit = %d\n%s", status, errOut)
+		}
+		if got := dirMode(t, home); got != 0o755 {
+			t.Errorf("$HOME mode = %04o after init-key, want 0755 left alone", got)
+		}
+		if !strings.Contains(errOut, "warn "+home+" is accessible to others (mode 0755)") {
+			t.Errorf("no warning that the identity's directory is open to others:\n%s", errOut)
+		}
+		if !strings.Contains(errOut, "chmod 700 "+home) {
+			t.Errorf("the warning does not say how to tighten it:\n%s", errOut)
+		}
+		if got := dirMode(t, filepath.Join(home, ".config", "brb")); got != 0o700 {
+			t.Errorf("the default recipients directory was created with mode %04o, want 0700", got)
+		}
+	})
+
+	t.Run("private directory draws no warning", func(t *testing.T) {
+		home := isolate(t)
+		private := filepath.Join(home, "private")
+		if err := os.Mkdir(private, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		writeConfig(t, home, "AGE_IDENTITY="+filepath.Join(private, "identity.txt")+"\n")
+		status, _, errOut := runMain(t, "init-key")
+		if status != exitOK {
+			t.Fatalf("init-key exit = %d\n%s", status, errOut)
+		}
+		if strings.Contains(errOut, "accessible to others") {
+			t.Errorf("a 0700 directory was warned about:\n%s", errOut)
+		}
+	})
+
+	t.Run("default key directory is made private", func(t *testing.T) {
+		home := isolate(t)
+		def := filepath.Join(home, ".config", "brb")
+		if err := os.MkdirAll(def, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if got := dirMode(t, def); got != 0o755 {
+			t.Skipf("umask left the fixture at %04o", got)
+		}
+		status, _, errOut := runMain(t, "init-key")
+		if status != exitOK {
+			t.Fatalf("init-key exit = %d\n%s", status, errOut)
+		}
+		if got := dirMode(t, def); got != 0o700 {
+			t.Errorf("default key directory mode = %04o after init-key, want 0700", got)
+		}
+		if strings.Contains(errOut, "accessible to others") {
+			t.Errorf("brb's own directory was warned about instead of tightened:\n%s", errOut)
+		}
+	})
+
+	t.Run("directory init-key creates is private", func(t *testing.T) {
+		home := isolate(t)
+		keys := filepath.Join(home, "keys", "nested")
+		writeConfig(t, home, "AGE_RECIPIENTS_FILE="+filepath.Join(keys, "recipients.txt")+"\n")
+		if status, _, errOut := runMain(t, "init-key"); status != exitOK {
+			t.Fatalf("init-key exit = %d\n%s", status, errOut)
+		}
+		if got := dirMode(t, keys); got != 0o700 {
+			t.Errorf("created key directory mode = %04o, want 0700", got)
+		}
+	})
+
+	t.Run("existing non-default recipients directory is left alone", func(t *testing.T) {
+		home := isolate(t)
+		shared := filepath.Join(home, "shared-keys")
+		if err := os.Mkdir(shared, 0o750); err != nil {
+			t.Fatal(err)
+		}
+		if got := dirMode(t, shared); got != 0o750 {
+			t.Skipf("umask left the fixture at %04o", got)
+		}
+		writeConfig(t, home, "AGE_RECIPIENTS_FILE="+filepath.Join(shared, "recipients.txt")+"\n")
+		status, _, errOut := runMain(t, "init-key")
+		if status != exitOK {
+			t.Fatalf("init-key exit = %d\n%s", status, errOut)
+		}
+		if got := dirMode(t, shared); got != 0o750 {
+			t.Errorf("shared key directory mode = %04o after init-key, want 0750 left alone", got)
+		}
+		if !strings.Contains(errOut, "warn "+shared+" is accessible to others (mode 0750)") {
+			t.Errorf("no warning about the group-accessible directory:\n%s", errOut)
+		}
+	})
 }
 
 func TestMainReportsCancellation(t *testing.T) {

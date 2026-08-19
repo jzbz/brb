@@ -6,6 +6,10 @@
 // die/step helpers so that operators see the same output from both
 // implementations. Nothing here ever terminates the process: Fail prints and
 // returns, leaving the decision to the caller.
+//
+// Every message goes out with its terminal control bytes escaped (see
+// visible), so a file name or a subprocess line that carries an escape
+// sequence is shown to the operator rather than executed by their terminal.
 package ui
 
 import (
@@ -17,6 +21,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 )
 
 // ErrNonInteractive is returned when a prompt is needed but no terminal is
@@ -128,7 +133,7 @@ func (p *Printer) Step(format string, a ...any) { p.emit("   .", cDim, format, a
 // Raw prints the formatted message with no prefix and no colour, followed by a
 // newline.
 func (p *Printer) Raw(format string, a ...any) {
-	msg := fmt.Sprintf(format, a...)
+	msg := visible(fmt.Sprintf(format, a...))
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.hideProgressLocked()
@@ -136,7 +141,7 @@ func (p *Printer) Raw(format string, a ...any) {
 }
 
 func (p *Printer) emit(prefix, color, format string, a ...any) {
-	msg := fmt.Sprintf(format, a...)
+	msg := visible(fmt.Sprintf(format, a...))
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.hideProgressLocked()
@@ -149,10 +154,94 @@ func (p *Printer) emit(prefix, color, format string, a ...any) {
 
 // write emits text with no trailing newline, used for prompts.
 func (p *Printer) write(s string) {
+	s = visible(s)
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.hideProgressLocked()
 	fmt.Fprint(p.w, s)
+}
+
+// visible renders a message so that nothing in it can drive the terminal.
+//
+// Every message the Printer emits passes through here, whatever it was built
+// from. Most are brb's own prose, but a great many carry text brb did not
+// write: file names from the scanned tree in scan-problem and oversized-file
+// reports, subprocess output forwarded line by line (mksquashfs prints
+// "Failed to read file <name>" with the name's bytes intact), disc labels and
+// archive names read back from media, and the destination path echoed in a
+// Confirm prompt. Anyone who can plant one file in a tree that gets backed up
+// picks its name freely, and a name holding ESC ] 0 ; ... BEL retitles the
+// operator's window, ESC [ 2 J wipes what they were reading, and worse is
+// possible on terminals that answer queries. Escaping in the Printer, rather
+// than at each call site, means a caller cannot forget.
+//
+// What is escaped: every C0 control byte except newline and tab, DEL, and the
+// C1 controls U+0080..U+009F (which xterm-compatible terminals honour when
+// they arrive UTF-8 encoded, exactly as ESC-bracket sequences). Newline is
+// kept because callers deliberately emit multi-line messages through one
+// call; tab is kept because it cannot move the cursor anywhere but along the
+// current line and subprocess output is often tab-aligned. Bytes that are not
+// valid UTF-8 pass through: a terminal shows them as replacement characters,
+// which is honest, and rewriting them would misreport the name.
+//
+// The rendering is the C-style one restore's escapeControls uses for index
+// lines — \r for CR, \xNN for anything else, one escape per byte — so an
+// operator sees the same spelling for the same name whichever command printed
+// it, and can feed it back through printf to reproduce the bytes. The colour
+// codes the Printer wraps around a message are added after this runs and are
+// never touched.
+func visible(s string) string {
+	if !needsEscaping(s) {
+		return s
+	}
+	var b strings.Builder
+	b.Grow(len(s) + 16)
+	for i := 0; i < len(s); {
+		c := s[i]
+		switch {
+		case c == '\n' || c == '\t':
+			b.WriteByte(c)
+			i++
+		case c == '\r':
+			b.WriteString(`\r`)
+			i++
+		case c < 0x20 || c == 0x7f:
+			fmt.Fprintf(&b, `\x%02x`, c)
+			i++
+		case c >= utf8.RuneSelf:
+			r, size := utf8.DecodeRuneInString(s[i:])
+			if r >= 0x80 && r <= 0x9f {
+				// A C1 control, UTF-8 encoded: spell out both bytes so the
+				// escape round-trips through printf like every other one.
+				for _, cb := range []byte(s[i : i+size]) {
+					fmt.Fprintf(&b, `\x%02x`, cb)
+				}
+			} else {
+				b.WriteString(s[i : i+size])
+			}
+			i += size
+		default:
+			b.WriteByte(c)
+			i++
+		}
+	}
+	return b.String()
+}
+
+// needsEscaping is visible's fast path: almost every message is clean, and
+// the printer is on the hot path of every forwarded subprocess line.
+func needsEscaping(s string) bool {
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if (c < 0x20 && c != '\n' && c != '\t') || c == 0x7f {
+			return true
+		}
+		// 0xC2 is the lead byte of every UTF-8 encoded C1 control.
+		if c == 0xc2 && i+1 < len(s) && s[i+1] >= 0x80 && s[i+1] <= 0x9f {
+			return true
+		}
+	}
+	return false
 }
 
 // hideProgressLocked erases a drawn progress bar so a message can take the

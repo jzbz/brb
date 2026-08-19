@@ -1,9 +1,11 @@
 package cli
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -278,6 +280,25 @@ func checkKeys(ctx context.Context, cfg *config.Config, p *ui.Printer) int {
 		return problems
 	}
 
+	// A passphrase-protected identity — `age -p` over the key file, which the
+	// README says works anywhere a plain one does — is an age container, and
+	// age.ParseIdentities rejects a container as "no secret keys found". That
+	// used to count as a problem to fix before a backup, on a setup the restore
+	// side handles fine. Doctor never asks for a passphrase (nothing that runs
+	// unattended may), so it says what it found and leaves the round trip to
+	// the first command that unlocks the key.
+	container, err := identityIsAgeContainer(idPath)
+	if err != nil {
+		p.Fail("identity %s: %v", idPath, err)
+		return problems + 1
+	}
+	if container {
+		p.OK("identity %s is passphrase-protected: a restore asks for the passphrase once per command", idPath)
+		p.Step("doctor never asks for it, so the round trip is not proved here; the first restore-side")
+		p.Step("command that unlocks it fails at once if the key does not match %s", cfg.AgeRecipientsFile)
+		return problems
+	}
+
 	ids, err := agecrypt.ParseIdentityFile(idPath)
 	if err != nil {
 		p.Fail("identity %s: %v", idPath, err)
@@ -324,6 +345,27 @@ func roundTrip(ctx context.Context, recips []age.Recipient, ids []age.Identity) 
 		return errors.New("the decrypted probe does not match what was encrypted")
 	}
 	return nil
+}
+
+// identityIsAgeContainer reports whether the file at path is an age container
+// — a passphrase-protected identity — rather than a plaintext one. Both
+// container formats announce themselves on their first line: the binary one
+// with "age-encryption.org/v1", the ASCII-armored one with the PEM-style
+// BEGIN line. An age-keygen identity starts with "# created:" or
+// "AGE-SECRET-KEY-". This is the same test the restore side and brb.sh's
+// identity_is_encrypted apply before deciding whether to ask for a passphrase.
+func identityIsAgeContainer(path string) (bool, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return false, err
+	}
+	defer f.Close()
+	first, err := bufio.NewReader(f).ReadString('\n')
+	if err != nil && !errors.Is(err, io.EOF) {
+		return false, err
+	}
+	return strings.HasPrefix(first, "age-encryption.org/v1") ||
+		strings.HasPrefix(first, "-----BEGIN AGE ENCRYPTED FILE-----"), nil
 }
 
 // defaultIdentityPath resolves AGE_IDENTITY the way brb.sh's resolve_identity

@@ -19,7 +19,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/jzbz/brb/internal/backup"
@@ -138,9 +140,23 @@ func fail(p *ui.Printer, err error) int {
 }
 
 // loadConfig reads the configuration file and reports which one was used.
+//
+// path is what -c named, or "" for the default location. The two are not
+// treated alike when the file is missing: no file at the default path is the
+// ordinary first run, but a -c that names nothing is a mistyped path, and
+// carrying on with the defaults would silently point a restore at
+// /var/tmp/brb — an empty staging directory and a report of no discs at all —
+// or a backup at $HOME. brb.sh dies on the same condition with the same words.
 func loadConfig(path string, p *ui.Printer) (*config.Config, string, error) {
-	if path == "" {
+	explicit := path != ""
+	if !explicit {
 		path = config.DefaultConfigPath()
+	}
+	if explicit {
+		if _, err := os.Stat(path); errors.Is(err, fs.ErrNotExist) {
+			return nil, path, fmt.Errorf("config file not found: %s (named by -c; "+
+				"check the path, or drop -c to use %s)", path, config.DefaultConfigPath())
+		}
 	}
 	cfg, err := config.Load(path)
 	if err != nil {
@@ -150,6 +166,50 @@ func loadConfig(path string, p *ui.Printer) (*config.Config, string, error) {
 		p.Step("config: %s", path)
 	}
 	return cfg, path, nil
+}
+
+// resolveSourceDir replaces a SOURCE_DIR that is itself a symbolic link with
+// the directory it points at. It is called by the commands that read the
+// source tree — doctor, plan and backup — and by nothing on the restore side,
+// where SOURCE_DIR is unused and the message would only be noise.
+//
+// Validate and doctor stat the path, which follows the link, so a symlinked
+// SOURCE_DIR passed every check and then failed at the scan, which lstats its
+// root and reported "not a directory" — accurate, unhelpful, and hours after
+// doctor said ready. The scanner is right not to follow links inside the tree,
+// but the root is the operator's choice of what to back up, and a link there
+// can only ever have meant its target. Only the last component is resolved,
+// which is exactly the case the scanner rejects; symlinked parents were always
+// fine (EvalSymlinks resolves those too, which changes nothing the scanner
+// cares about). A backup resumed after this change cannot be surprised by the
+// new path: a symlinked SOURCE_DIR never got as far as writing state.
+//
+// The original spelling is kept for the message and for ARCHIVE_NAME, which
+// Load has already derived from it — the operator named the link, so the
+// archive is named after the link.
+func resolveSourceDir(cfg *config.Config, p *ui.Printer) error {
+	if cfg.SourceDir == "" {
+		return nil
+	}
+	fi, err := os.Lstat(cfg.SourceDir)
+	if err != nil || fi.Mode()&fs.ModeSymlink == 0 {
+		return nil // missing or ordinary: Validate reports the former
+	}
+	target, err := filepath.EvalSymlinks(cfg.SourceDir)
+	if err != nil {
+		return fmt.Errorf("SOURCE_DIR %s is a symlink that cannot be followed: %w", cfg.SourceDir, err)
+	}
+	tfi, err := os.Stat(target)
+	if err != nil {
+		return fmt.Errorf("SOURCE_DIR %s is a symlink to %s: %w", cfg.SourceDir, target, err)
+	}
+	if !tfi.IsDir() {
+		// Leave it: Validate's "not a directory" is the right complaint.
+		return nil
+	}
+	p.Step("SOURCE_DIR %s is a symlink to %s; using %s", cfg.SourceDir, target, target)
+	cfg.SourceDir = target
+	return nil
 }
 
 // bestEffortConfig loads the configuration for the help text, falling back to
@@ -176,6 +236,9 @@ func dispatch(ctx context.Context, g globals, cfg *config.Config, cfgPath string
 		if err := f.need(0, 0, "doctor"); err != nil {
 			return err
 		}
+		if err := resolveSourceDir(cfg, p); err != nil {
+			return err
+		}
 		return doctor(ctx, cfg, cfgPath, p, tools.Detect(ctx))
 
 	case "init-key":
@@ -198,15 +261,15 @@ func dispatch(ctx context.Context, g globals, cfg *config.Config, cfgPath string
 		if err := f.need(0, 0, "plan"); err != nil {
 			return err
 		}
+		if err := resolveSourceDir(cfg, p); err != nil {
+			return err
+		}
 		_, err := backup.Plan(ctx, backup.Options{Cfg: cfg, UI: p, DryRun: true})
 		return err
 
 	case "backup":
-		var resume, roundTrip, public bool
-		f := newFlags("backup")
-		f.Bool(&resume, "--resume")
-		f.Bool(&roundTrip, "--verify-roundtrip")
-		f.Bool(&public, "--public-archive")
+		var bo backupOptions
+		f := backupFlags(&bo)
 		if err := f.parse(g.args); err != nil {
 			return err
 		}
@@ -214,17 +277,20 @@ func dispatch(ctx context.Context, g globals, cfg *config.Config, cfgPath string
 			"backup [--resume] [--verify-roundtrip] [--public-archive]"); err != nil {
 			return err
 		}
+		if err := resolveSourceDir(cfg, p); err != nil {
+			return err
+		}
 		// The flag turns it on; the config file can too. Neither can turn the
 		// other off, so a set is public only if something said so explicitly.
-		if public {
+		if bo.public {
 			cfg.PublicArchive = true
 		}
 		return backup.Run(ctx, backup.Options{
 			Cfg:             cfg,
 			UI:              p,
 			Tools:           tools.Detect(ctx),
-			Resume:          resume,
-			VerifyRoundTrip: roundTrip,
+			Resume:          bo.resume,
+			VerifyRoundTrip: bo.roundTrip,
 		})
 
 	case "burn":
@@ -346,6 +412,26 @@ func dispatch(ctx context.Context, g globals, cfg *config.Config, cfgPath string
 	}
 
 	return usagef("unknown command %q", g.cmd)
+}
+
+// backupOptions are the per-command flags of `brb backup`.
+type backupOptions struct {
+	resume    bool
+	roundTrip bool
+	public    bool
+}
+
+// backupFlags registers every flag `brb backup` accepts. It is the one list:
+// dispatch parses with it, and TestHelpDocumentsEveryBackupFlag reads the
+// names back out of it and looks each one up in helpText — so a flag added
+// here without a line in the help fails the tests instead of shipping as an
+// undocumented switch, which is how --public-archive went missing once.
+func backupFlags(o *backupOptions) *cmdFlags {
+	f := newFlags("backup")
+	f.Bool(&o.resume, "--resume")
+	f.Bool(&o.roundTrip, "--verify-roundtrip")
+	f.Bool(&o.public, "--public-archive")
+	return f
 }
 
 // restoreOpts builds the dependency bundle every restore-side command takes.

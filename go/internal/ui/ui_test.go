@@ -136,6 +136,108 @@ func TestFailDoesNotExit(t *testing.T) {
 	}
 }
 
+// TestPrinterEscapesTerminalControls pins the one place terminal-escape
+// injection is stopped: a file name or a forwarded subprocess line that
+// carries ESC/BEL/CSI bytes reaches the writer spelled out, through every
+// emitting method, while the colour codes the Printer adds itself survive.
+func TestPrinterEscapesTerminalControls(t *testing.T) {
+	// An OSC title-set: ESC ] 0 ; title BEL. The classic hostile file name.
+	const hostile = "a\x1b]0;x\x07b"
+	const wantSpelled = `a\x1b]0;x\x07b`
+
+	emitters := []struct {
+		name string
+		call func(p *Printer)
+	}{
+		{"Log", func(p *Printer) { p.Log("%s", hostile) }},
+		{"OK", func(p *Printer) { p.OK("%s", hostile) }},
+		{"Warn", func(p *Printer) { p.Warn("%s", hostile) }},
+		{"Fail", func(p *Printer) { p.Fail("%s", hostile) }},
+		{"Step", func(p *Printer) { p.Step("%s", hostile) }},
+		{"Raw", func(p *Printer) { p.Raw("%s", hostile) }},
+		{"Confirm prompt", func(p *Printer) {
+			p.SetInput(strings.NewReader("n\n"))
+			_, _ = p.Confirm(hostile)
+		}},
+		{"Confirm under --yes", func(p *Printer) {
+			p.SetAssumeYes(true)
+			_, _ = p.Confirm(hostile)
+		}},
+		{"PromptEnter", func(p *Printer) {
+			p.SetInput(strings.NewReader("\n"))
+			_ = p.PromptEnter(hostile)
+		}},
+	}
+	for _, tc := range emitters {
+		t.Run(tc.name, func(t *testing.T) {
+			p, buf := newTestPrinter(false)
+			tc.call(p)
+			got := buf.String()
+			if strings.ContainsAny(got, "\x1b\x07") {
+				t.Errorf("%s wrote a raw ESC or BEL to the terminal: %q", tc.name, got)
+			}
+			if !strings.Contains(got, wantSpelled) {
+				t.Errorf("%s output = %q, want it to spell the bytes out as %q", tc.name, got, wantSpelled)
+			}
+		})
+	}
+
+	// The Printer's own colour codes are not user data and must stay intact.
+	p, buf := newTestPrinter(true)
+	p.OK("%s", hostile)
+	if got, want := buf.String(), "\033[32m  ok\033[0m "+wantSpelled+"\n"; got != want {
+		t.Errorf("coloured OK = %q, want %q (own colour kept, message escaped)", got, want)
+	}
+
+	// The progress bar's label is drawn straight onto the terminal by render,
+	// which bypasses emit; it too can carry a name read off a disc. The bar
+	// only draws on a terminal, so check the stored label and the rendered
+	// line rather than the writer.
+	p, _ = newTestPrinter(false)
+	pr := p.NewProgress(hostile, 10)
+	if pr.label != wantSpelled {
+		t.Errorf("progress label stored as %q, want %q", pr.label, wantSpelled)
+	}
+	if line := pr.line(5); strings.ContainsAny(line, "\x1b\x07") || !strings.Contains(line, wantSpelled) {
+		t.Errorf("progress line = %q, want the label spelled out as %q with no raw ESC or BEL", line, wantSpelled)
+	}
+}
+
+// TestVisible pins exactly what is escaped and how: the same C-style spelling
+// restore uses for index lines, newline and tab left alone, C1 controls
+// caught in their UTF-8 form, and ordinary text — multi-byte included —
+// returned untouched.
+func TestVisible(t *testing.T) {
+	tests := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{"plain", "disc01.squashfs", "disc01.squashfs"},
+		{"multibyte stays", "phötos ✓ 日本", "phötos ✓ 日本"},
+		{"newline kept", "line one\nline two", "line one\nline two"},
+		{"tab kept", "a\tb", "a\tb"},
+		{"carriage return", "a\rb", `a\rb`},
+		{"escape", "\x1b[2J", `\x1b[2J`},
+		{"bell", "ding\x07", `ding\x07`},
+		{"nul", "a\x00b", `a\x00b`},
+		{"delete", "a\x7fb", `a\x7fb`},
+		{"c1 control in utf-8", "a\u009bb", `a\xc2\x9bb`},  // CSI as one rune
+		{"c1 nel", "a\u0085b", `a\xc2\x85b`},               // NEL
+		{"latin-1 above c1 stays", "a\u00a0b", "a\u00a0b"}, // NBSP is not a control
+		{"invalid utf-8 passes", "a\xffb", "a\xffb"},       // not ours to rewrite
+		{"stray c2 at end", "a\xc2", "a\xc2"},              // truncated sequence, no C1
+		{"stray c2 before ascii", "a\xc2b", "a\xc2b"},      // not a C1 encoding
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := visible(tc.in); got != tc.want {
+				t.Errorf("visible(%q) = %q, want %q", tc.in, got, tc.want)
+			}
+		})
+	}
+}
+
 func TestColorEnabled(t *testing.T) {
 	t.Setenv("NO_COLOR", "")
 	t.Setenv("TERM", "xterm")

@@ -43,7 +43,9 @@ func (p *Printer) NewProgress(label string, total int64) *Progress {
 	if prev != nil {
 		prev.Done()
 	}
-	pr := &Progress{p: p, label: label, total: total}
+	// The label is drawn on the terminal like any message, and it too can
+	// carry a name read off a disc; escape it once here rather than per redraw.
+	pr := &Progress{p: p, label: visible(label), total: total}
 	p.mu.Lock()
 	pr.on = p.tty
 	p.prog = pr

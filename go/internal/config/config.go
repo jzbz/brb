@@ -388,6 +388,16 @@ func isArrayKey(key string) bool {
 	return key == "PRUNE_DIRS" || key == "EXCLUDE_MASKS"
 }
 
+// isKnownKey reports whether key is one Keys lists.
+func isKnownKey(key string) bool {
+	for _, k := range Keys() {
+		if k == key {
+			return true
+		}
+	}
+	return false
+}
+
 // EnvName returns the environment variable that carries a configuration key.
 //
 // It is the key itself for everything but DIST_DIR, which brb.sh reads from
@@ -471,7 +481,23 @@ func envValue(key, raw string) (Value, error) {
 }
 
 // set applies one key.
+//
+// An empty scalar — KEY= or KEY="" — leaves the setting exactly as it was,
+// for every key. That is what the sample config in `brb help` and the README
+// relies on: DISC_CAPACITY_BYTES= and DIST_DIR= are how they say "not
+// overridden", and it is what the same file means to brb.sh, whose
+// ${VAR:-default} treats an empty variable as an unset one. Before this rule
+// a pasted sample failed to load with "DISC_CAPACITY_BYTES: invalid integer".
+// The two array keys are the deliberate exception: PRUNE_DIRS=() and even
+// PRUNE_DIRS="" mean "prune nothing", because for them the defaults are a
+// list an operator may want to switch off, and a value that could not do so
+// would leave no spelling for it; see [Value.list]. An unknown key is still an
+// error even when it is empty: KEEP_IMAGES= in a shared file is the same typo
+// as KEEP_IMAGES=0, and the README promises it is reported.
 func (c *Config) set(key string, v Value) error {
+	if !v.IsArray && v.Scalar == "" && !isArrayKey(key) && isKnownKey(key) {
+		return nil
+	}
 	switch key {
 	case "SOURCE_DIR":
 		return v.str(key, &c.SourceDir)
