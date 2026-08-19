@@ -275,6 +275,11 @@ func Mount(ctx context.Context, o Options, n int, mountPoint string) error {
 	if err := o.check(); err != nil {
 		return err
 	}
+	unlock, err := o.lockStaging()
+	if err != nil {
+		return err
+	}
+	defer unlock()
 	if n <= 0 {
 		return fmt.Errorf("restore: disc number must be 1 or more, got %d", n)
 	}

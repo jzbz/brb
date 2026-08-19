@@ -202,6 +202,10 @@ type runner struct {
 	pubkeys    []string
 	identities []age.Identity
 
+	// lock is the staging lock this run holds, or nil before preflight has
+	// taken it (and for a dry run, which writes nothing).
+	lock *fsx.StagingLock
+
 	// publicIdentity is the archive's own secret key under PUBLIC_ARCHIVE, and
 	// nil otherwise. It is minted in preflight and written onto every disc as
 	// identity.txt; see mintPublicIdentity. Its presence is what the manifest

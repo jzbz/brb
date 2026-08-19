@@ -283,6 +283,22 @@ func Build(ctx context.Context, o Options, spec string) error {
 	if len(nums) == 0 {
 		return fmt.Errorf("iso: no disc directories in %s — run 'brb backup' first", o.Cfg.Dirs().Discs)
 	}
+	// Locked here rather than at the top, and the order is the point twice
+	// over. There is nowhere to put a lock file until staging exists, and
+	// "cannot open .brb.lock" is a poor way to be told there is no disc set to
+	// image — so the cheap checks above answer first. This is also the command
+	// entry point: BuildAll and Ensure do not lock, because their callers (a
+	// backup run, and burn) hold it already, and one process taking an flock
+	// twice on two descriptors would refuse itself.
+	lock, err := fsx.LockStaging(o.Cfg.Staging)
+	if err != nil {
+		return fmt.Errorf("iso: %w", err)
+	}
+	defer func() {
+		if err := lock.Release(); err != nil {
+			o.UI.Warn("could not release the staging lock: %v", err)
+		}
+	}()
 	rng, err := ParseRange(spec)
 	if err != nil {
 		return fmt.Errorf("iso: %w", err)

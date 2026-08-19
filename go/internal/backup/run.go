@@ -69,6 +69,12 @@ func Run(ctx context.Context, o Options) error {
 	if r.tools == nil {
 		r.tools = tools.Detect(ctx)
 	}
+	// Deferred BEFORE preflight, not after: preflight takes the staging lock
+	// partway through and can still refuse the run after that (a resume whose
+	// state disagrees, too little space, a declined confirmation). Releasing
+	// only on the success path leaked the lock for the life of the process,
+	// which a one-shot CLI hides and a second Run in the same process does not.
+	defer r.releaseStaging()
 	if err := r.preflight(ctx); err != nil {
 		return err
 	}

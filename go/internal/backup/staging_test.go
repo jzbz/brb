@@ -1,12 +1,14 @@
 package backup
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/jzbz/brb/internal/config"
+	"github.com/jzbz/brb/internal/fsx"
 )
 
 // stagingRunner is a runner with nothing set but the staging paths, which is
@@ -205,3 +207,76 @@ func TestAppendIndexDoesNotWriteThroughAPlantedSymlink(t *testing.T) {
 // (That it still accumulates across discs — the reason it cannot use
 // fsx.CreateFresh — is pinned by TestAppendIndexAccumulatesAcrossDiscs in
 // index_test.go.)
+
+// TestBackupRefusesToShareStagingWithAnotherRun. Every earlier guard against a
+// second run caught one that had already finished; this is the one that
+// notices a run in progress. The case it is really for is `burn` mastering an
+// ISO from a disc directory a backup has not finished writing.
+func TestBackupRefusesToShareStagingWithAnotherRun(t *testing.T) {
+	ctx := context.Background()
+	set := realTools(t, ctx)
+	cfg := integrationConfig(t, 2, 1<<20)
+	keysFor(t, cfg)
+
+	// Stand in for the run already under way: hold its lock, having secured
+	// the tree exactly as its preflight would.
+	if err := fsx.SecureStaging(cfg.Staging); err != nil {
+		t.Fatal(err)
+	}
+	held, err := fsx.LockStaging(cfg.Staging)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer held.Release()
+
+	err = Run(ctx, Options{Cfg: cfg, UI: yesPrinter(), Tools: set})
+	if err == nil {
+		t.Fatal("a second backup into the same staging directory was accepted")
+	}
+	if !strings.Contains(err.Error(), "another brb is using") {
+		t.Fatalf("Run = %v, want the staging-in-use refusal", err)
+	}
+
+	// And the lock is not a one-way door: once the first run is done, the next
+	// one proceeds. Without this the test would pass just as well against a
+	// build that refused every backup.
+	if err := held.Release(); err != nil {
+		t.Fatal(err)
+	}
+	free, err := fsx.LockStaging(cfg.Staging)
+	if err != nil {
+		t.Fatalf("staging stayed locked after the holder released: %v", err)
+	}
+	free.Release()
+}
+
+// TestAFailedPreflightReleasesTheStagingLock. preflight takes the lock partway
+// through and can still refuse the run afterwards. Releasing only on the
+// success path leaked it for the life of the process — invisible in a one-shot
+// CLI, and fatal to any second Run in the same process, which is what every
+// resume test here is. Caught by the suite, not by the unit tests, so it is
+// pinned here.
+func TestAFailedPreflightReleasesTheStagingLock(t *testing.T) {
+	ctx := context.Background()
+	set := realTools(t, ctx)
+	cfg := integrationConfig(t, 2, 1<<20)
+	keysFor(t, cfg)
+
+	// A refusal that happens AFTER makeDirs has locked: --resume with no state
+	// to resume from. Any late preflight refusal would do.
+	err := Run(ctx, Options{Cfg: cfg, UI: yesPrinter(), Tools: set, Resume: true})
+	if err == nil {
+		t.Fatal("--resume with no state was accepted")
+	}
+	if strings.Contains(err.Error(), "another brb is using") {
+		t.Fatalf("the refusal was the lock itself, not the expected one: %v", err)
+	}
+
+	// The lock must be free again: nothing is holding it, so taking it here
+	// must succeed. Before the fix this failed, and so did every later Run.
+	lock, err := fsx.LockStaging(cfg.Staging)
+	if err != nil {
+		t.Fatalf("the failed preflight leaked the staging lock: %v", err)
+	}
+	lock.Release()
+}

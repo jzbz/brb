@@ -42,6 +42,11 @@ func Ingest(ctx context.Context, o Options, mountPoint string) error {
 	if err := o.check(); err != nil {
 		return err
 	}
+	unlock, err := o.lockStaging()
+	if err != nil {
+		return err
+	}
+	defer unlock()
 	encDir := o.dirs().Enc
 	if err := o.secureStaging(encDir); err != nil {
 		return err

@@ -28,6 +28,11 @@ func Burn(ctx context.Context, o Options, which string) error {
 	if err := o.check(); err != nil {
 		return err
 	}
+	unlock, err := o.lockStaging()
+	if err != nil {
+		return err
+	}
+	defer unlock()
 	if err := o.Tools.Require(tools.Xorriso); err != nil {
 		return fmt.Errorf("restore: %w", err)
 	}
@@ -94,6 +99,12 @@ func Burn(ctx context.Context, o Options, which string) error {
 	} else {
 		o.UI.OK("burned %d of %d disc(s), %d skipped", burned, len(queue), len(queue)-burned)
 	}
+	// Worth repeating at the end, because the per-disc hints have scrolled by
+	// under xorriso's output by now, and a set nobody read back is a set whose
+	// first news of a bad drive arrives at restore time.
+	if burned > 0 {
+		o.UI.Step("verify what you burned:  brb verify-disc <n>  for each disc, with it in the drive")
+	}
 	return nil
 }
 
@@ -136,6 +147,12 @@ func (o Options) burnOne(ctx context.Context, n, total int) (burned bool, err er
 		return false, fmt.Errorf("restore: burning disc %d: %w", n, err)
 	}
 	o.UI.OK("disc %d burned — label it: %s, disc %d of %d", n, o.Cfg.ArchiveName, n, total)
+	// xorriso exiting 0 says the drive accepted the write, not that the medium
+	// reads back. Nothing here reads it back — that is what verify-disc is for,
+	// and it is the only thing that catches a drive or a blank that wrote badly
+	// — so say so at the moment the disc is still in the tray and the ISO, on
+	// the next line, may be about to be deleted.
+	o.UI.Step("read it back before you trust it:  brb verify-disc %d", n)
 
 	// Only here, and only on success: the bytes are on the medium, so the second
 	// copy in staging has served its purpose. Every path above that did not burn

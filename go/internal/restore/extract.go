@@ -82,6 +82,11 @@ func Restore(ctx context.Context, o Options, ro RestoreOptions) error {
 	if err := o.check(); err != nil {
 		return err
 	}
+	unlock, err := o.lockStaging()
+	if err != nil {
+		return err
+	}
+	defer unlock()
 	if ro.Dest == "" {
 		return errors.New("restore: no destination given")
 	}
@@ -789,6 +794,11 @@ func List(ctx context.Context, o Options, n int, w io.Writer) error {
 	if err := o.check(); err != nil {
 		return err
 	}
+	unlock, err := o.lockStaging()
+	if err != nil {
+		return err
+	}
+	defer unlock()
 	if w == nil {
 		return errors.New("restore: no output writer given")
 	}

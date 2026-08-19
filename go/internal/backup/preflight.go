@@ -50,6 +50,11 @@ func (r *runner) preflight(ctx context.Context) error {
 	if err := r.makeDirs(); err != nil {
 		return err
 	}
+	// After makeDirs, which has just proved this process owns the tree, and
+	// before anything is written into it. Released by Run's defer.
+	if err := r.lockStaging(); err != nil {
+		return err
+	}
 	if err := r.checkSpace(); err != nil {
 		return err
 	}
@@ -334,6 +339,30 @@ func (r *runner) makeDirs() error {
 		return fmt.Errorf("backup: %w", err)
 	}
 	return nil
+}
+
+// lockStaging takes the staging lock for the life of this run, so a second brb
+// cannot write into the same tree at the same time. See [fsx.LockStaging] for
+// why that matters and why the lock is an flock rather than a pid file.
+func (r *runner) lockStaging() error {
+	lock, err := fsx.LockStaging(r.cfg.Staging)
+	if err != nil {
+		return fmt.Errorf("backup: %w", err)
+	}
+	r.lock = lock
+	return nil
+}
+
+// releaseStaging drops the staging lock. It is safe to call on a runner that
+// never took one — a dry run, or a preflight that failed before locking.
+func (r *runner) releaseStaging() {
+	if r.lock == nil {
+		return
+	}
+	if err := r.lock.Release(); err != nil {
+		r.p.Warn("could not release the staging lock: %v", err)
+	}
+	r.lock = nil
 }
 
 // checkSpace refuses to start a multi-hour job that cannot finish one disc.
