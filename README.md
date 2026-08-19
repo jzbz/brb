@@ -41,9 +41,11 @@ archive format.
 
 The Go build is the tool you use day to day. The bash script exists for one
 reason: a restore fifteen years from now, by someone holding a disc and no
-particular reason to trust an 8 MB binary. It is a bit over a thousand lines,
-comments and all, and can be read end to end in an afternoon, so the answer to
-"what is this going to do to my bytes" is available without running anything.
+particular reason to trust an 8 MB binary. It is one file of under two thousand
+lines, comments and all — `wc -l brb.sh` on the disc is the authority here,
+because a number written into prose drifts and this one already has — and
+it can be read end to end in an afternoon, so the answer to "what is this going
+to do to my bytes" is available without running anything.
 
 `brb.sh` refuses `backup`, `plan`, `burn`, `iso` and `init-key` by name, and says
 where they went, rather than failing as an unknown command.
@@ -1001,6 +1003,15 @@ set on purpose: a rotted `.sha512` sidecar must not condemn an image par2 proves
 is whole, while an image par2 *cannot* repair must still be refused rather than
 decrypted.
 
+It also plants symlinks in the *destination* — the direction a restore is
+attacked from — and holds both readers to the same two refusals: a link that
+resolves to a directory, which `unsquashfs -f` would follow to write the
+archive's files outside the destination, and a link that resolves to a file
+sitting where the image holds a directory, whose target would otherwise be
+given the archive's directory mode, owner and times. Each refusal is checked
+alongside the cases that must still restore, so neither guard can pass by
+refusing everything.
+
 Where the two genuinely differ, the check is written the way it ought to pass
 and marked `XFAIL` with the divergence named. An `XFAIL` that starts passing is
 reported as `XPASS` and **counted as a failure**, so a fixed divergence gets
@@ -1023,6 +1034,13 @@ default again. For `build-dist.sh` that is taken literally: no output argument,
 `BRB_DIST_OUT` unset, and `HOME` pointed at a fresh, empty directory for that one
 step, so the script's own `~/brb-dist` fallback is what decides where the
 payload lands, and the checks that follow look only there.
+
+Every third-party action the workflow uses is pinned to a **40-character commit
+SHA**, with the release tag it came from in a trailing comment. A `@v5`-style
+tag is movable by whoever owns that repository, and the job holding it is the
+one that builds the payload burned onto the discs; the same reasoning that
+checksums the shellcheck download applies to it. The header of `ci.yml` records
+how to resolve and verify a SHA when one is moved forward.
 
 The four shell scripts are linted with a pinned, checksummed **shellcheck
 0.11.0** at its most inclusive severity, and all four are clean at it. The

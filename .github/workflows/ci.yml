@@ -9,6 +9,26 @@
 # test and dist wait on check so a stray gofmt diff costs one minute rather than
 # fifteen of par2 arithmetic, and so a red run points at one job instead of three.
 #
+# WHY THE ACTIONS ARE PINNED BY SHA. `actions/checkout@v5` is a branch-shaped
+# tag: whoever controls that repository can move it, and the job it runs in is
+# the one that builds the payload burned onto every disc. The shellcheck
+# download below is checksummed for exactly that reason, and leaving the
+# actions on mutable tags would have made that ceremony rather than a policy.
+# So each `uses:` names a 40-character commit SHA, with the release tag it came
+# from in a trailing comment — the comment is what a human reads, the SHA is
+# what GitHub resolves. To move one forward:
+#
+#   gh api repos/actions/checkout/git/ref/tags/v5 --jq .object
+#     -> {"sha": "...", "type": "commit"}      # use that sha
+#     -> {"sha": "...", "type": "tag"}         # annotated: deref once more,
+#        gh api repos/actions/checkout/git/tags/<sha> --jq .object.sha
+#   gh api 'repos/actions/checkout/tags?per_page=100' --jq '.[]|"\(.name) \(.commit.sha)"' | grep <sha>
+#     -> the vX.Y.Z that shares it, which is what the trailing comment says
+#
+# Verify the SHA really belongs to that repository before writing it down
+# (`gh api repos/actions/checkout/commits/<sha> --jq .sha` must echo it back);
+# a SHA from the wrong repository is not a pin, it is a 404 on the next run.
+#
 # WHY A FRESH RUNNER IS THE POINT. This repo shipped with one machine's home
 # directory baked into three defaults, and that was found only because the tree
 # happened to move. Every job below starts from a bare checkout with nothing
@@ -44,7 +64,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09  # v5.1.0
 
       # Pinned, and checksummed, rather than taken from apt. Ubuntu ships
       # shellcheck 0.9.0; these scripts were triaged against 0.11.0, and the two
@@ -72,7 +92,7 @@ jobs:
       - name: shellcheck
         run: shellcheck --severity=style --format=gcc -- *.sh
 
-      - uses: actions/setup-go@v6
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16  # v6.5.0
         with:
           # Read the version out of go.mod rather than pinning it twice.
           go-version-file: go/go.mod
@@ -106,9 +126,9 @@ jobs:
     needs: check
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09  # v5.1.0
 
-      - uses: actions/setup-go@v6
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16  # v6.5.0
         with:
           go-version-file: go/go.mod
           cache-dependency-path: go/go.sum
@@ -189,9 +209,9 @@ jobs:
     needs: check
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09  # v5.1.0
 
-      - uses: actions/setup-go@v6
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16  # v6.5.0
         with:
           go-version-file: go/go.mod
           cache-dependency-path: go/go.sum

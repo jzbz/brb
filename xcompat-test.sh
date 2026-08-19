@@ -1111,6 +1111,114 @@ assert0 "brb.sh refuses a destination that is a symlink, spelled with a trailing
 assert0 "go brb refuses a destination that is a symlink, spelled with a trailing slash" \
   selflink_slash_refused go
 
+# Every plant above resolves to a DIRECTORY, so every one of them is answered by
+# refuse_symlinked_dirs / refuseSymlinkedDirs — the guard against unsquashfs -f
+# traversing a link and writing the archive's files outside the destination.
+# There is a SECOND, per-image guard, refuse_symlinks_at_dirs /
+# refuseSymlinksAtImageDirs, for the case that guard cannot see: a link
+# resolving to a FILE, at a path the IMAGE holds as a directory. Nothing
+# escapes through that one — unsquashfs finds the path taken and carries on —
+# but when it finishes the directory it applies the archive's mode, owner and
+# mtime to the path, and the kernel follows the link and applies them to the
+# target instead. A planted "Documents -> /etc/shadow" under a root restore is
+# the case both readers cite in their comments.
+#
+# No check in either shell suite ever fired that refusal until this one: both
+# readers build their directory list by parsing `unsquashfs -ll` text, so one
+# format change is all it would take for the guard to find nothing and return
+# happily, and a suite that only ever exercised the traversal guard would stay
+# green through it. Each check below therefore insists on the words only this
+# guard uses — "symlink(s) where", which the traversal guard's "symlink(s) to
+# directories" does not contain — so the other guard cannot answer for it.
+#
+# empty/ is the plant site because the reference image holds it as a directory
+# with NO children (drwxr-xr-x … squashfs-root/empty, read out of the image's
+# own listing rather than assumed). Where the archive directory has children
+# unsquashfs aborts on its own; an empty one is the case where this guard is
+# the only thing between the restore and the target file's metadata.
+HOSTAGE=$T/hostage.txt
+fresh_hostage() {
+  printf 'hostage\n' > "$HOSTAGE"
+  chmod 600 "$HOSTAGE"
+  [[ -f $HOSTAGE ]] || { echo "could not build the hostage file" >&2; return 1; }
+  [[ "$(stat -c%a "$HOSTAGE")" == 600 ]]
+}
+# Mode as much as contents: nothing is ever written into this file: the hazard
+# is the archive directory's 0755, owner and mtime landing on a 0600 file that
+# the restore was never pointed at.
+hostage_untouched() {
+  [[ -f $HOSTAGE && ! -L $HOSTAGE ]] \
+    || { echo "the hostage file is no longer a plain file" >&2; return 1; }
+  [[ "$(cat "$HOSTAGE" 2>/dev/null)" == hostage ]] \
+    || { echo "the hostage file's contents were rewritten" >&2; return 1; }
+  local m; m=$(stat -c%a "$HOSTAGE")
+  [[ $m == 600 ]] \
+    || { printf "the hostage file is now mode %s, not 600 — the archive directory's mode was written THROUGH the link\n" \
+           "$m" >&2; return 1; }
+}
+
+# plant_at DEST RELPATH — a symlink to the hostage FILE at RELPATH, with the
+# proof that it is one. A plant that quietly resolved to a directory, or to
+# nothing, would be answered by a different guard, or by none, and the refusal
+# below would be measuring something else.
+plant_at() {
+  local d=$1 rel=$2 parent=$1
+  fresh_hostage || return 1
+  rm -rf -- "$d"
+  if [[ $rel == */* ]]; then parent=$d/${rel%/*}; fi
+  mkdir -p -- "$parent"
+  ln -s "$HOSTAGE" "$d/$rel"
+  [[ -L "$d/$rel" ]] || { echo "$d/$rel is not a symlink" >&2; return 1; }
+  [[ -f "$d/$rel" && ! -d "$d/$rel" ]] \
+    || { echo "$d/$rel does not resolve to a plain file" >&2; return 1; }
+}
+
+# The same three-part shape as escape_refused: refused, refused BY THIS GUARD,
+# and the target of the link untouched.
+imagedir_refused() { # imagedir_refused sh|go LOGNAME DEST [restore args...]
+  local who=$1 tag=$2 rc=0
+  sym_restore "$@" || rc=$?
+  (( rc != 0 )) || { echo "exited 0 — the link at an archive directory path was extracted onto" >&2; return 1; }
+  grep -q 'symlink(s) where' "$LOG/symdest-$tag.log" \
+    || { echo "refused, but not by the per-image directory guard: $(_tail "$(cat "$LOG/symdest-$tag.log")")" >&2; return 1; }
+  hostage_untouched
+}
+# ...and the mirror, for the plants that must still restore.
+imagedir_not_refused() { # imagedir_not_refused sh|go LOGNAME DEST
+  local who=$1 tag=$2 rc=0
+  sym_restore "$@" || rc=$?
+  (( rc == 0 )) || { echo "exit $rc: $(_tail "$(cat "$LOG/symdest-$tag.log")")" >&2; return 1; }
+  hostage_untouched
+}
+
+for who in sh go; do
+  name=$([[ $who == sh ]] && echo 'brb.sh' || echo 'go brb')
+  D=$T/symatdir-$who
+
+  assert0 "fixture: $name — the destination holds a link to a FILE at empty/, which the image holds as a directory" \
+    plant_at "$D" empty
+  assert0 "$name refuses a symlink where the IMAGE holds a directory"                imagedir_refused "$who" "atdir-$who" "$D"
+  assert0 "  ... leaving the link's target file at mode 600 with its own contents"   hostage_untouched
+
+  # Two negative controls, because "refuses" is only worth having next to
+  # "still restores". A guard that refused every symlink it found in the
+  # destination would pass the check above and break every ordinary restore
+  # over a tree that already holds some of the archive's own entries: a link
+  # where the archive has a FILE, and a link where the archive has a SYMLINK of
+  # its own — which is exactly what disc 1's extracted links look like to disc
+  # 2 — must both restore, and be replaced rather than written through.
+  assert0 "fixture: the same link at big.bin instead, which the image holds as a file" \
+    plant_at "$D" big.bin
+  assert0 "$name still restores over a link at an archive FILE path"                 imagedir_not_refused "$who" "atfile-$who" "$D"
+  assert0 "  ... replacing it with the archive's real file"                          cmp -s "$SRC/big.bin" "$D/big.bin"
+
+  assert0 "fixture: the same link at lib/sym.bin, which the image holds as a symlink" \
+    plant_at "$D" lib/sym.bin
+  assert0 "$name still restores over a link at an archive SYMLINK path"              imagedir_not_refused "$who" "atsym-$who" "$D"
+  assert0 "  ... replacing it with the archive's own link"                           test "$(readlink -- "$D/lib/sym.bin")" = ../big.bin
+done
+unset name D
+
 # ---------------------------------------------------------------------------
 head_s "13. a staging path full of glob metacharacters"
 # ---------------------------------------------------------------------------
