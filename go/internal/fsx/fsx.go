@@ -1,12 +1,18 @@
-// Package fsx holds the two filesystem measurements brb makes outside any one
-// stage of the pipeline: how many bytes a directory tree holds, and how many
-// are still free on the volume under it.
+// Package fsx holds the filesystem operations brb performs outside any one
+// stage of the pipeline, in one copy each, because a second implementation of
+// any of them is a second chance to get it wrong.
 //
-// They live together, and apart from their callers, because both sides of a
-// disc-sizing decision use them — the backup checks a disc directory against
-// the media, the ISO builder checks the same tree against the free space it
-// needs to copy it — and a second implementation of either is a second chance
-// to get that decision wrong.
+// Two are measurements: how many bytes a directory tree holds, and how many
+// are still free on the volume under it. Both sides of a disc-sizing decision
+// use them — the backup checks a disc directory against the media, the ISO
+// builder checks the same tree against the free space it needs to copy it.
+//
+// The rest are the staging area's safety rules — [SecureStaging], [SecureDir],
+// [CreateFresh], [OpenAppend]. The writer and the reader share one staging
+// tree layout and one threat: its default lives under a world-writable
+// /var/tmp, and it holds plaintext. These rules used to be written once per
+// caller, and each rewrite lost a piece of them, which is why they are here
+// and not there.
 package fsx
 
 import (

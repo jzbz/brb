@@ -16,6 +16,7 @@ import (
 	"github.com/jzbz/brb/internal/agecrypt"
 	"github.com/jzbz/brb/internal/config"
 	"github.com/jzbz/brb/internal/doc"
+	"github.com/jzbz/brb/internal/fsx"
 	"github.com/jzbz/brb/internal/tools"
 	"github.com/jzbz/brb/internal/ui"
 )
@@ -300,17 +301,37 @@ func (r *runner) loadIdentity() error {
 	return nil
 }
 
-// makeDirs creates the staging tree and tightens its mode: it holds plaintext.
+// makeDirs creates the staging tree and secures every directory in it. The
+// rules, and why each of them is there, are [fsx.SecureDir]'s; this decides
+// what to point them at.
+//
+// The root goes first, and is the one that matters most: STAGING defaults to a
+// path under /var/tmp, which is world-writable, so it is the one directory in
+// the tree that another local account can create ahead of the operator. Once
+// it is proven to be a real directory, mode 0700, owned by this process,
+// nothing else can be planted below it.
+//
+// The five subdirectories are then secured too, rather than merely created,
+// for two reasons. Staging is deliberately reused — a resumed run finds the
+// whole tree already there — so these are as often inherited as made, and an
+// inherited directory can have any mode, any owner, or be a symlink the
+// operator pointed at a bigger volume; the reader refuses exactly that at enc/
+// and restore/, and a writer that accepted it would be the same defect in the
+// other implementation. And what they hold is worth the check on its own:
+// img/ holds unencrypted squashfs images until each one is encrypted and
+// verified, enc/ the ciphertext, and work/ the index and the resume state,
+// whose Assigned list is what a continued run consults to decide which files
+// it may skip. A tampered state file does not corrupt a set loudly; it makes
+// the set quietly incomplete.
+//
+// This runs before checkSpace, which measures the filesystem under STAGING,
+// and before prepareState, which reads work/state.json — so nothing is
+// measured through a symlink and no resume decision is taken on a file another
+// account could have written.
 func (r *runner) makeDirs() error {
-	for _, d := range []string{
-		r.cfg.Staging, r.dirs.Work, r.dirs.Img, r.dirs.Enc, r.dirs.Discs, r.dirs.ISO,
-	} {
-		if err := os.MkdirAll(d, 0o700); err != nil {
-			return fmt.Errorf("backup: creating %s: %w", d, err)
-		}
-	}
-	if err := os.Chmod(r.cfg.Staging, 0o700); err != nil {
-		return fmt.Errorf("backup: securing %s: %w", r.cfg.Staging, err)
+	if err := fsx.SecureStaging(r.cfg.Staging,
+		r.dirs.Work, r.dirs.Img, r.dirs.Enc, r.dirs.Discs, r.dirs.ISO); err != nil {
+		return fmt.Errorf("backup: %w", err)
 	}
 	return nil
 }

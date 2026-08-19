@@ -10,6 +10,7 @@ import (
 	"os"
 	"strings"
 
+	"github.com/jzbz/brb/internal/fsx"
 	"github.com/jzbz/brb/internal/indexfmt"
 )
 
@@ -43,10 +44,16 @@ func writeIndexLines(w io.Writer, discNum int, paths []string) error {
 // appendIndex appends one disc's file list to the index file and flushes it to
 // disk, so that an interrupted run resumes with an index that already covers
 // every disc it completed.
+//
+// It is the one file in staging that accumulates rather than being written
+// once, so [fsx.CreateFresh]'s remove-then-O_EXCL — used everywhere else here
+// — would throw away every earlier disc's lines. [fsx.OpenAppend] gives it the
+// same refusal to open through a planted symlink without discarding what is
+// already in the file.
 func appendIndex(path string, discNum int, paths []string) (err error) {
-	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0o600)
+	f, err := fsx.OpenAppend(path, 0o600)
 	if err != nil {
-		return fmt.Errorf("backup: opening index %s: %w", path, err)
+		return fmt.Errorf("backup: index: %w", err)
 	}
 	defer func() {
 		cerr := f.Close()

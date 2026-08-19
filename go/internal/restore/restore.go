@@ -48,6 +48,7 @@ import (
 	"github.com/jzbz/brb/internal/agecrypt"
 	"github.com/jzbz/brb/internal/config"
 	"github.com/jzbz/brb/internal/doc"
+	"github.com/jzbz/brb/internal/fsx"
 	"github.com/jzbz/brb/internal/tools"
 	"github.com/jzbz/brb/internal/ui"
 )
@@ -869,10 +870,10 @@ func (o Options) decryptVerifying(ctx context.Context, encPath, dst, wantCipher 
 		// default lives under /var/tmp. The ciphertext, its sidecars and the
 		// par2 volumes stay 0644 — those modes end up on a disc.
 		//
-		// createFresh, never O_TRUNC: a symlink another local user planted at
+		// fsx.CreateFresh, never O_TRUNC: a symlink another local user planted at
 		// the .part path would otherwise have the plaintext streamed into a
 		// file of their choosing with this process's privileges.
-		out, err = createFresh(part, 0o600)
+		out, err = fsx.CreateFresh(part, 0o600)
 		if err != nil {
 			return "", fmt.Errorf("restore: %w", err)
 		}

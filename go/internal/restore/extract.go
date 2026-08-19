@@ -16,6 +16,7 @@ import (
 	"strings"
 
 	"github.com/jzbz/brb/internal/agecrypt"
+	"github.com/jzbz/brb/internal/fsx"
 	"github.com/jzbz/brb/internal/tools"
 	"github.com/jzbz/brb/internal/ui"
 )
@@ -468,7 +469,7 @@ func unsquashfsLogName(image string) string {
 func (o Options) extractImage(ctx context.Context, image, dest string, only []string) error {
 	name := filepath.Base(image)
 	logPath := filepath.Join(o.dirs().Restore, unsquashfsLogName(image))
-	lf, err := createFresh(logPath, 0o600)
+	lf, err := fsx.CreateFresh(logPath, 0o600)
 	if err != nil {
 		return fmt.Errorf("restore: %w", err)
 	}

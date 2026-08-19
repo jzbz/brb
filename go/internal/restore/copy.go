@@ -14,6 +14,7 @@ import (
 	"strings"
 
 	"github.com/jzbz/brb/internal/agecrypt"
+	"github.com/jzbz/brb/internal/fsx"
 	"github.com/jzbz/brb/internal/tools"
 )
 
@@ -73,12 +74,12 @@ func copyStream(ctx context.Context, src, dst string, prog io.Writer) (string, e
 	}
 	defer in.Close()
 
-	// createFresh: O_EXCL, never O_TRUNC, so a symlink planted at the .part
+	// fsx.CreateFresh: O_EXCL, never O_TRUNC, so a symlink planted at the .part
 	// path cannot redirect the copy; and a stale .part from a run that was
 	// killed mid-copy is removed first, so an interrupted ingest of
 	// MANIFEST.txt, which nothing reaps, can be repeated.
 	part := dst + partExt
-	out, err := createFresh(part, 0o644)
+	out, err := fsx.CreateFresh(part, 0o644)
 	if err != nil {
 		return "", err
 	}

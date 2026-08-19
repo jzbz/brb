@@ -8,6 +8,8 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+
+	"github.com/jzbz/brb/internal/fsx"
 )
 
 // copyBufSize is the chunk size of the context-aware copy loop. It also sets
@@ -53,6 +55,13 @@ func copyCtx(ctx context.Context, dst io.Writer, src io.Reader) (int64, error) {
 // dst. Callers use it as `defer func() { err = finish(err) }()` with a named
 // return so that every failure path — including cancellation — cleans up
 // identically and dst is never observed half-written.
+//
+// The .part is opened by [fsx.CreateFresh], which removes any leftover and
+// then uses O_EXCL. This used to be O_WRONLY|O_CREATE|O_TRUNC, which opens
+// straight through a symlink sitting at the path — and everything that goes
+// through here is written inside staging, whose default lives under a
+// world-writable /var/tmp. The reader had already stopped doing this in two
+// places for exactly that reason; the writer had not.
 func createPart(dst string) (*os.File, func(error) error, error) {
 	if dst == "" {
 		return nil, nil, errors.New("backup: no destination path given")
@@ -61,9 +70,9 @@ func createPart(dst string) (*os.File, func(error) error, error) {
 		return nil, nil, fmt.Errorf("backup: creating %s: %w", filepath.Dir(dst), err)
 	}
 	part := dst + ".part"
-	f, err := os.OpenFile(part, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
+	f, err := fsx.CreateFresh(part, 0o644)
 	if err != nil {
-		return nil, nil, fmt.Errorf("backup: creating %s: %w", part, err)
+		return nil, nil, fmt.Errorf("backup: %w", err)
 	}
 	finish := func(cause error) error {
 		if cause != nil {

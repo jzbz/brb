@@ -20,6 +20,7 @@ import (
 
 	"github.com/jzbz/brb/internal/agecrypt"
 	"github.com/jzbz/brb/internal/doc"
+	"github.com/jzbz/brb/internal/fsx"
 	"github.com/jzbz/brb/internal/tools"
 	"github.com/jzbz/brb/internal/ui"
 )
@@ -677,11 +678,11 @@ func (o Options) ingestPublicIdentity(mp, want string) (staged bool, err error) 
 }
 
 // writeStagedFile writes body to dst through a ".part" sibling that is
-// created fresh (see createFresh — never through a symlink planted at the
+// created fresh (see fsx.CreateFresh — never through a symlink planted at the
 // name), fsynced, and renamed into place, so dst is either whole or absent.
 func writeStagedFile(dst string, body []byte, mode os.FileMode) error {
 	part := dst + partExt
-	f, err := createFresh(part, mode)
+	f, err := fsx.CreateFresh(part, mode)
 	if err != nil {
 		return err
 	}

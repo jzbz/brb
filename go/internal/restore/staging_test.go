@@ -44,6 +44,12 @@ func TestSecureStagingRefusesASymlinkedDirectory(t *testing.T) {
 			if err == nil || !strings.Contains(err.Error(), "is a symlink") || !strings.Contains(err.Error(), link) {
 				t.Fatalf("secureStaging = %v, want a refusal naming the symlink %s", err, link)
 			}
+			// The rules live in internal/fsx and are shared with the writer;
+			// what this package adds is the prefix the operator reads. Losing
+			// it would leave a bare sentence with no command attached to it.
+			if !strings.HasPrefix(err.Error(), "restore: ") {
+				t.Errorf("the refusal lost its command prefix: %v", err)
+			}
 			// And the commands that write plaintext all go through it: PrepareImage
 			// must refuse before decrypting a byte.
 			enc, _ := e.writeImage(1, []byte("payload"))
@@ -95,114 +101,11 @@ func TestSecureStagingCreatesAndTightens(t *testing.T) {
 	}
 }
 
-// A staging directory this process cannot chmod is one it does not own, and
-// "could not lock the door" is fatal, not a warning: the writer's makeDirs
-// already treats it so. As non-root that is what a root-owned directory looks
-// like; as root chmod succeeds and the ownership check below takes over.
-func TestSecureStagingFailsWhenItCannotTighten(t *testing.T) {
-	if os.Geteuid() == 0 {
-		t.Skip("skipping: root can chmod anything, and must not chmod /proc")
-	}
-	// /proc is a directory root owns that no unprivileged process can chmod,
-	// and that nothing here can damage by trying.
-	if fi, err := os.Stat("/proc"); err != nil || !fi.IsDir() {
-		t.Skip("skipping: no /proc to stand in for a directory somebody else owns")
-	}
-	err := secureDir("/proc")
-	if err == nil || !strings.Contains(err.Error(), "securing /proc") {
-		t.Fatalf("secureDir(/proc) = %v, want a fatal chmod failure", err)
-	}
-	if !strings.Contains(err.Error(), "point STAGING at a directory you own") {
-		t.Errorf("the refusal does not say what to do: %v", err)
-	}
-}
-
-// Under root chmod succeeds on anything, so the ownership check is what stops
-// a restore from writing plaintext into a directory another account controls.
-// Only root can build that fixture, so the test runs only as root.
-func TestSecureStagingRefusesADirectoryOwnedBySomeoneElse(t *testing.T) {
-	if os.Geteuid() != 0 {
-		t.Skip("skipping: only root can create a directory owned by another uid")
-	}
-	dir := filepath.Join(t.TempDir(), "theirs")
-	if err := os.Mkdir(dir, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	const nobody = 65534
-	if err := os.Chown(dir, nobody, nobody); err != nil {
-		t.Fatal(err)
-	}
-	err := secureDir(dir)
-	if err == nil || !strings.Contains(err.Error(), "is owned by uid 65534") {
-		t.Fatalf("secureDir = %v, want an ownership refusal", err)
-	}
-	if !strings.Contains(err.Error(), "chown") {
-		t.Errorf("the refusal does not say what to do: %v", err)
-	}
-}
-
-// fileOwner is what the ownership check compares with, so it has to read the
-// real uid: ours on our own file, root's on root's.
-func TestFileOwnerReadsTheUid(t *testing.T) {
-	own := filepath.Join(t.TempDir(), "mine")
-	if err := os.WriteFile(own, []byte("x"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	fi, err := os.Stat(own)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if uid, ok := fileOwner(fi); !ok || uid != os.Geteuid() {
-		t.Fatalf("fileOwner(own file) = %d, %v; want %d, true", uid, ok, os.Geteuid())
-	}
-	if fi, err := os.Stat("/"); err == nil {
-		if uid, ok := fileOwner(fi); !ok || uid != 0 {
-			t.Fatalf("fileOwner(/) = %d, %v; want 0, true", uid, ok)
-		}
-	}
-}
-
-// createFresh is how every .part and log in staging is opened. A symlink
-// planted at the path must not be followed: the plaintext lands under the
-// intended name and the link's target is untouched. O_TRUNC would have written
-// straight through it.
-func TestCreateFreshNeverFollowsAPlantedSymlink(t *testing.T) {
-	dir := t.TempDir()
-	victim := filepath.Join(dir, "victim")
-	if err := os.WriteFile(victim, []byte("theirs"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	part := filepath.Join(dir, "disc01.squashfs.part")
-	if err := os.Symlink(victim, part); err != nil {
-		t.Fatal(err)
-	}
-	f, err := createFresh(part, 0o600)
-	if err != nil {
-		t.Fatalf("createFresh: %v", err)
-	}
-	if _, err := f.WriteString("plaintext"); err != nil {
-		t.Fatal(err)
-	}
-	f.Close()
-	if got, _ := os.ReadFile(victim); string(got) != "theirs" {
-		t.Fatalf("the planted symlink was followed: victim now holds %q", got)
-	}
-	fi, err := os.Lstat(part)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if fi.Mode()&os.ModeSymlink != 0 {
-		t.Fatal("the symlink is still at the .part path")
-	}
-	if got, _ := os.ReadFile(part); string(got) != "plaintext" {
-		t.Fatalf(".part holds %q, want the plaintext", got)
-	}
-}
-
-// The same guarantee, end to end through PrepareImage: a symlink planted at
-// restore/discNN.squashfs.part before the run must not receive the decrypted
-// image. This is the reproduced attack — attacker-owned staging, link planted
-// after the reap — reduced to the one step that matters.
+// fsx.CreateFresh's guarantee, end to end through PrepareImage: a symlink
+// planted at restore/discNN.squashfs.part before the run must not receive the
+// decrypted image. This is the reproduced attack — attacker-owned staging,
+// link planted after the reap — reduced to the one step that matters. The unit
+// test of the guarantee itself lives beside the implementation, in internal/fsx.
 func TestPrepareImageDoesNotDecryptThroughAPlantedSymlink(t *testing.T) {
 	e := newEnv(t)
 	payload := bytes.Repeat([]byte("secret image bytes\n"), 300)
