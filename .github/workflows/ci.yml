@@ -196,16 +196,31 @@ jobs:
           go-version-file: go/go.mod
           cache-dependency-path: go/go.sum
 
-      # No argument: this also proves the output default is not machine-specific.
-      - name: Build the payload
-        run: ./build-dist.sh "$RUNNER_TEMP/dist"
+      # build-dist.sh is run with NO argument and BRB_DIST_OUT unset, so the
+      # only thing deciding where the payload lands is the script's own
+      # fallback, $HOME/brb-dist. That is what makes this step a test of the
+      # default and not merely of the script: an absolute path from somebody's
+      # machine baked into that fallback would put the payload somewhere the
+      # steps below never look, and they would fail. HOME is pointed at a fresh,
+      # empty directory for this one step so the fallback is exercised against
+      # nothing pre-existing — no dotfiles, no earlier build — and so the
+      # verification steps can name exactly one place, ${{ runner.temp }}/home/brb-dist,
+      # to look in. (Go re-downloads its modules under the fresh HOME; that is
+      # the price of an honest test and it is a few seconds.)
+      - name: A fresh, empty HOME for the payload build
+        run: mkdir -p "$RUNNER_TEMP/home"
+
+      - name: Build the payload, with no argument and no environment
+        env:
+          HOME: ${{ runner.temp }}/home
+        run: ./build-dist.sh
 
       - name: The published set must verify against its own SHA512SUMS
-        working-directory: ${{ runner.temp }}/dist
+        working-directory: ${{ runner.temp }}/home/brb-dist
         run: sha512sum -c SHA512SUMS
 
       - name: Both binaries must be static, and the right architectures
-        working-directory: ${{ runner.temp }}/dist
+        working-directory: ${{ runner.temp }}/home/brb-dist
         run: |
           file brb-linux-amd64 brb-linux-aarch64
           # A cross-compile that silently produced two amd64 binaries would sail
@@ -224,7 +239,7 @@ jobs:
       - name: The source tarball must rebuild with the network off
         run: |
           cd "$RUNNER_TEMP"
-          tar xzf dist/brb-src.tar.gz
+          tar xzf home/brb-dist/brb-src.tar.gz
           cd brb-*/go
           GOPROXY=off go build -mod=vendor -o "$RUNNER_TEMP/brb-offline" ./cmd/brb
           "$RUNNER_TEMP/brb-offline" version

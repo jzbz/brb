@@ -21,12 +21,12 @@ tool versions used to create this set
 -------------------------------------
 {{range .ToolVersions}}  {{.}}
 {{else}}  (not recorded)
-{{end}}
+{{end -}}
 age recipients (public keys — harmless on their own)
 ----------------------------------------------------
 {{range .Recipients}}  {{.}}
 {{else}}  (none recorded — this set cannot be decrypted without the key that made it)
-{{end}}
+{{end -}}
 {{if .PublicIdentity}}THIS SET IS PUBLIC — IT KEEPS NO SECRET
 ----------------------------------------
   The key below opens every disc in this set, and it is ON every disc, in
@@ -52,4 +52,4 @@ excluded from this backup
 -------------------------
 {{range .PruneDirs}}  prune: {{.}}
 {{end}}{{range .ExcludeMasks}}  mask : {{.}}
-{{end}}
+{{end -}}

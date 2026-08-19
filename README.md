@@ -91,7 +91,7 @@ the same and one fewer thing has to be installed.
 | `sha512sum`, `stat`, `cp`, `cut`, `sort`, `tr`, `dd`, `df`, `readlink` | `coreutils` | hashing, accounting, and the destination symlink check |
 | `gzip` / `gunzip` | `gzip` | reading the encrypted index |
 | `find`, `awk`, `sed` | `findutils`, `gawk`, `sed` | locating and formatting |
-| `bash` **≥ 4.4** | `bash` | the script itself (uses `mapfile -d`) |
+| `bash` **≥ 4.2** | `bash` | the script itself. The newest constructs in it are `mapfile -t` (4.0) and `declare -g` (4.2); it uses no `mapfile -d`, no `${var@Q}`, no namerefs or negative subscripts, and every expansion of an array that may be empty is guarded, so `set -u` on a bash older than 4.4 does not trip it either |
 
 No `python3` for either — the bin-packer that once needed it is Go code now.
 
@@ -334,15 +334,28 @@ path and `--yes`, and fails outright with no terminal, where the Go build's
 
 Global flags, before the command: `--yes` / `-y` to skip confirmations and
 `-c CONFIG` to point at an alternate config file, on both; `--no-color` on the
-Go build only. Per-command flags go *after* the command, and are recognised only
-where they are documented — `brb --resume backup` is a usage error, `brb backup
---resume` is the resume.
+Go build only. `-c` naming a file that does not exist is an error on both, not a
+silent fall-through to the defaults — a typo in the path must not quietly run
+the command against a different staging directory. Per-command flags go *after*
+the command, and are recognised only where they are documented — `brb --resume
+backup` is a usage error, `brb backup --resume` is the resume.
 
 `restore` takes `--only <path-in-archive>` to extract a single path, and
 `--disc <n>` to restore only one disc. `--only` is repeatable on the Go build
 and every path given is extracted; `brb.sh` takes one path and a second `--only`
 silently replaces the first. The Go build additionally takes `--keep-images`,
 which is `KEEP_IMAGES=1` for one run.
+
+Two details of `restore` are worth knowing on both implementations. If
+`unsquashfs` finishes with exit status 2 — it extracted everything but hit
+non-fatal errors, typically an xattr or a special file the destination
+filesystem will not take — the restore warns, keeps that image's `unsquashfs`
+log under `$STAGING/restore`, and continues with the next disc; exit 1 still
+stops it. And a decrypted image already sitting in `$STAGING/restore` (left by
+`KEEP_IMAGES=1`, or by an interrupted run) is not trusted on sight: it is
+verified against the recorded plaintext hash before it is reused, and a copy
+whose hash disagrees is not reused — the image is decrypted again from the
+ciphertext instead.
 
 ### restore overwrites the destination
 
@@ -385,6 +398,19 @@ measured size has changed. `ARCHIVE_NAME` and `SOURCE_DIR` must match the
 interrupted run, or the resume stops rather than write two different trees into
 one set. Without `--resume`, a `backup` that finds finished discs in staging
 refuses to start rather than overwrite days of work.
+
+The resume also refuses anything that would make the finished discs and the
+ones still to come disagree about what set they belong to. The state file
+records the recipients the first disc was encrypted to, the disc geometry
+(`DISC_TYPE`, the capacity, `RESERVE_BYTES`, `PAR2_REDUNDANCY`) and whether the
+set is a public archive, and a `--resume` whose configuration differs in any of
+those stops with a message naming the setting rather than continuing. Each of
+those would otherwise produce a set that looks whole and is not: a changed
+recipients file yields later discs your key cannot open, a changed geometry
+yields images planned for one medium and burned to another, and a public
+archive that turns ordinary mid-set — or the reverse — yields discs that
+disagree about whether the key is on them. Change the setting back, or clear
+staging and start the set again.
 
 ### ISOs
 
@@ -429,7 +455,9 @@ the file, an unknown key is simply a variable nobody reads. The Go build
 *validates*, and rejects an unknown key by refusing to run at all. `KEEP_IMAGES`
 is the case that bites today: it is a real bash setting, and putting it in a
 shared config stops the Go build dead. Use its `--keep-images` flag instead, or
-keep the readers on separate config files.
+keep the readers on separate config files. Where the setting is read, both
+readers accept the same spellings — `1`/`0`, `true`/`false`, `yes`/`no`,
+`on`/`off` — so a value written for one is not misread by the other.
 
 ```bash
 SOURCE_DIR=/home/you
@@ -437,7 +465,7 @@ STAGING=/var/tmp/brb
 DISC_TYPE=bd25                  # bd25 | bd50 | bdxl100 | bdxl128 (M-DISC uses the same value)
 DISC_CAPACITY_BYTES=            # override for unusual media
 COMPRESSION=zstd                # zstd | xz | gzip | lz4 | lzo | none
-COMPRESSION_LEVEL=19            # zstd 1-22
+COMPRESSION_LEVEL=19            # zstd 1-22, gzip/lzo 1-9; xz, lz4 and none ignore it
 BLOCK_SIZE=1M
 PACK_RATIO=1.00                 # expected compressed/raw; lower = fuller discs
 PAR2_REDUNDANCY=10
@@ -691,7 +719,13 @@ unreadable regions with zeros and keeps going, which is exactly what par2 needs:
 
 ```bash
 ddrescue -d -r3 /mnt/data/disc07.squashfs.age ./disc07.squashfs.age ./disc07.mapfile
+cp /mnt/data/disc07.squashfs.age.* .    # the sidecar and the parity — .age.* so cp skips the damaged image
+par2 repair -- disc07.squashfs.age.par2
 ```
+
+`ddrescue` fetches only the image, and par2 can only use recovery files it can
+see, so the `.par2` set has to be copied beside it before the repair; the
+on-disc README spells the same three steps out.
 
 ---
 
@@ -819,10 +853,16 @@ is that nothing else about the format changes: same age container, same par2
 over the same ciphertext, same `SHA512SUMS`, same two readers. A public set is
 an ordinary set that happens to carry its own key, not a second on-disc format —
 so the manual recipe on the disc (`age -d -i /mnt/identity.txt …`) needs nothing
-new. One honest limit: neither `brb` reader searches a disc root or its own
-staging for a key on its own, so a `brb restore` of a public set wants
-`AGE_IDENTITY` pointed at a copy of the disc's `identity.txt`; the on-disc README
-says exactly that in its worked example.
+new. Nor do the two readers need telling: `ingest`, on both, copies the disc's
+`identity.txt` into staging as `enc/identity.txt` alongside the images, and
+every command that decrypts (`restore`, `mount`, `list`, `index`) tries that key
+in addition to whatever `AGE_IDENTITY`, or the identity found beside the
+recipients file, supplies. So
+`brb ingest` followed by `brb restore /dest` opens a public set with nothing
+configured at all, and the on-disc README's worked example says exactly that.
+A configured `AGE_IDENTITY` is not displaced by it — the disc's key is added,
+not substituted — so a machine set up for your own ordinary sets reads a public
+one without any change.
 
 **The key is always freshly generated.** `AGE_RECIPIENTS_FILE` is not consulted
 and neither is `AGE_IDENTITY`, deliberately: publishing a key you already use
@@ -856,7 +896,9 @@ never will be.
   keeps them all, and `list` and `mount` leave the image they decrypted behind
   by design. Remove them when you are done: `rm -rf $STAGING/restore`.
 - **The recipients file contains public keys only** and is harmless. The identity
-  file is the secret, and it is never written to a disc.
+  file is the secret, and it is never written to a disc — the one exception being
+  a [public archive](#a-public-archive-with-no-secret-at-all), whose freshly
+  minted key is on every disc by design.
 - Encrypting to multiple recipients is supported: append more `age1...` public
   keys to the recipients file and every image becomes decryptable by any of them.
   `brb init-key --rescue-key` is that mechanism applied to your own second key —
@@ -889,11 +931,25 @@ Known and deliberate, but you should hear them before you rely on this:
 - **Resuming is deliberate, not automatic.** An interrupted run continues with
   `brb backup --resume`, but a plain `backup` refuses to start on top of one
   rather than silently throwing the work away. The resumed run must agree with
-  the interrupted one on `ARCHIVE_NAME` and `SOURCE_DIR`, and needs the state
-  file in `$STAGING`; if staging has been cleared, the set is built again from
-  scratch. A resume re-scans the source and skips what is already on a disc, so
-  files added since the run started are picked up on later discs and a set can
-  span two points in time — it warns when the tree's measured size has changed.
+  the interrupted one on `ARCHIVE_NAME` and `SOURCE_DIR`, on the recipients,
+  the disc geometry and public-or-ordinary mode (see [Resuming an interrupted
+  backup](#resuming-an-interrupted-backup)), and needs the state file in
+  `$STAGING`; if staging has been cleared, the set is built again from scratch.
+  A resume re-scans the source and skips what is already on a disc, so files
+  added since the run started are picked up on later discs and a set can span
+  two points in time — it warns when the tree's measured size has changed.
+- **One filesystem at a time.** The scan does not cross a filesystem boundary
+  under `SOURCE_DIR`: a mount point inside the tree is reported at `plan` and
+  `backup` time and appears on the discs as an empty directory, and nothing
+  mounted there is backed up. Back a second filesystem up as its own set, or
+  point `SOURCE_DIR` at it. This is what keeps a home directory backup from
+  quietly swallowing an external drive or a network share that happened to be
+  mounted under it that day.
+- **Files you cannot read are left out, and said so.** A file the scanning user
+  has no permission to open is reported by the scan and excluded from the set —
+  it is not written as an empty file, which would restore as a silent
+  truncation. Run `backup` as root to capture them, and to record real
+  ownership; see [Security notes](#security-notes).
 - **A single file larger than one disc cannot be stored.** `brb` detects this
   during `plan`/`backup` and stops rather than silently dropping it. Exclude it,
   use larger media, or split it yourself.
@@ -909,9 +965,13 @@ Known and deliberate, but you should hear them before you rely on this:
 - **ISOs are ISO 9660 level 3 only**, not UDF. Level 3 multi-extent is what
   allows the >4 GiB images. Any Linux system reads these; some appliances that
   expect UDF on Blu-ray may not.
-- **`COMPRESSION_LEVEL` only applies to `zstd` and `gzip`.** It is silently
-  ignored for `xz`, `lz4` and `lzo`, which mksquashfs tunes through different
-  flags. Those compressors run at their own defaults.
+- **`COMPRESSION_LEVEL` applies to `zstd`, `gzip` and `lzo` only.** Those are
+  the compressors mksquashfs takes `-Xcompression-level` for (1–22 for zstd,
+  1–9 for the other two, and a value outside the range is a config error). `xz`
+  and `lz4` are tuned through different flags and run at their own defaults; a
+  non-zero `COMPRESSION_LEVEL` alongside one of them — and the default is 19 —
+  is called out in a warning by `doctor` and at the start of `backup` rather
+  than dropped silently. `COMPRESSION_LEVEL=0` quiets it.
 
 ---
 
@@ -959,7 +1019,10 @@ cd go && go test ./...
 every push and pull request, weekly on a schedule, and on demand. Both suites and
 `build-dist.sh` are invoked there with **no arguments and no environment**, which
 is the only arrangement that catches a machine-specific path getting baked into a
-default again.
+default again. For `build-dist.sh` that is taken literally: no output argument,
+`BRB_DIST_OUT` unset, and `HOME` pointed at a fresh, empty directory for that one
+step, so the script's own `~/brb-dist` fallback is what decides where the
+payload lands, and the checks that follow look only there.
 
 The four shell scripts are linted with a pinned, checksummed **shellcheck
 0.11.0** at its most inclusive severity, and all four are clean at it. The

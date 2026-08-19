@@ -498,6 +498,18 @@ root_has() { test -f "$GOD/$1"; }
 for f in README.md MANIFEST.txt SHA512SUMS; do
   assert0 "a disc's root carries $f" root_has "$f"
 done
+# The root, too, is part of the frozen format, and "carries these three" is
+# not "carries nothing else": --public-archive added identity.txt at the root
+# without this section noticing, which is exactly the event it exists to catch.
+# The tool payload (brb.sh, the two static binaries, the source tarball) is
+# optional and whitelisted rather than expected: a set built without a dist
+# directory legitimately carries only the copy of the running binary.
+ROOT_EXPECTED='MANIFEST.txt
+README.md
+SHA512SUMS'
+root_inventory() { inventory "$1" | grep -v '^data/' | grep -vE '^(brb\.sh|brb-linux-amd64|brb-linux-aarch64|brb-src\.tar\.gz)$'; }
+root_is() { diff <(printf '%s\n' "$2") <(root_inventory "$1") >&2; }
+assert0 "a disc's root holds exactly README.md, MANIFEST.txt and SHA512SUMS beside the payload (a new root artifact fails here)" root_is "$GOD" "$ROOT_EXPECTED"
 readme_documents_escaping() { grep -q 'never span two rows' "$GOD/README.md"; }
 assert0 "the on-disc README states the index escaping contract" readme_documents_escaping
 readme_no_udf() { ! grep -qi 'UDF' "$GOD/README.md" || grep -qi 'no UDF\|not UDF' "$GOD/README.md"; }
@@ -1093,8 +1105,10 @@ selflink_slash_refused() { # selflink_slash_refused sh|go
 }
 assert0 "brb.sh refuses a destination that is a symlink, spelled with a trailing slash" \
   selflink_slash_refused sh
-xassert0 "go brb refuses a destination that is a symlink, spelled with a trailing slash" \
-  "BUG, not a design choice: filepath.WalkDir(dest) with a trailing slash resolves the link before lstat, so refuseSymlinkedDirs walks the TARGET and sees nothing to refuse — the archive is written outside the destination. brb.sh strips the slash first and refuses. Fix by cleaning the path before the walk" \
+# Was an XFAIL: filepath.WalkDir(dest) with a trailing slash resolved the link
+# before lstat, so refuseSymlinkedDirs walked the TARGET and saw nothing to
+# refuse. Restore cleans the destination path first now, as brb.sh always did.
+assert0 "go brb refuses a destination that is a symlink, spelled with a trailing slash" \
   selflink_slash_refused go
 
 # ---------------------------------------------------------------------------
@@ -1331,6 +1345,143 @@ go_reads_keep_images_from_config() {
 xassert0 "go brb honours KEEP_IMAGES from the config file" \
   "brb.sh takes KEEP_IMAGES from the config; the Go build exposes only a --keep-images flag, so one config file cannot drive both readers the same way" \
   go_reads_keep_images_from_config
+
+# ---------------------------------------------------------------------------
+head_s "15. a public archive: the set that keeps no secret"
+# ---------------------------------------------------------------------------
+# --public-archive mints a keypair for the set, encrypts to it as usual, and
+# writes the secret key onto every disc as identity.txt at the root, beside
+# README.md; the writer keeps the same key at <staging>/enc/identity.txt for
+# the life of the set. Both readers pick the key up: ingest copies the disc's
+# identity.txt into staging, and it is used as an identity in addition to any
+# configured one. Nothing else about the format changes — same ciphertext,
+# same par2, same SHA512SUMS — and that is what this section pins, from both
+# sides. The recipients path below points into an EMPTY directory on purpose:
+# a public set must need no key material on the machine, and a stray
+# identity.txt beside the recipients file would have masked a reader that
+# only worked by accident.
+PUB=$T/stage-pub
+mkdir -p "$PUB" "$T/cfg/pubkeys"
+{ printf 'STAGING="%s"\nSOURCE_DIR="%s"\nARCHIVE_NAME="xcompat-public"\n' "$PUB" "$SRC"
+  printf 'DISC_CAPACITY_BYTES=60000000\nRESERVE_BYTES=30000000\nPAR2_BLOCKS=40\n'
+  printf 'AGE_RECIPIENTS_FILE="%s"\nPUBLIC_ARCHIVE=1\n' "$T/cfg/pubkeys/no-such-recipients.txt"
+} > "$T/cfg/pub"
+assert0 "go brb backup with PUBLIC_ARCHIVE=1 exits 0 with no key material on the machine" \
+  run_go "$LOG/backup-pub.log" "$T/cfg/pub" backup
+PUBD=$PUB/discs/disc01
+pub_key0() { grep -o 'AGE-SECRET-KEY-1[A-Z0-9]*' "$PUB/enc/identity.txt" 2>/dev/null | head -1; }
+pub_staging_has_key() { [[ -n "$(pub_key0)" ]]; }
+assert0 "the writer left the set's key at <staging>/enc/identity.txt" pub_staging_has_key
+pub_key_everywhere() {
+  local k0 d k; k0=$(pub_key0); [[ -n $k0 ]] || return 1
+  for d in "$PUB"/discs/disc*; do
+    k=$(grep -o 'AGE-SECRET-KEY-1[A-Z0-9]*' "$d/identity.txt" 2>/dev/null | head -1)
+    [[ $k == "$k0" ]] || return 1
+    [[ $(stat -c %a "$d/identity.txt") == 644 ]] || return 1
+    grep -q "$k0" "$d/MANIFEST.txt" && grep -q "$k0" "$d/README.md" || return 1
+  done
+}
+assert0 "every disc carries that key as identity.txt (0644), and again in MANIFEST.txt and README.md" pub_key_everywhere
+pub_sums_cover_key() { grep -qE '\./identity\.txt$' "$PUBD/SHA512SUMS" && ( cd "$PUBD" && sha512sum -c --quiet SHA512SUMS ) >/dev/null 2>&1; }
+assert0 "SHA512SUMS lists ./identity.txt and the disc still verifies" pub_sums_cover_key
+assert0 "a public disc's data/ is byte-for-byte the ordinary layout" inv_is "$PUBD" "$DATA_EXPECTED"
+assert0 "  ... and its root is the ordinary root plus identity.txt, nothing else" \
+  root_is "$PUBD" "$ROOT_EXPECTED"$'\n'"identity.txt"
+pub_readme_truthful() {
+  grep -q 'deliberately NOT confidential' "$PUBD/README.md" \
+    && ! grep -q 'never will be' "$PUBD/README.md" \
+    && grep -q 'never will be' "$GOD/README.md"
+}
+assert0 "the public README says so at the top, and only the public one drops the key-is-not-here sentence" pub_readme_truthful
+
+# The manual recipe, using nothing but the disc.
+pub_manual() {
+  local w=$T/pub-manual; rm -rf "$w"; mkdir -p "$w"
+  cp "$PUBD"/data/disc01.squashfs.age* "$w"/ || return 1
+  ( cd "$w" && sha512sum -c --quiet disc01.squashfs.age.sha512 \
+      && age -d -i "$PUBD/identity.txt" -o disc01.squashfs disc01.squashfs.age \
+      && sha512sum -c --quiet "$PUBD/data/disc01.squashfs.sha512" ) >/dev/null 2>&1
+}
+assert0 "the on-disc recipe opens the image with the disc's own key and nothing else" pub_manual
+
+# Both readers, from the writer's own staging, with no identity configured
+# anywhere: the key must be found at <staging>/enc/identity.txt.
+pub_restore_from_staging() { # pub_restore_from_staging sh|go
+  local who=$1
+  local dest=$T/pub-out-$who
+  rm -rf "$dest"; mkdir -p "$dest"
+  case $who in
+    sh) run_sh "$LOG/pub-restore-sh.log" "$T/cfg/pub" restore "$dest" ;;
+    go) run_go "$LOG/pub-restore-go.log" "$T/cfg/pub" restore "$dest" ;;
+  esac || return 1
+  # tree_matches: the same comparison the reference set uses, which knows the
+  # planted core dump is excluded by the default masks and that diff will not
+  # compare the fifo.
+  tree_matches "$dest"
+}
+assert0 "brb.sh restores a public set from staging with no identity configured, byte-identical" pub_restore_from_staging sh
+assert0 "go brb restores a public set from staging with no identity configured, byte-identical" pub_restore_from_staging go
+assert0 "  ... and the two readers' trees agree exactly" diff -r --no-dereference --exclude=a-fifo "$T/pub-out-sh" "$T/pub-out-go"
+
+# And from the discs: ingest must carry the key into a fresh staging area,
+# refuse to mix two different public sets into one, and restore from it.
+if (( HAVE_SCRIPT )); then
+  pub_ing_prepare() { # pub_ing_prepare sh|go
+    local who=$1
+    local st=$T/ing-pub-$who
+    rm -rf "$st"; mkdir -p "$st/enc"
+    { printf 'STAGING="%s"\nSOURCE_DIR="%s"\nARCHIVE_NAME="xcompat-public"\n' "$st" "$SRC"
+      printf 'AGE_RECIPIENTS_FILE="%s"\n' "$T/cfg/pubkeys/no-such-recipients.txt"
+    } > "$T/cfg/ing-pub-$who"
+    (( $(find "$st/enc" -type f | wc -l) == 0 ))
+  }
+  pub_ingest() { # pub_ingest sh|go LOGFILE
+    case $1 in
+      sh) run_pty "$2" $'\nq\n' "bash '$BRB_SH' -c '$T/cfg/ing-pub-sh' ingest '$PUBD'" ;;
+      go) run_pty "$2" $'\n\n'  "'$BRB_GO' --no-color -c '$T/cfg/ing-pub-go' ingest '$PUBD'" ;;
+    esac
+  }
+  pub_ingest_carries_key() { # pub_ingest_carries_key sh|go
+    local who=$1
+    local st=$T/ing-pub-$who
+    pub_ingest "$who" "$LOG/ingest-pub-$who.log" || return 1
+    cmp -s "$st/enc/identity.txt" "$PUBD/identity.txt"
+  }
+  pub_ingest_refuses_mix() { # pub_ingest_refuses_mix sh|go — a different key already staged
+    # Exits 0 only when the reader REFUSED the disc and left the staged key
+    # alone. Written positively so that a broken fixture (age-keygen missing,
+    # cp failing) fails the assertion instead of passing it by accident.
+    local who=$1
+    local st=$T/ing-pub-$who
+    local other; other=$T/cfg/pubkeys/other-identity.txt
+    [[ -f $other ]] || age-keygen -o "$other" >/dev/null 2>&1 || return 1
+    cp -f "$other" "$st/enc/identity.txt" && chmod 644 "$st/enc/identity.txt" || return 1
+    if pub_ingest "$who" "$LOG/ingest-pub-mix-$who.log"; then return 1; fi   # accepted a foreign key
+    cmp -s "$st/enc/identity.txt" "$other"                                    # and did not touch it
+  }
+  pub_restore_from_ingest() { # pub_restore_from_ingest sh|go
+    local who=$1
+    local st=$T/ing-pub-$who
+    local dest=$T/pub-ing-out-$who
+    # put the right key back after the mix test, the way a fresh ingest would
+    cp -f "$PUBD/identity.txt" "$st/enc/identity.txt" || return 1
+    rm -rf "$dest"; mkdir -p "$dest"
+    case $who in
+      sh) run_sh "$LOG/pub-ing-restore-sh.log" "$T/cfg/ing-pub-$who" restore "$dest" --disc 1 ;;
+      go) run_go "$LOG/pub-ing-restore-go.log" "$T/cfg/ing-pub-$who" restore "$dest" --disc 1 ;;
+    esac || return 1
+    (( $(find "$dest" -type f | wc -l) > 0 ))
+  }
+  for who in sh go; do
+    case $who in sh) name="brb.sh" ;; go) name="go brb" ;; esac
+    assert0 "fixture: $name starts from an empty staging area for the public set" pub_ing_prepare "$who"
+    assert0 "$name ingest carries the disc's identity.txt into staging, byte-identical" pub_ingest_carries_key "$who"
+    assert0 "$name ingest refuses a disc whose key differs from the one already staged, and leaves it alone" pub_ingest_refuses_mix "$who"
+    assert0 "  ... and a restore from that staging opens disc 1 with the ingested key" pub_restore_from_ingest "$who"
+  done
+else
+  skip "public-archive ingest (both readers)" "no script(1) for a pty"
+fi
 
 printf '\n%d passed, %d failed, %d xfail (known divergences), %d skipped\n' \
   "$pass_n" "$fail_n" "$xfail_n" "$skip_n"

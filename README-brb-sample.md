@@ -1,6 +1,6 @@
 # Backup disc 01 of 1 — `home-2026-08-07`
 
-Created 2026-08-08T21:27:41-04:00 from `/home/you`.
+Created 2026-08-19T01:52:15-04:00 from `/home/you`.
 Written by brb (Blu-ray Backup) 1.0.0.
 
 **This disc is self-contained.** It holds a complete, independent SquashFS
@@ -82,8 +82,9 @@ this archive was encrypted to, so you can tell which of your keys is the one.
 ## Restoring, the short way
 
 ```sh
-# 1. copy the image off the disc
-cp /mnt/data/disc01.squashfs.age .
+# 1. copy the image off the disc — the glob is deliberate: it brings the
+#    .sha512 sidecar and the .par2 files along, which step 2 needs
+cp /mnt/data/disc01.squashfs.age* .
 
 # 2. check it, and repair it if the hash disagrees
 sha512sum -c disc01.squashfs.age.sha512 \
@@ -126,7 +127,7 @@ cp /mnt/brb-linux-amd64 /tmp/brb && chmod +x /tmp/brb && /tmp/brb help
 
 `brb.sh` is the same tool as a bash script. It does the same job but needs
 `age`, `par2` and `squashfs-tools` installed, where a static binary needs only
-`mksquashfs` and `par2` for a full restore and nothing at all to decrypt and
+`unsquashfs` and `par2` for a full restore and nothing at all to decrypt and
 mount. It is also the readable one: if you would rather know exactly what
 happens to your bytes than trust a binary, read it.
 
@@ -158,14 +159,24 @@ export AGE_IDENTITY=/path/to/identity.txt
 regions with zeros and keeps going, which is exactly what par2 needs:
 
 ```sh
+# 1. salvage the image, reading past the bad spots
 ddrescue -d -r3 /mnt/data/disc01.squashfs.age \
                 ./disc01.squashfs.age \
                 ./disc01.mapfile
+
+# 2. bring the sidecar and the parity files over — .age.* and not .age*, so
+#    cp does not try the damaged image again and stop at the same error
+cp /mnt/data/disc01.squashfs.age.* .
+
+# 3. let par2 rebuild the zeroed regions
 par2 repair -- disc01.squashfs.age.par2
 ```
 
 Plain `par2 repair` cannot read past a hardware error on its own. Getting the
-file off the disc with `ddrescue` first is what makes the parity usable.
+file off the disc with `ddrescue` first is what makes the parity usable — and
+par2 can only use parity it can see, so the `.par2` files have to be sitting
+beside the image, which is what step 2 is for. If `cp` fails on one of *those*
+too, `ddrescue` it the same way; par2 tolerates damage in its own volumes.
 
 Each image carries 10% recovery data, so roughly 10%
 of it can be destroyed and still rebuilt. Beyond that, par2 reports how many

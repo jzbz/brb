@@ -398,15 +398,112 @@ ck "a rebuild sweeps the stale recovery set away and exits 0 (ordinary path)" $?
 leave_only_stale_par2 "$GSTAGE"
 ck "fixture: only the previous run's recovery set is left in the metacharacter staging" $?
 backup_over_stale_par2 "$W/cfg/glob" meta
-metarc=$?
-xck "a rebuild sweeps the stale recovery set away and exits 0 (metacharacter path)" "$metarc" \
-  "BUG, reproduced: protect() sweeps stale parity with filepath.Glob(filepath.Join(r.dirs.Enc, ...)) at internal/backup/run.go:342, so a staging path holding [ ] * or ? is interpreted, the sweep matches nothing and par2 create dies with 'Par2 file already exists' (exit 3). protectSidecars has the same shape at run.go:575 (warn-only) and tools.removePar2 at internal/tools/par2.go:76. Fix by listing the directory instead, as restore.altCopies now does"
-# Only while the defect is still there: an XFAIL that started failing for some
-# OTHER reason would otherwise sit here looking like the same known bug. Skipped
-# entirely once the rebuild succeeds, so a fix reports one XPASS and nothing else.
-if (( metarc != 0 )); then
-  grep -q 'already exists' "$W/stale-meta.log"
-  ck "  ... and it is still the stale recovery set it dies on, not something else" $?
+# Was an XFAIL: protect() swept stale parity with filepath.Glob over a pattern
+# that included the staging directory, so a path holding [ ] * or ? matched
+# nothing and par2 create died on the survivors with 'Par2 file already exists'.
+# The sweeps (run.go protect and protectSidecars, tools.removePar2) list the
+# directory and match the base name now, so this is an ordinary assertion.
+ck "a rebuild sweeps the stale recovery set away and exits 0 (metacharacter path)" $?
+
+sect "a --public-archive backup killed mid-set resumes with the SAME key"
+# The defect this pins was silent and permanent: the minted key lived only in
+# process memory until the end of a completed run, so an interrupted public
+# backup took it to the grave and the resume minted another, encrypted the rest
+# of the set to that, and stamped it onto every disc — including the discs
+# whose images were encrypted to the dead key. Those verified clean and were
+# undecryptable forever. The key is persisted to staging before disc 1 now,
+# and state.json records the mode and the public key; this proves it, with a
+# real kill -9 at exactly the window the defect lived in.
+PUBW=$W/stage-pub
+mkdir -p "$PUBW" "$W/cfg/pubkeys"
+# The recipients path points into an empty directory on purpose: a public set
+# must need no key material on the machine, and the restore below must find
+# the key in staging rather than beside a recipients file.
+cat > "$W/cfg/public" <<EOF
+SOURCE_DIR="$W/src"
+STAGING="$PUBW"
+AGE_RECIPIENTS_FILE="$W/cfg/pubkeys/no-such-recipients.txt"
+DISC_CAPACITY_BYTES=40000000
+RESERVE_BYTES=12000000
+COMPRESSION=none
+ARCHIVE_NAME="go-e2e-public"
+PUBLIC_ARCHIVE=1
+EOF
+pub_state=$PUBW/state.json
+pub_discs_done() {
+  [[ -f "$pub_state" ]] || return 1
+  sed -n 's/.*"discs_done"[[:space:]]*:[[:space:]]*\([0-9]\+\).*/\1/p' "$pub_state" | head -1
+}
+set -m
+"$BRB" --yes -c "$W/cfg/public" backup </dev/null > "$W/pub-run1.log" 2>&1 &
+pubpid=$!
+set +m
+pub_killed_at=""
+for _ in $(seq 1 4000); do
+  n="$(pub_discs_done 2>/dev/null || true)"
+  if [[ -n "$n" ]] && (( n >= 1 )); then
+    pub_killed_at="$n"
+    kill -9 -- "-$pubpid" 2>/dev/null
+    break
+  fi
+  kill -0 "$pubpid" 2>/dev/null || break
+  sleep 0.05
+done
+wait "$pubpid" 2>/dev/null
+[[ -n "$pub_killed_at" ]] && (( pub_killed_at >= 1 ))
+ck "public backup was killed after disc ${pub_killed_at:-?} completed" $?
+if [[ -z "$pub_killed_at" ]]; then
+  printf '\ncould not interrupt the public run; the rest of this section would prove nothing\n'
+  fail=$((fail+1))
+else
+  key_before=$(grep -o 'AGE-SECRET-KEY-1[A-Z0-9]*' "$PUBW/enc/identity.txt" 2>/dev/null | head -1)
+  [[ -n "$key_before" ]]
+  ck "  ... and its key was already on disk in staging before the kill" $?
+  grep -q '"public_archive"' "$pub_state" && grep -q '"public_key"' "$pub_state"
+  ck "  ... and state.json records the mode and the public key" $?
+
+  # Forgetting the mode must be refused, not quietly turned into an ordinary
+  # set. PUBLIC_ARCHIVE=1 lives in the config file here, so the flagless case is
+  # driven with the setting switched off in a copy of it — and with a REAL
+  # recipients file, because an ordinary-mode preflight reads that file before
+  # it ever looks at the resume state: without one the run is refused for the
+  # missing file, and the assertion below that the refusal names the flag is
+  # what tells that wrong reason from the right one.
+  sed -e 's/^PUBLIC_ARCHIVE=1$/PUBLIC_ARCHIVE=0/' \
+      -e "s|^AGE_RECIPIENTS_FILE=.*|AGE_RECIPIENTS_FILE=\"$W/cfg/recipients.txt\"|" \
+      "$W/cfg/public" > "$W/cfg/public-off"
+  "$BRB" --yes -c "$W/cfg/public-off" backup --resume </dev/null > "$W/pub-off.log" 2>&1
+  (( $? != 0 )); ck "resuming with PUBLIC_ARCHIVE turned off is refused" $?
+  grep -q -- '--public-archive' "$W/pub-off.log"
+  ck "  ... and the refusal names the flag to pass" $?
+
+  "$BRB" --yes -c "$W/cfg/public" backup --resume </dev/null > "$W/pub-run2.log" 2>&1
+  ck "--resume finishes the public set" $?
+  grep -qi 'resumed with its recorded key' "$W/pub-run2.log"
+  ck "  ... reloading the recorded key rather than minting" $?
+  ! grep -qi 'a keypair was generated' "$W/pub-run2.log"
+  ck "  ... (no new keypair anywhere in the log)" $?
+  [[ ! -f "$pub_state" ]]; ck "  ... and removed the state file on success" $?
+
+  n_pub=$(find "$PUBW/discs" -mindepth 1 -maxdepth 1 -type d -name 'disc*' 2>/dev/null | wc -l)
+  (( n_pub >= 2 )); ck "the public set spans $n_pub discs" $?
+  pub_all=0
+  for d in "$PUBW"/discs/disc*; do
+    k=$(grep -o 'AGE-SECRET-KEY-1[A-Z0-9]*' "$d/identity.txt" 2>/dev/null | head -1)
+    [[ "$k" == "$key_before" ]] || pub_all=1
+    grep -q "$key_before" "$d/MANIFEST.txt" && grep -q "$key_before" "$d/README.md" || pub_all=1
+    ( cd "$d" && sha512sum -c --quiet SHA512SUMS ) >/dev/null 2>&1 || pub_all=1
+    img=$(basename "$d"); img="$d/data/$img.squashfs.age"
+    age -d -i "$d/identity.txt" -o /dev/null "$img" >/dev/null 2>&1 || pub_all=1
+  done
+  ck "every disc — before and after the kill — carries the ORIGINAL key and decrypts with it" "$pub_all"
+
+  # And the tool itself opens the set with no identity configured anywhere:
+  # the key it finds is the one the writer left in staging.
+  "$BRB" --yes -c "$W/cfg/public" restore "$W/pub-out" > "$W/pub-restore.log" 2>&1
+  ck "brb restore opens the public set from staging with no configured identity" $?
+  diff -r --no-dereference "$W/src" "$W/pub-out" >/dev/null 2>&1
+  ck "  ... byte-identical to the source" $?
 fi
 
 printf '\n%d passed, %d failed, %d xfail\n' "$pass" "$fail" "$xfail"

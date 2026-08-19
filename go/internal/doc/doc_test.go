@@ -106,9 +106,12 @@ func TestRenderDiscREADMESubstitutions(t *testing.T) {
 		{"the sidecar volumes carry their own redundancy", "sidecars.vol*.par2               50% recovery data for them"},
 		{"the sidecar parity is explained", "carry their own parity\nin `sidecars.par2`"},
 		{"repairing a rotted sidecar is spelled out", "par2 repair -- sidecars.par2"},
-		{"restore recipe copies the right image", "cp /mnt/data/disc03.squashfs.age ."},
+		{"restore recipe copies the image and its sidecars", "cp /mnt/data/disc03.squashfs.age* ."},
 		{"kernel mount recipe", "sudo mount -o loop,ro disc03.squashfs /mnt"},
 		{"ddrescue section", "ddrescue -d -r3 /mnt/data/disc03.squashfs.age"},
+		{"ddrescue section fetches the parity too", "cp /mnt/data/disc03.squashfs.age.* ."},
+		{"the static binary restores with unsquashfs, not mksquashfs",
+			"a static binary needs only\n`unsquashfs` and `par2` for a full restore"},
 		{"redundancy in prose", "Each image carries 10% recovery data"},
 		{"disc gone entirely section", "## If a disc is gone entirely"},
 		{"index awk example uses the unpadded number", "'$1==3'"},
@@ -167,6 +170,23 @@ func TestRenderDiscREADMEFactualCorrections(t *testing.T) {
 			absent:  "you do **not** need this script",
 			present: "You do **not** need this program, and you do **not** need Python.",
 		},
+		{
+			// The short way once copied only the .age file and then ran
+			// `sha512sum -c disc03.squashfs.age.sha512 || par2 repair ...` on
+			// a directory holding neither the sidecar nor the parity, so step 2
+			// failed on every pristine disc ever burned. The glob is the fix,
+			// and this pins it: the bare form must not come back.
+			name:    "the short way copies the sidecars, not just the image",
+			absent:  "cp /mnt/data/disc03.squashfs.age .",
+			present: "cp /mnt/data/disc03.squashfs.age* .",
+		},
+		{
+			// A restore never runs mksquashfs; that is the writer's tool. The
+			// Go build extracts with unsquashfs and repairs with par2.
+			name:    "the static binary is not said to restore with mksquashfs",
+			absent:  "`mksquashfs` and `par2` for a full restore",
+			present: "`unsquashfs` and `par2` for a full restore",
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -178,6 +198,85 @@ func TestRenderDiscREADMEFactualCorrections(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestRenderDiscREADMEShortWayIsRunnable walks the "short way" block the way
+// a restorer would, line by line, and checks that every file a step reads was
+// put there by an earlier step. The block is the one restore path a stranger
+// with a disc and no brb is promised; a recipe that fails at step 2 on a
+// perfectly good disc is the worst thing this package can print.
+func TestRenderDiscREADMEShortWayIsRunnable(t *testing.T) {
+	out := RenderDiscREADME(sampleDisc())
+	block := codeBlockAfter(t, out, "## Restoring, the short way")
+
+	// Step 1 must be a copy whose glob covers the sidecar and the parity.
+	// "disc03.squashfs.age*" matches disc03.squashfs.age, .age.sha512, .age.par2
+	// and .age.vol*.par2 — exactly what steps 2 and 3 read.
+	iCopy := strings.Index(block, "cp /mnt/data/disc03.squashfs.age* .")
+	iCheck := strings.Index(block, "sha512sum -c disc03.squashfs.age.sha512")
+	iRepair := strings.Index(block, "par2 repair -- disc03.squashfs.age.par2")
+	iDecrypt := strings.Index(block, "-o disc03.squashfs disc03.squashfs.age")
+	if iCopy < 0 || iCheck < 0 || iRepair < 0 || iDecrypt < 0 {
+		t.Fatalf("short-way block is missing a step:\n%s", block)
+	}
+	if !(iCopy < iCheck && iCheck < iRepair && iRepair < iDecrypt) {
+		t.Errorf("short-way steps are out of order (copy=%d check=%d repair=%d decrypt=%d)",
+			iCopy, iCheck, iRepair, iDecrypt)
+	}
+	// And the reason the glob is there is written next to it, so a future
+	// edit does not "tidy" it away again.
+	if !strings.Contains(block, "the glob is deliberate") {
+		t.Errorf("the short way does not say why the glob is there:\n%s", block)
+	}
+}
+
+// TestRenderDiscREADMEDdrescueRecipeHasParityToRepairWith is the same audit
+// applied to the salvage section: ddrescue produces the image alone, so a
+// `par2 repair` straight after it had no recovery files to work with. The
+// recipe has to copy the sidecar and the .par2 set over between the two, and
+// with a glob that does not touch the image ddrescue just fought for.
+func TestRenderDiscREADMEDdrescueRecipeHasParityToRepairWith(t *testing.T) {
+	out := RenderDiscREADME(sampleDisc())
+	block := codeBlockAfter(t, out, "## If a disc will not read")
+
+	iRescue := strings.Index(block, "ddrescue -d -r3 /mnt/data/disc03.squashfs.age")
+	iCopy := strings.Index(block, "cp /mnt/data/disc03.squashfs.age.* .")
+	iRepair := strings.Index(block, "par2 repair -- disc03.squashfs.age.par2")
+	if iRescue < 0 || iCopy < 0 || iRepair < 0 {
+		t.Fatalf("salvage block is missing a step:\n%s", block)
+	}
+	if !(iRescue < iCopy && iCopy < iRepair) {
+		t.Errorf("salvage steps are out of order (ddrescue=%d copy=%d repair=%d)", iRescue, iCopy, iRepair)
+	}
+	// ".age*" would include the image itself, and cp would stop at the very
+	// I/O error the section exists to get past.
+	if strings.Contains(block, "cp /mnt/data/disc03.squashfs.age* ") {
+		t.Errorf("the salvage recipe copies the damaged image with cp:\n%s", block)
+	}
+}
+
+// codeBlockAfter returns the first fenced code block that follows heading.
+func codeBlockAfter(t *testing.T, doc, heading string) string {
+	t.Helper()
+	i := strings.Index(doc, heading)
+	if i < 0 {
+		t.Fatalf("README has no %q section", heading)
+	}
+	rest := doc[i+len(heading):]
+	open := strings.Index(rest, "```")
+	if open < 0 {
+		t.Fatalf("no code block after %q", heading)
+	}
+	rest = rest[open+3:]
+	// Skip the language tag on the opening fence.
+	if nl := strings.IndexByte(rest, '\n'); nl >= 0 {
+		rest = rest[nl+1:]
+	}
+	end := strings.Index(rest, "```")
+	if end < 0 {
+		t.Fatalf("unterminated code block after %q", heading)
+	}
+	return rest[:end]
 }
 
 // TestRenderDiscREADMEListsOnlyWhatIsOnTheDisc is the audit finding this field
@@ -366,6 +465,190 @@ func TestRenderDiscREADMEDiscNumbers(t *testing.T) {
 			t.Errorf("disc %d/%d: missing file name %q", tt.disc, tt.total, tt.wantFile)
 		}
 	}
+}
+
+// sampleKey is a syntactically plausible age secret key for the public-archive
+// renders. It is not a real key.
+const sampleKey = "AGE-SECRET-KEY-1QQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQ"
+
+// TestRenderDiscREADMEPublicArchive covers the passages that switch on
+// PublicIdentity. A public set has to say, in the disc's own README, that it
+// keeps no secret, where the key is, and that neither brb reader needs the key
+// configured — ingest picks it up off the disc — while an ordinary set must
+// render without a trace of any of it.
+func TestRenderDiscREADMEPublicArchive(t *testing.T) {
+	pub := sampleDisc()
+	pub.PublicIdentity = sampleKey
+	public := RenderDiscREADME(pub)
+	ordinary := RenderDiscREADME(sampleDisc())
+	assertNoPlaceholders(t, "public README", public)
+	assertNoPlaceholders(t, "ordinary README", ordinary)
+
+	wantPublic := []string{
+		"> **This archive is deliberately NOT confidential.**",
+		// Listed with the other root files, in the same column as they are.
+		"identity.txt               the key to this archive — see the notice above",
+		"**The age secret key is on this disc**, in `identity.txt`.",
+		"## The key to this archive",
+		sampleKey,
+		// The worked example: nothing to export, ingest does it. Both readers
+		// copy identity.txt into "$STAGING"/enc/ during ingest and use it, in
+		// addition to any configured identity, for every later command.
+		"# no key to configure: ingest copies identity.txt off the disc into\n" +
+			"# \"$STAGING\"/enc/ and every command below picks it up from there on its own\n" +
+			"\n./brb.sh ingest",
+	}
+	unwantPublic := []string{
+		// The old worked example told the restorer to copy the key by hand
+		// and export AGE_IDENTITY, because neither reader looked at the disc
+		// root. Both do now, so the example must not send them on that errand.
+		"export AGE_IDENTITY",
+		"cp /mnt/identity.txt",
+		"the tool does not read the disc root itself",
+		// The ordinary set's line about the key.
+		"never will be",
+	}
+	for _, w := range wantPublic {
+		if !strings.Contains(public, w) {
+			t.Errorf("public README missing %q", w)
+		}
+	}
+	for _, w := range unwantPublic {
+		if strings.Contains(public, w) {
+			t.Errorf("public README still contains %q", w)
+		}
+	}
+
+	wantOrdinary := []string{
+		"**You do need the age secret key.**",
+		"It is not on this disc and never will be.",
+		"export AGE_IDENTITY=/path/to/identity.txt\n\n./brb.sh ingest",
+	}
+	unwantOrdinary := []string{
+		"identity.txt               ",
+		"NOT confidential",
+		"## The key to this archive",
+		// The ordinary README does say the key is "one line beginning
+		// AGE-SECRET-KEY-1..."; what it must not carry is a key.
+		sampleKey,
+		"no key to configure",
+	}
+	for _, w := range wantOrdinary {
+		if !strings.Contains(ordinary, w) {
+			t.Errorf("ordinary README missing %q", w)
+		}
+	}
+	for _, w := range unwantOrdinary {
+		if strings.Contains(ordinary, w) {
+			t.Errorf("ordinary README contains %q, which belongs to a public set only", w)
+		}
+	}
+
+	// The identity file is listed in the same column as everything else in
+	// the root listing; a ragged column reads as a typo in the one place a
+	// restorer is told where the key is.
+	col := strings.Index("brb.sh                     the tool", "the tool")
+	line := lineContaining(public, "identity.txt               the key")
+	if got := strings.Index(line, "the key"); got != col {
+		t.Errorf("identity.txt note starts at column %d, the other notes at %d:\n%s", got, col, line)
+	}
+}
+
+// TestRenderManifestPublicArchive: the manifest carries the second legible
+// copy of a public archive's key, and says why, and an ordinary manifest
+// carries no such section.
+func TestRenderManifestPublicArchive(t *testing.T) {
+	m := sampleManifest()
+	m.PublicIdentity = sampleKey
+	public := RenderManifest(m)
+	ordinary := RenderManifest(sampleManifest())
+	assertNoPlaceholders(t, "public MANIFEST", public)
+
+	for _, w := range []string{
+		"THIS SET IS PUBLIC — IT KEEPS NO SECRET",
+		"  secret key: " + sampleKey,
+		"identity.txt beside this file",
+		// The public section sits between the recipients and the contents.
+		"disc contents\n-------------\n",
+	} {
+		if !strings.Contains(public, w) {
+			t.Errorf("public MANIFEST missing %q\n---\n%s", w, public)
+		}
+	}
+	iKey := strings.Index(public, "THIS SET IS PUBLIC")
+	iRec := strings.Index(public, "age recipients (public keys")
+	iContents := strings.Index(public, "disc contents\n")
+	if !(iRec < iKey && iKey < iContents) {
+		t.Errorf("public section out of place: recipients=%d key=%d contents=%d", iRec, iKey, iContents)
+	}
+	for _, w := range []string{"THIS SET IS PUBLIC", "secret key:", "AGE-SECRET-KEY-1"} {
+		if strings.Contains(ordinary, w) {
+			t.Errorf("ordinary MANIFEST contains %q", w)
+		}
+	}
+}
+
+// TestRenderHasNoStrayBlankLines renders every shape of both documents and
+// refuses a run of two blank lines anywhere. The templates lean on
+// {{if}}/{{end}} placed at line starts to swallow their own newlines, and one
+// misplaced end leaves a gap that reads as a missing paragraph — in the
+// public-archive branches especially, which an ordinary set never renders.
+func TestRenderHasNoStrayBlankLines(t *testing.T) {
+	toolSets := [][]string{
+		{"brb.sh", "brb-linux-amd64", "brb-linux-aarch64", "brb-src.tar.gz"},
+		{"brb-linux-amd64"},
+		{"brb.sh", "brb-src.tar.gz"},
+		nil,
+	}
+	for _, key := range []string{"", sampleKey} {
+		mode := "ordinary"
+		if key != "" {
+			mode = "public"
+		}
+		for _, tools := range toolSets {
+			d := sampleDisc()
+			d.Tools = tools
+			d.PublicIdentity = key
+			name := "README/" + mode + "/" + strings.Join(tools, ",")
+			assertNoDoubleBlank(t, name, RenderDiscREADME(d))
+		}
+		m := sampleManifest()
+		m.PublicIdentity = key
+		assertNoDoubleBlank(t, "MANIFEST/"+mode, RenderManifest(m))
+		m.ToolVersions, m.Recipients, m.PruneDirs, m.ExcludeMasks = nil, nil, nil, nil
+		assertNoDoubleBlank(t, "MANIFEST/"+mode+"/empty", RenderManifest(m))
+	}
+}
+
+// assertNoDoubleBlank fails on two consecutive empty lines.
+func assertNoDoubleBlank(t *testing.T, name, out string) {
+	t.Helper()
+	lines := strings.Split(out, "\n")
+	for i := 1; i < len(lines); i++ {
+		if lines[i] == "" && lines[i-1] == "" {
+			t.Errorf("%s: two blank lines in a row at line %d (after %q)", name, i, lastNonBlank(lines[:i]))
+		}
+	}
+}
+
+// lastNonBlank returns the nearest preceding non-empty line, for messages.
+func lastNonBlank(lines []string) string {
+	for i := len(lines) - 1; i >= 0; i-- {
+		if lines[i] != "" {
+			return lines[i]
+		}
+	}
+	return ""
+}
+
+// lineContaining returns the first line of s that contains sub, or "".
+func lineContaining(s, sub string) string {
+	for _, l := range strings.Split(s, "\n") {
+		if strings.Contains(l, sub) {
+			return l
+		}
+	}
+	return ""
 }
 
 func TestRenderManifest(t *testing.T) {
