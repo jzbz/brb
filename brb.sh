@@ -168,6 +168,20 @@ num_arg() {  # num_arg <value> <what-it-is>
 # never written to a file and never appears in a command line.
 AGE_IDENTITY_TEXT=""
 
+# A public archive (--public-archive in the Go writer) carries its own secret key
+# on every disc, as identity.txt at the disc root beside README.md, and ingest
+# copies that file into $ENC_DIR/identity.txt. It is a second identity, never a
+# replacement: the identity search below runs exactly as it always has, and this
+# path is handed to age as an additional -i when it exists — or as the only one,
+# when nothing else is configured, which is the point of a public set: it opens
+# with nothing but the discs. Set by resolve_identity; "" when there is none.
+AGE_IDENTITY_EXTRA=""
+
+# The one line of an age-keygen file that is the key. Everything else in it is
+# comment, and the writer stamps every disc's copy with its own "# created:"
+# time, so two copies of the same key are rarely byte-identical.
+identity_key_of() { grep -m1 '^AGE-SECRET-KEY-' "$1" 2>/dev/null || true; }
+
 # Both age container formats announce themselves on their first line; an
 # age-keygen identity starts with "# created:" or "AGE-SECRET-KEY-".
 identity_is_encrypted() {
@@ -218,13 +232,19 @@ unlock_identity() {
 }
 
 # Every decryption goes through here, so no caller has to know whether the
-# identity is a file on disk or the unlocked text held in memory. Arguments are
-# passed straight to age: age_d -o OUT IN, or age_d IN, or age_d reading stdin.
+# identity is a file on disk or the unlocked text held in memory, nor whether a
+# public archive's own key is along for the ride. Arguments are passed straight
+# to age: age_d -o OUT IN, or age_d IN, or age_d reading stdin.
+#
+# age accepts several -i and tries each identity against the file, so a public
+# set's key is simply added; when it is the only identity, resolve_identity has
+# already made it AGE_IDENTITY and the extra is empty. ${x:+...} expands to
+# nothing at all when unset, so no empty argument reaches age.
 age_d() {
   if [[ -n "$AGE_IDENTITY_TEXT" ]]; then
-    age -d -i <(printf '%s\n' "$AGE_IDENTITY_TEXT") "$@"
+    age -d -i <(printf '%s\n' "$AGE_IDENTITY_TEXT") ${AGE_IDENTITY_EXTRA:+-i "$AGE_IDENTITY_EXTRA"} "$@"
   else
-    age -d -i "$AGE_IDENTITY" "$@"
+    age -d -i "$AGE_IDENTITY" ${AGE_IDENTITY_EXTRA:+-i "$AGE_IDENTITY_EXTRA"} "$@"
   fi
 }
 
@@ -262,12 +282,32 @@ load_config() {
     for kv in "${BRB_ENV_OVERRIDES[@]}"; do declare -g "$kv"; done
   fi
   [[ -z "$CLI_ASSUME_YES" ]] || ASSUME_YES=1
+  # The two yes/no settings are used in (( )) arithmetic further down, and under
+  # set -u a KEEP_IMAGES=true from the config — the natural thing to write —
+  # ended the restore with nothing but "true: unbound variable". Normalise them
+  # to 1/0 here, once, and refuse anything that is not recognisably a boolean:
+  # a typo silently read as "no" would quietly delete every decrypted image.
+  bool_setting KEEP_IMAGES
+  bool_setting ASSUME_YES
   # A config file written for the Go build will carry SOURCE_DIR, DISC_TYPE,
   # COMPRESSION and the rest. Sourcing it here simply defines variables this
   # script never reads, which lets one config serve both — but sourcing is
   # execution, so the config must be trusted exactly like brb.sh itself.
   ENC_DIR="$STAGING/enc"
   RESTORE_DIR="$STAGING/restore"
+}
+
+# bool_setting NAME — rewrite the named setting in place as 1 or 0. Accepts
+# 1/0, true/false, yes/no and on/off in any case; an empty value is "no".
+# Anything else is fatal and says which setting, which value, and where it was
+# read from, so the operator can go straight to the line.
+bool_setting() {
+  local name="$1" v="${!1:-}"
+  case "${v,,}" in
+    1|true|yes|on)     declare -g "$name=1" ;;
+    0|false|no|off|"") declare -g "$name=0" ;;
+    *) die "$name must be 1 or 0 (also true/false, yes/no, on/off), got '$v' — check $CONFIG_FILE and the environment" ;;
+  esac
 }
 
 # /var/tmp is swept by systemd-tmpfiles (30 days; /tmp is 10), and an ingested
@@ -332,14 +372,21 @@ cmd_doctor() {
   # first time on the day the primary identity is gone.
   local keydir; keydir="$(dirname "$AGE_RECIPIENTS_FILE")"
   local id; id="$(find_identity || true)"
-  if [[ -z "$id" ]]; then
+  if [[ -z "$id" && -f "$ENC_DIR/identity.txt" ]]; then
+    # A public archive's key, ingested off one of its discs: enough on its own.
+    ok "restore would use the archive's own published key, $ENC_DIR/identity.txt"
+  elif [[ -z "$id" ]]; then
     warn "no age identity found — a restore cannot decrypt anything without one"
     step "set AGE_IDENTITY, or put identity.txt in $keydir"
+    step "(a public archive carries its key as identity.txt on every disc; ingest stages it as $ENC_DIR/identity.txt)"
     missing=1
   elif identity_is_encrypted "$id"; then
     ok "restore would use $id  (passphrase-protected: it will ask once per command)"
   else
     ok "restore would use $id"
+  fi
+  if [[ -n "$id" && -f "$ENC_DIR/identity.txt" ]]; then
+    step "and the archive's published key, $ENC_DIR/identity.txt, alongside it"
   fi
   if [[ -f "$keydir/rescue-identity.txt.age" ]]; then
     ok "rescue key present: $keydir/rescue-identity.txt.age"
@@ -404,6 +451,268 @@ unmount_disc() {
 # there is nothing recognisable there.
 disc_identity() {
   find "$1/data" -maxdepth 1 -name 'disc*.squashfs.age' -printf '%f' -quit 2>/dev/null || true
+}
+
+# The disc number in an image name such as disc07.squashfs.age, as a plain
+# integer; 0 when the name is not one this format produces. Any number of
+# digits, so a set past 99 discs still works — the same rule as discNumberOf
+# in go/internal/restore/restore.go.
+disc_number_of() {
+  if [[ "${1:-}" =~ ^disc([0-9]+)\.squashfs\.age$ ]]; then printf '%d' "$(( 10#${BASH_REMATCH[1]} ))"
+  else printf '0'; fi
+}
+
+# The name a file from a disc's data/ directory is stored under in staging.
+# Every name comes across unchanged except the sidecar parity set: each disc
+# carries a sidecars.par2 (plus sidecars.vol*.par2) of its own, covering that
+# disc's .sha512 files and the shared index, and staging is one flat directory.
+# Copied in under the on-disc name the N sets collided and only one disc's
+# survived — every other disc's sidecars were left with no parity at all. So
+# in staging the set is named per disc: sidecars.par2 becomes
+# sidecars-disc03.par2, sidecars.vol00+40.par2 becomes
+# sidecars-disc03.vol00+40.par2. par2 finds a set's volumes by the index file's
+# stem, so the renamed set repairs exactly as the original does. What is on the
+# disc is untouched — the on-disc name is frozen format. This mirrors
+# stagedSidecarName in go/internal/restore/restore.go byte for byte, so either
+# reader's staging is the other's. A disc whose number cannot be told (0)
+# keeps the flat name.
+staged_name() {  # staged_name BASENAME DISC-NUMBER
+  local base="$1" disc="$2"
+  if (( disc > 0 )) && [[ "$base" == sidecars.* && "$base" == *.par2 ]]; then
+    printf 'sidecars-disc%02d%s' "$disc" "${base#sidecars}"
+  else
+    printf '%s' "$base"
+  fi
+}
+
+# The staged sidecar parity that covers disc N's small files, or the encrypted
+# index when N is 0: the index is on every disc and in every disc's set, so any
+# staged set will do for it, but a numbered disc's .sha512 files are only in
+# that disc's own set — another disc's parity knows nothing about them, and
+# sending an operator to run a repair that cannot work is worse than saying
+# nothing. The flat sidecars.par2 comes last: a staging area filled by an
+# older reader holds one set under the on-disc name. Prints the names that
+# exist in $ENC_DIR, one per line, most specific first (stagedSidecarSets in
+# go/internal/restore/restore.go).
+staged_sidecar_sets() {  # staged_sidecar_sets DISC-NUMBER
+  local n="$1" nm
+  local -a cands=()
+  if (( n > 0 )); then
+    cands+=( "$(printf 'sidecars-disc%02d.par2' "$n")" )
+  else
+    for nm in "$ENC_DIR"/sidecars-disc*.par2; do
+      [[ -e "$nm" && "$nm" != *.vol* ]] || continue
+      cands+=( "${nm##*/}" ); break
+    done
+  fi
+  cands+=( sidecars.par2 )
+  for nm in "${cands[@]}"; do [[ -f "$ENC_DIR/$nm" ]] && printf '%s\n' "$nm"; done
+  return 0
+}
+
+# What to tell the operator when a small file — a .sha512 sidecar, the index —
+# is what rotted rather than the image: every place the parity for it actually
+# is, in staging first and always ending with the disc itself, which is where it
+# can always be found. DISC is the disc whose sidecars the file belongs to, or 0
+# when any disc's set will do. Same words as sidecarRepairHint in the Go reader.
+sidecar_repair_hint() {  # sidecar_repair_hint DISC-NUMBER
+  local n="$1" nm from="the disc" out=""
+  while IFS= read -r nm; do
+    out+="par2 repair -- $nm in $ENC_DIR, or "
+  done < <(staged_sidecar_sets "$n")
+  (( n > 0 )) && from="disc $n"
+  printf '%s' "repair it from parity: ${out}par2 repair -- sidecars.par2 in ${from}'s data/ directory"
+}
+
+# The disc's own SHA512SUMS, read once per disc into DISC_SUMS keyed by the
+# path relative to the disc root with the leading ./ dropped ("data/disc03.
+# squashfs.age", "identity.txt"), so that EVERY file ingest stages can be
+# checked against the hash this disc records for it — the par2 index and
+# volumes, the .sha512 sidecars, the published key — and not only the two files
+# that happen to carry a sidecar of their own. A disc without a readable
+# SHA512SUMS is usable but unverifiable, and says so (discSums in
+# go/internal/restore/ingest.go).
+declare -A DISC_SUMS=()
+read_disc_sums() {  # read_disc_sums MOUNTPOINT
+  DISC_SUMS=()
+  local h p
+  if [[ ! -f "$1/SHA512SUMS" ]]; then
+    warn "no SHA512SUMS on this disc; copies cannot be checked as they are made"
+    return 0
+  fi
+  while read -r h p; do
+    # A line SHA512SUMS's own rot has mangled is simply not a hash for anything;
+    # the file it named is then copied unchecked, exactly as if it were absent.
+    [[ "$h" =~ ^[0-9A-Fa-f]{128}$ && -n "$p" ]] || continue
+    p="${p#\*}"; p="${p#./}"
+    DISC_SUMS["$p"]="${h,,}"
+  done < "$1/SHA512SUMS"
+}
+
+# The SHA-512 of a file, from its contents alone — no name in the output to
+# escape or parse.
+sha512_of() { sha512sum < "$1" | awk '{print $1}'; }
+
+# ingest_one SRC DST WANT — bring one file off the disc into staging, or say
+# why not. DST is where it is stored (the staged name, which for the sidecar
+# parity differs from the on-disc name); WANT is the hash the disc's SHA512SUMS
+# records for it, "" when the disc carries none. Returns non-zero for a copy
+# that is not proven good — incomplete, or not matching the hash — which the
+# caller counts and reports at the end.
+#
+# Two rules, both learned the hard way, and the same two reconcileExisting in
+# go/internal/restore/ingest.go follows. A staged copy is never overwritten
+# unless its replacement is already proven better — never removed first and
+# re-copied after, because the moment between is where a power cut lands. And a
+# differing copy of an IMAGE is never thrown away: two pressings of the same
+# disc, each rotted past its own par2 redundancy, can still hold every block
+# between them, but only if both copies are on disk for par2 to combine — and
+# par2 only combines files named on its command line, so the second copy sits
+# beside the first as <name>.copy<epoch>, the name prepare_image passes.
+ingest_one() {
+  local src="$1" dst="$2" want="$3"
+  local base name got alt
+  base="${src##*/}"; name="$base"
+  # An operator who has just been told to run par2 against sidecars-disc03.par2
+  # needs to have seen where it came from.
+  [[ "${dst##*/}" == "$base" ]] || name="$base (staged as ${dst##*/})"
+
+  if [[ -f "$dst" ]]; then
+    if [[ -n "$want" ]]; then
+      # The hash speaks first: a staged copy that matches is done, whatever a
+      # leftover ddrescue map file claims — an interrupted salvage's map
+      # survives a later clean re-ingest and would otherwise brand it
+      # incomplete forever. "Already have" has to mean "already have a file
+      # proven good": otherwise a truncated copy from a bad sector sticks
+      # forever, and — because backup leaves its own images in ENC_DIR — the
+      # post-backup test restore reads staging instead of the discs it was
+      # supposed to be testing.
+      got="$(sha512_of "$dst")"
+      if [[ "$got" == "$want" ]]; then
+        rm -f -- "$dst.mapfile"
+        step "already have $name, and it matches the hash on this disc"; return 0
+      fi
+      warn "the staged $name does not match the hash on this disc; reading this disc's copy"
+      alt="$dst.copy$(date +%s)"
+      if ! copy_file_robustly "$src" "$alt"; then
+        if [[ "$base" == *.squashfs.age ]]; then
+          # The partial salvage — and its map file — stay under the .copy name:
+          # zeros and all, it is more raw material for par2.
+          step "keeping the partial copy as ${alt##*/} for par2 to combine during '$PROG restore'"
+        else
+          rm -f -- "$alt" "$alt.mapfile"
+        fi
+        return 1
+      fi
+      got="$(sha512_of "$alt")"
+      if [[ "$got" == "$want" ]]; then
+        # A copy proven whole is better than an unverified staged one, so it
+        # becomes the primary — the only name prepare_image's par2 repair and
+        # decryption ever read. It was written under its own name and hashed
+        # first, and only now renamed over the staged one: the staged bytes are
+        # never destroyed ahead of the replacement's proof.
+        mv -f -- "$alt" "$dst"
+        rm -f -- "$alt.mapfile" "$dst.mapfile"
+        step "replaced the staged $name with this disc's verified copy"; return 0
+      fi
+      if [[ "$base" == *.squashfs.age ]]; then
+        warn "this disc's copy of $name does not match the recorded hash either; keeping both — par2 will combine them during '$PROG restore'"
+        return 1
+      fi
+      # Not an image: a second bad copy is no use to par2 under this name, and
+      # two unverifiable sidecars are no better than one.
+      rm -f -- "$alt" "$alt.mapfile"
+      warn "$name: neither the staged copy nor this disc's matches the hash this disc records for it"
+      return 1
+    fi
+    # No recorded hash, so nothing can judge either copy. Compare the two files
+    # themselves: identical is done; a differing image is kept as a second copy
+    # for par2; anything else keeps the staged copy and says how to change that.
+    if cmp -s -- "$src" "$dst"; then
+      step "already have $name, byte for byte"; return 0
+    fi
+    if [[ "$base" == *.squashfs.age ]]; then
+      alt="$dst.copy$(date +%s)"
+      warn "already have $name, and it differs from the copy on this disc"
+      step "ingesting this disc's copy as ${alt##*/} for par2 to combine during '$PROG restore'"
+      copy_file_robustly "$src" "$alt" || return 1
+      return 0
+    fi
+    warn "already have $name, and it differs from the copy on this disc; keeping the staged copy"
+    step "delete $dst and ingest this disc again if you want the disc's copy instead"
+    return 0
+  fi
+
+  # Copy to .part and check it against the hash recorded on this disc before
+  # promoting it. Putting a partial file under the real name is exactly what
+  # made the old skip test sticky.
+  step "copying $name"
+  if ! copy_file_robustly "$src" "$dst.part"; then
+    warn "$name could not be read off this disc — leaving it for another copy"
+    rm -f -- "$dst.part" "$dst.part.mapfile"; return 1
+  fi
+  if [[ -n "$want" ]]; then
+    got="$(sha512_of "$dst.part")"
+    if [[ "$got" != "$want" ]]; then
+      # The drive returned wrong data without reporting an error. Keep the
+      # damaged bytes under the REAL name: restore's par2 repair only ever
+      # looks there, and this branch is reached only when no copy of the file
+      # exists at all, so nothing good is overwritten. A second ingest of this
+      # disc — or of another pressing — then lands as the .copy<epoch> above,
+      # exactly the pair par2 can combine, or replaces it outright once proven
+      # whole. (Filing it away under a .bad name kept bytes par2 could often
+      # repair where no repair path would ever read them.)
+      warn "$name does not match the hash this disc records for it — keeping the damaged copy for par2 repair, or for a second pressing to replace"
+      mv -f -- "$dst.part" "$dst"
+      rm -f -- "$dst.part.mapfile"
+      return 1
+    fi
+  fi
+  mv -f -- "$dst.part" "$dst"
+  rm -f -- "$dst.part.mapfile"
+  if [[ -n "$want" ]]; then step "$name copied and verified"; else step "$name copied"; fi
+}
+
+# A public archive (--public-archive in the Go writer) carries its own secret
+# key on every disc, as identity.txt at the disc root beside README.md — the
+# whole point of such a set is that it opens with nothing but the discs. Ingest
+# brings that file into $ENC_DIR/identity.txt, which is also where the Go
+# writer leaves the same key while it builds the set, and resolve_identity
+# picks it up from there. Checked against SHA512SUMS like everything else, and
+# refused outright when staging already holds a DIFFERENT key: that can only
+# mean two different public sets are being ingested into one staging area,
+# where their same-named images would be taken for damaged copies of each
+# other. Two copies of the same key are compared by the key line alone, because
+# the writer stamps every disc's copy with its own "# created:" time.
+#
+# Runs before the data files are touched, so a refused disc leaves nothing
+# behind. Returns non-zero for a copy that could not be trusted, which the
+# caller counts like any other bad file; the same key is on every other disc.
+ingest_public_identity() {  # ingest_public_identity MOUNTPOINT
+  local mp="$1" src="$1/identity.txt" dst="$ENC_DIR/identity.txt" want got key have
+  [[ -f "$src" ]] || return 0
+  want="${DISC_SUMS[identity.txt]:-}"
+  if [[ -n "$want" ]]; then
+    got="$(sha512_of "$src")"
+    if [[ "$got" != "$want" ]]; then
+      warn "identity.txt on this disc does not match the hash the disc records for it — not staging it (every disc of the set carries the same key)"
+      return 1
+    fi
+  fi
+  key="$(identity_key_of "$src")"
+  if [[ -z "$key" ]]; then
+    warn "identity.txt on this disc has no AGE-SECRET-KEY- line, so it is not an age identity — not staging it"
+    return 1
+  fi
+  if [[ -f "$dst" ]]; then
+    have="$(identity_key_of "$dst")"
+    if [[ "$have" == "$key" ]]; then step "already have the archive's published key, $dst"; return 0; fi
+    unmount_disc
+    die "the disc at $mp carries a different published key (identity.txt) from the one already in $dst: two different public archives are being ingested into one staging area. Point STAGING at an empty directory for this set and ingest it again."
+  fi
+  cp -- "$src" "$dst.part" || { rm -f -- "$dst.part"; warn "could not copy identity.txt off this disc"; return 1; }
+  mv -f -- "$dst.part" "$dst"
+  step "staged the archive's published key as $dst — this set opens with nothing but the discs"
 }
 
 cmd_verify_disc() {
@@ -522,7 +831,7 @@ cmd_ingest() {
   # a copy that can never complete.
   rm -f -- "$ENC_DIR"/*.part "$ENC_DIR"/*.part.mapfile
   trap 'rm -f -- "$ENC_DIR"/*.part "$ENC_DIR"/*.part.mapfile' EXIT
-  local mp f base want got alt prev_id="" this_id bad=0
+  local mp f base want prev_id="" this_id disc bad=0
   while :; do
     # Deliberately not prompt_enter/confirm: both auto-return under --yes, so
     # neither loop exit was reachable and `brb --yes ingest` ran forever.
@@ -538,79 +847,36 @@ cmd_ingest() {
       confirm "Read it again anyway?" || { unmount_disc; continue; }
     fi
     prev_id="$this_id"
+    # The sidecar parity is the one thing on a disc whose name is the same on
+    # every disc of the set, so it needs the disc number to survive being copied
+    # into one flat staging directory (see staged_name).
+    disc="$(disc_number_of "$this_id")"
+    (( disc > 0 )) \
+      || warn "$mp carries no numbered image, so its sidecars.par2 is staged under the flat name and another disc's may already be there"
+    read_disc_sums "$mp"
+    # The published key first: a disc from a different public set is refused
+    # before any of its same-named files can be taken for damaged copies of
+    # this set's.
+    ingest_public_identity "$mp" || bad=$(( bad + 1 ))
     while IFS= read -r f; do
-      base="$(basename "$f")"
-      # "Already have" has to mean "already have a file proven good". Otherwise
-      # a truncated copy from a bad sector sticks forever, and — because backup
-      # leaves its own images in ENC_DIR — the post-backup test restore reads
-      # staging instead of the discs it was supposed to be testing.
-      if [[ -f "$ENC_DIR/$base" ]]; then
-        if [[ -f "$ENC_DIR/$base.sha512" ]] && ( cd "$ENC_DIR" && sha512sum -c --status "$base.sha512" ); then
-          step "already have a verified $base"; continue
-        fi
-        if [[ "$base" == *.squashfs.age ]]; then
-          # par2 can combine two differently damaged copies, but only ones named
-          # on its command line — prepare_image passes these.
-          alt="$ENC_DIR/$base.copy$(date +%s)"
-          step "have an unverified $base — ingesting this copy as $(basename "$alt") for par2 to combine"
-          if ! copy_file_robustly "$f" "$alt"; then
-            # The partial salvage stays under the .copy name: zeros and all, it
-            # is more raw material for par2.
-            warn "$base second copy incomplete"; bad=$(( bad + 1 )); continue
-          fi
-          # A copy proven whole is better than an unverified staged one, so it
-          # becomes the primary — the only name prepare_image's par2 repair and
-          # decryption ever read. Without this a pristine pressing was parked as
-          # a .copy and the damaged image stayed in charge of the restore.
-          # Mirrors replaceOrKeepBoth in go/internal/restore/ingest.go: the
-          # staged bytes are never destroyed ahead of the replacement's proof —
-          # the copy is written under its own name and hashed first, and only
-          # then renamed over the staged one.
-          if [[ -f "$f.sha512" ]]; then
-            want="$(awk '{print $1; exit}' "$f.sha512")"
-            got="$(sha512sum < "$alt" | awk '{print $1}')"
-            if [[ "$want" == "$got" ]]; then
-              mv -f "$alt" "$ENC_DIR/$base"
-              rm -f -- "$alt.mapfile" "$ENC_DIR/$base.mapfile"
-              step "replaced the staged $base with this disc's verified copy"
-              continue
-            fi
-            warn "this disc's copy of $base does not match the recorded hash either; keeping both — par2 will combine them during '$PROG restore'"
-          fi
-        else
-          step "already have $base (unverified, not an image — keeping existing)"
-        fi
-        continue
-      fi
-      # Copy to .part and check it against the hash recorded on this disc before
-      # promoting it. Putting a partial file under the real name is exactly what
-      # made the old skip test sticky.
-      step "copying $base"
-      if ! copy_file_robustly "$f" "$ENC_DIR/$base.part"; then
-        warn "$base could not be read off this disc — leaving it for another copy"
-        rm -f -- "$ENC_DIR/$base.part" "$ENC_DIR/$base.part.mapfile"; bad=$(( bad + 1 )); continue
-      fi
-      if [[ -f "$f.sha512" ]]; then
-        want="$(awk '{print $1; exit}' "$f.sha512")"
-        got="$(sha512sum < "$ENC_DIR/$base.part" | awk '{print $1}')"
-        if [[ "$want" != "$got" ]]; then
-          # Keep the damaged bytes under the REAL name: restore's par2 repair
-          # only ever looks there, and this branch is reached only when no
-          # copy of $base exists at all, so nothing good is overwritten. A
-          # second ingest of this disc then lands as $base.copy<epoch> above —
-          # exactly the pair par2 can combine. (Filing it away under a .bad
-          # name kept bytes par2 could often repair where no repair path would
-          # ever read them.)
-          warn "$base does not match the hash recorded on the disc — keeping the damaged copy for par2 repair during restore"
-          mv -f "$ENC_DIR/$base.part" "$ENC_DIR/$base"
-          rm -f -- "$ENC_DIR/$base.part.mapfile"
-          bad=$(( bad + 1 )); continue
-        fi
-      fi
-      mv -f "$ENC_DIR/$base.part" "$ENC_DIR/$base"
-      rm -f -- "$ENC_DIR/$base.part.mapfile"
+      base="${f##*/}"
+      want="${DISC_SUMS[data/$base]:-}"
+      # A disc whose SHA512SUMS is unreadable still carries the two per-file
+      # sidecars; they are the only witness left for the image and the index.
+      if [[ -z "$want" && -f "$f.sha512" ]]; then want="$(awk '{print tolower($1); exit}' "$f.sha512")"; fi
+      ingest_one "$f" "$ENC_DIR/$(staged_name "$base" "$disc")" "$want" || bad=$(( bad + 1 ))
     done < <(find "$mp/data" -type f | sort -V)
-    [[ -f "$mp/MANIFEST.txt" ]] && cp -f "$mp/MANIFEST.txt" "$STAGING/MANIFEST.txt"
+    # The manifest is the same on every disc, so a rotted copy is simply not
+    # taken: the next disc's will do, and check_complete copes without one.
+    if [[ -f "$mp/MANIFEST.txt" ]]; then
+      want="${DISC_SUMS[MANIFEST.txt]:-}"
+      if [[ -n "$want" && "$(sha512_of "$mp/MANIFEST.txt")" != "$want" ]]; then
+        warn "MANIFEST.txt on this disc does not match the hash the disc records for it — not copying it"
+        bad=$(( bad + 1 ))
+      else
+        cp -f -- "$mp/MANIFEST.txt" "$STAGING/MANIFEST.txt"
+      fi
+    fi
     unmount_disc
     # A silenced eject failure is how the loop ends up re-reading the same
     # disc — but only touch the tray when mount_disc found the disc in $BURNER
@@ -633,10 +899,26 @@ cmd_ingest() {
 # restore
 # ---------------------------------------------------------------------------
 resolve_identity() {
-  local found=""
+  local found="" pub="$ENC_DIR/identity.txt"
   found="$(find_identity || true)"
-  [[ -n "$found" ]] \
-    || die "no age identity found: looked for ${AGE_IDENTITY:-identity.txt}, ${AGE_IDENTITY:-identity.txt}.age and rescue-identity.txt.age near $AGE_RECIPIENTS_FILE  (set AGE_IDENTITY=/path/to/identity.txt)"
+  # A public archive's own key, staged by ingest (or left by the Go writer),
+  # rides along as a second identity, or serves alone when nothing else is
+  # configured. It is never passphrase-protected, so there is nothing to ask;
+  # but a file under that name that is not an identity at all is a wrong
+  # answer worth stopping on rather than a mystery "decryption failed" later.
+  AGE_IDENTITY_EXTRA=""
+  if [[ -f "$pub" ]]; then
+    [[ -n "$(identity_key_of "$pub")" ]] \
+      || die "$pub is not an age identity (no AGE-SECRET-KEY- line). Ingest stages a public archive's published key there; remove or replace it."
+    AGE_IDENTITY_EXTRA="$pub"
+  fi
+  if [[ -z "$found" ]]; then
+    [[ -n "$AGE_IDENTITY_EXTRA" ]] \
+      || die "no age identity found: looked for ${AGE_IDENTITY:-identity.txt}, ${AGE_IDENTITY:-identity.txt}.age and rescue-identity.txt.age near $AGE_RECIPIENTS_FILE, and no published key at $pub  (set AGE_IDENTITY=/path/to/identity.txt — or, for a public archive, ingest one of its discs: its key comes across as $pub)"
+    step "using the archive's own published key, $pub"
+    AGE_IDENTITY="$pub"; AGE_IDENTITY_EXTRA=""
+    return 0
+  fi
   # Say so when the file used is not the one asked for: falling back to the
   # rescue key is a decision the operator should see, not discover from a
   # passphrase prompt.
@@ -672,6 +954,10 @@ prepare_image() {
     fi
   fi
 
+  # Which disc's sidecar parity to point at when a small file turns out to be
+  # the corrupt party. 0 (a name this format did not produce) means any set.
+  local disc; disc="$(disc_number_of "$base.age")"
+
   intact=unknown
   if [[ -f "$ENC_DIR/$base.age.sha512" ]]; then
     if ( cd "$ENC_DIR" && sha512sum -c --status "$base.age.sha512" ); then
@@ -681,39 +967,43 @@ prepare_image() {
     fi
   fi
 
-  if [[ "$intact" != "yes" ]]; then
+  if [[ "$intact" == "unknown" ]]; then
+    # Nothing has checked this file, so calling it damaged would be wrong —
+    # this used to die "damaged and has no par2 data" over a ciphertext no
+    # check had ever failed. Use par2 when it is there, and otherwise proceed:
+    # age authenticates as it decrypts, so a corrupted ciphertext fails loudly
+    # rather than quietly, and the decrypted image is still checked against its
+    # own .sha512 below. Same three answers as checkCiphertextNoSum in
+    # go/internal/restore/restore.go.
+    warn "no recorded hash for $base.age" >&2
+    if [[ ! -f "$enc.par2" ]]; then
+      warn "no par2 data either; relying on age's authentication to detect damage" >&2
+    elif ! command -v par2 >/dev/null 2>&1; then
+      warn "par2 is not installed to check it either; relying on age's authentication to detect damage" >&2
+    else
+      step "checking $base.age with par2 instead"
+      par2_repair_image "$base" \
+        || die "par2 could not repair $base.age. If you burned a second copy of the set, ingest that disc into $ENC_DIR too and retry."
+    fi
+  elif [[ "$intact" == "no" ]]; then
     [[ -f "$enc.par2" ]] || die "$base.age is damaged and has no par2 data. Ingest another copy of that disc and retry."
+    # mount and list do not insist on par2 up front, because a clean image never
+    # needs it. This one does: the honest failure is the missing tool, not
+    # "unrepairable" data that par2 has not been allowed to look at.
+    need par2 "$base.age is damaged and cannot be repaired without it"
     warn "attempting par2 repair of $base.age" >&2
-    # par2 ignores files it was not told about, so the alternate copies ingest
-    # saved off a second burn have to be named explicitly to be of any use.
-    #
-    # A plain glob, and the directory part QUOTED so that it is matched
-    # literally: compgen -G took the whole thing as one pattern, so a staging
-    # path containing [ ] * or ? was interpreted rather than matched, found no
-    # copies at all, and a set that par2 could have repaired from a second burn
-    # was declared unrepairable. ${c##*/} strips the directory with a fixed
-    # pattern; the old ${extras[@]/#$ENC_DIR\/} substituted $ENC_DIR AS a pattern
-    # and carried exactly the same hazard. No nullglob: an unmatched pattern
-    # comes through as itself and the -e test drops it.
-    local -a extras=(); local c
-    for c in "$ENC_DIR/$base.age.copy"*; do
-      [[ -e "$c" ]] || continue
-      extras+=( "${c##*/}" )
-    done
-    ( cd "$ENC_DIR" && par2 repair -- "$base.age.par2" ${extras[@]+"${extras[@]}"} >&2 ) \
+    par2_repair_image "$base" \
       || die "par2 could not repair $base.age. If you burned a second copy of the set, ingest that disc into $ENC_DIR too and retry."
     # par2 covers the ciphertext only. When par2 says the image is whole and the
     # 170-byte .sha512 sidecar disagrees, the sidecar is what rotted — dying
     # here would throw away a 22 GB image that is provably byte-for-byte
     # correct. The decrypted image is still checked against .sha512 below, so
     # nothing is decrypted on trust.
-    if [[ -f "$ENC_DIR/$base.age.sha512" ]]; then
-      if ( cd "$ENC_DIR" && sha512sum -c --status "$base.age.sha512" ); then
-        ok "repaired $base.age" >&2
-      else
-        warn "$base.age passes par2 but not its .sha512 sidecar — the sidecar is what is corrupt, not the image" >&2
-        warn "  (repair it from the disc: par2 repair -- sidecars.par2)" >&2
-      fi
+    if ( cd "$ENC_DIR" && sha512sum -c --status "$base.age.sha512" ); then
+      ok "repaired $base.age" >&2
+    else
+      warn "$base.age passes par2 but not its .sha512 sidecar — the sidecar is what is corrupt, not the image" >&2
+      warn "  ($(sidecar_repair_hint "$disc"))" >&2
     fi
   fi
 
@@ -722,13 +1012,42 @@ prepare_image() {
   mv "$plain.part" "$plain"
 
   # Delete on failure: a rejected image left behind is what the cache above
-  # would otherwise pick up and trust on the next run.
+  # would otherwise pick up and trust on the next run. age authenticates as it
+  # decrypts, so the ciphertext is intact and the two candidates are the image
+  # that was encrypted and the 150-byte sidecar recording its hash — and the
+  # sidecar is the one with its own parity, so say how to put it back.
   if [[ -f "$ENC_DIR/$base.sha512" ]]; then
     cp -f "$ENC_DIR/$base.sha512" "$RESTORE_DIR/"
     ( cd "$RESTORE_DIR" && sha512sum -c --status "$base.sha512" ) \
-      || { rm -f -- "$plain"; die "decrypted image $base does not match its recorded hash"; }
+      || { rm -f -- "$plain"; die "decrypted image $base does not match the hash in $base.sha512; the ciphertext decrypted cleanly, so either the image is not what was backed up or that sidecar has rotted — $(sidecar_repair_hint "$disc"), then retry"; }
+  else
+    warn "no recorded hash for the decrypted $base; age's own authentication is the only check performed" >&2
   fi
   PREPARED_IMG="$plain"
+}
+
+# par2_repair_image BASE — verify, and if need be repair, BASE.age in $ENC_DIR
+# from its own par2 set. par2 ignores files it was not told about, so the
+# alternate copies ingest saved off a second burn have to be named explicitly
+# to be of any use.
+#
+# A plain glob, and the directory part QUOTED so that it is matched literally:
+# compgen -G took the whole thing as one pattern, so a staging path containing
+# [ ] * or ? was interpreted rather than matched, found no copies at all, and a
+# set that par2 could have repaired from a second burn was declared
+# unrepairable. ${c##*/} strips the directory with a fixed pattern; the old
+# ${extras[@]/#$ENC_DIR\/} substituted $ENC_DIR AS a pattern and carried
+# exactly the same hazard. No nullglob: an unmatched pattern comes through as
+# itself and the -e test drops it. par2's own chatter goes to stderr, because
+# the caller's caller reads stdout for nothing and a person reads stderr.
+par2_repair_image() {
+  local base="$1"
+  local -a extras=(); local c
+  for c in "$ENC_DIR/$base.age.copy"*; do
+    [[ -e "$c" ]] || continue
+    extras+=( "${c##*/}" )
+  done
+  ( cd "$ENC_DIR" && par2 repair -- "$base.age.par2" ${extras[@]+"${extras[@]}"} >&2 )
 }
 
 # Refuse a destination that already holds a symlink resolving to a directory.
@@ -758,7 +1077,9 @@ refuse_symlinked_dirs() {
   while IFS= read -r -d '' p; do
     # -d follows the link, so this is true only for a symlinked DIRECTORY.
     [[ -d "$p" ]] || continue
-    bad+=( "$p -> $(readlink -- "$p" 2>/dev/null || true)" )
+    # Both halves are chosen by whoever planted the link, and this line goes to
+    # a terminal — so no control bytes reach it raw (see esc_controls).
+    bad+=( "$(esc_str "$p -> $(readlink -- "$p" 2>/dev/null || true)")" )
     (( ${#bad[@]} < 5 )) || break
   done < <(find -P "$d" -type l -print0)
   # An if, not `&&`: a false test would become this function's status and
@@ -768,8 +1089,55 @@ refuse_symlinked_dirs() {
   die "$d contains symlink(s) to directories ($list); unsquashfs -f would follow them and write the backup's files OUTSIDE the destination — remove them, or restore into an empty directory and merge by hand"
 }
 
+# The check above lets a symlink to a FILE through, and that is right as far as
+# it goes: where the archive holds a file, unsquashfs -f unlinks the link and
+# writes the file as a fresh entry. But where the archive holds a DIRECTORY,
+# unsquashfs -f takes the EEXIST from mkdir as "already there", tries to write
+# the directory's children through the link (which fails, harmlessly, with
+# ENOTDIR) — and then sets the directory's mode, owner and mtime on the path,
+# with chmod, chown and utimes, all of which follow the link. So a link planted
+# at, say, dest/etc pointing at /etc/shadow gets the archive's directory mode
+# and mtime, and, under root, its owner, written onto /etc/shadow. Verified
+# against unsquashfs 4.7: the target's mode changed.
+#
+# So, before each image is extracted, its directory paths are listed and the
+# destination is refused if it holds a symlink — to anything, or to nothing —
+# at any of them. Only directory paths: a symlink where the archive holds a
+# file or a symlink of its own is the ordinary case of restoring over a tree
+# that already has some of the archive's own links in it, and the skeleton on
+# every disc makes a path either a directory or a leaf across the whole set, so
+# what an earlier disc extracted can never trip this for a later one. The
+# destination itself counts as the root directory. The Go reader makes the
+# same check, and both refuse with the same words.
+#
+# unsquashfs -ll prints one entry per line, so a directory whose name carries a
+# newline is listed as two half-lines and neither is checked — the same limit
+# pathsPresent has, and no worse than it: that name is chosen by whoever could
+# plant a file in the backed-up tree, and this guard is against whoever can
+# plant a link in the destination, and it takes both to slip past it.
+refuse_symlinks_at_dirs() {  # refuse_symlinks_at_dirs IMAGE DEST
+  local img="$1" d="${2%/}"; [[ -n "$d" ]] || d="/"
+  local -a bad=()
+  local p
+  # A destination that is itself a link is caught above; the belt to that
+  # brace, so this guard is complete on its own.
+  [[ -L "$d" ]] && bad+=( "$(esc_str "$d")" )
+  # The listing shows raw names, one per line: mode, owner, size, date, time,
+  # then the path with squashfs-root/ in front of it. Directories only, and the
+  # root itself dropped: it is $d, tested above.
+  while IFS= read -r p; do
+    [[ -L "$d/$p" ]] || continue
+    bad+=( "$(esc_str "$d/$p -> $(readlink -- "$d/$p" 2>/dev/null || true)")" )
+    (( ${#bad[@]} < 5 )) || break
+  done < <(unsquashfs -ll "$img" 2>/dev/null \
+           | LC_ALL=C awk '/^d/ && sub(/^[^ ]+ +[^ ]+ +[0-9]+ +[0-9-]+ +[0-9:]+ squashfs-root\//, "") { print }')
+  if (( ${#bad[@]} == 0 )); then return 0; fi
+  local list; list="$(printf '%s, ' "${bad[@]}")"; list="${list%, }"
+  die "$d contains symlink(s) where ${img##*/} holds directories ($list); unsquashfs -f would set the archive's directory mode, owner and times on whatever they point at — remove them, or restore into an empty directory and merge by hand"
+}
+
 cmd_restore() {
-  need age; need par2; need unsquashfs
+  need age; need par2; need unsquashfs; need sha512sum
   local dest="${1:-}"
   [[ -n "$dest" ]] || die "usage: $PROG restore <destination> [--only <path-in-archive>] [--disc N]"
   shift || true
@@ -803,7 +1171,9 @@ cmd_restore() {
   # ls is the one of the two that a busybox rescue system is sure to have.
   if [[ -n "$(ls -A -- "$dest" 2>/dev/null)" ]]; then
     warn "$dest is not empty. unsquashfs -f will OVERWRITE existing files with the backup versions."
-    warn "  existing entries: $(ls -A -- "$dest" | head -5 | tr '\n' ' ')..."
+    # The names are whatever is in the destination — not ours — and this goes
+    # to a terminal, so control bytes are made visible first (esc_controls).
+    warn "  existing entries: $(ls -A -- "$dest" | head -5 | esc_controls | tr '\n' ' ')..."
     confirm "Overwrite the current contents of $dest with this backup?" \
       || die "aborted — restore into an empty directory and merge by hand"
   fi
@@ -887,6 +1257,9 @@ cmd_restore() {
   for enc in "${encs[@]}"; do
     step "preparing $(basename "$enc")"
     prepare_image "$enc"; img="$PREPARED_IMG"
+    # The second symlink guard, per image: it needs the image's own list of
+    # directories, which exists only now that it is decrypted.
+    refuse_symlinks_at_dirs "$img" "$dest"
     # unsquashfs exits 0 having created nothing when the requested path is not
     # in the image, so without this the run reports "extracted" for every disc
     # and gives no signal at all about the one file the user asked for. The
@@ -972,7 +1345,10 @@ EOF
 }
 
 cmd_mount() {
-  need age; need unsquashfs
+  # Not unsquashfs: this path never runs it — the image is prepared and handed
+  # to the kernel. par2 is not demanded up front either, because a clean image
+  # never needs it; prepare_image asks for it by name the moment a repair does.
+  need age; need sha512sum; need mount
   local n mp="${2:-}"
   [[ -n "${1:-}" && -n "$mp" ]] || die "usage: $PROG mount <disc-number> <mount-point>"
   n="$(num_arg "$1" 'disc number')"
@@ -1040,6 +1416,12 @@ esc_controls() {
 # without a newline.
 esc_out() { if [[ -t 1 ]]; then esc_controls; else cat; fi; }
 
+# One string, escaped for a message. esc_controls works on lines and never sees
+# the newline between them, so a newline INSIDE the string is turned into the
+# two characters \n first; esc_controls leaves a backslash alone, so the result
+# is exactly what a single pass over the bytes would give.
+esc_str() { local s="${1//$'\n'/\\n}"; printf '%s\n' "$s" | esc_controls; }
+
 cmd_index() {
   need age
   resolve_identity
@@ -1058,7 +1440,7 @@ cmd_index() {
 }
 
 cmd_list() {
-  need age; need unsquashfs
+  need age; need unsquashfs; need sha512sum
   resolve_identity
   local n
   [[ -n "${1:-}" ]] || die "usage: $PROG list <disc-number>"
@@ -1121,10 +1503,16 @@ CONFIGURATION
                                   identity.txt.age and
                                   rescue-identity.txt.age beside
                                   $AGE_RECIPIENTS_FILE
+                                  A PUBLIC archive carries its own key on every
+                                  disc, as identity.txt at the disc root; ingest
+                                  stages it as \$STAGING/enc/identity.txt and
+                                  restore uses it — alone when nothing above is
+                                  found, so such a set needs no key configured
     KEEP_IMAGES=$KEEP_IMAGES                 1 keeps each decrypted image after
                                   extracting it, for repeated restores. The
                                   default removes them, because otherwise a
                                   restore needs room for the whole archive twice
+                                  (1/0, or true/false, yes/no, on/off)
     BURNER=$BURNER            the drive discs are read back from
 
   Everything about how a set was BUILT — source tree, disc geometry,
