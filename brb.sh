@@ -10,8 +10,8 @@
 # It exists as a separate, deliberately small, deliberately readable program
 # because of what a restore actually looks like. Someone is holding a disc,
 # possibly years from now, possibly on a rescue system, and wants to know what
-# will happen to their bytes before they run anything. A few hundred lines of
-# shell can be read end to end in an afternoon. An 8 MB static binary cannot.
+# will happen to their bytes before they run anything. Under two thousand lines
+# of shell can be read end to end in an afternoon. An 8 MB static binary cannot.
 #
 # It is frozen against the on-disc format, so it changes only when that format
 # changes. The two implementations are held to the same format by
@@ -249,12 +249,99 @@ age_d() {
 }
 
 # Restore and ingest write the same plaintext the backup path warns about, into
-# a directory the README tells people to put under /var/tmp — which is 1777.
-# umask must be set before the mkdir, and an existing directory needs the chmod.
-secure_staging() {
+# a directory the README tells people to put under /var/tmp — which is 1777, so
+# every local account can create $STAGING before the operator does and own the
+# whole working namespace of the restore from then on. This used to set the
+# umask, mkdir -p, and then chmod with the failure thrown away (`|| true`),
+# which meant a directory somebody else owned was simply carried on with.
+#
+# It now refuses instead, by the same three rules as secureStaging in
+# go/internal/restore/staging.go, applied to $STAGING first and then to each
+# subdirectory this command is about to write into — the root first, because a
+# symlinked root would make every check below it a check on the link's target.
+#
+# umask is set here and not inside secure_dir because it has to cover
+# everything the command creates afterwards, not just these directories.
+secure_staging() {  # secure_staging [SUBDIR ...]
   umask 077
-  mkdir -p "$STAGING"
-  chmod 700 "$STAGING" 2>/dev/null || true
+  local d
+  secure_dir "$STAGING"
+  for d in "$@"; do secure_dir "$d"; done
+}
+
+# secure_dir DIR — make one directory fit to hold plaintext, or die saying what
+# to do about it. The three rules, in the order secure_dir applies them:
+#
+#   - It must not be a symlink. A restore writes decrypted images into these
+#     directories by name, and a link planted at "restore" or "enc" before the
+#     run sends every one of them wherever the planter chose. -L is a test on
+#     the link itself, dangling or not, and never on what it points at.
+#   - It is created if missing, and its mode is forced to 0700 whether or not
+#     it was just created: mkdir -p applies the umask only to what it makes, so
+#     a directory the operator made by hand keeps whatever mode it had. A chmod
+#     that FAILS is fatal — for as long as a restore runs this tree holds the
+#     whole archive in the clear, and "could not lock the door" is not a thing
+#     to walk past.
+#   - It must belong to the user running this command. A directory another
+#     account owns is one that account can rename, replace or fill at will,
+#     between any check made here and any write made later — the ownership
+#     check is what turns the two checks above from a race into a guarantee.
+#     It is also what the plaintext cache in prepare_image rests on: that cache
+#     trusts a hash sidecar sitting in these same directories, and whoever owns
+#     the directory can write both halves of a matching pair.
+secure_dir() {
+  local d="$1" owner
+  [[ -n "$d" ]] || die "no STAGING directory configured — set STAGING in $CONFIG_FILE or in the environment"
+  # A trailing slash makes -L (and lstat, and Go's) resolve the link instead of
+  # reporting it, so "STAGING=/var/tmp/brb/" would walk straight past the first
+  # check. The rest of the script builds its paths as "$STAGING/enc" and does
+  # not care either way, so this is trimmed here and nowhere else.
+  d="${d%/}"; [[ -n "$d" ]] || d="/"
+  if [[ -L "$d" ]]; then
+    die "$(esc_str "$d") is a symlink (-> $(esc_str "$(readlink -- "$d" 2>/dev/null || true)")); a staging directory must be a real directory, because decrypted images are written into it by name and would follow the link — remove the link, or point STAGING at the directory itself"
+  fi
+  mkdir -p -- "$d" \
+    || die "could not create $(esc_str "$d"); if something that is not a directory is in the way, remove it, or point STAGING elsewhere"
+  chmod 700 -- "$d" \
+    || die "could not secure $(esc_str "$d"), which will hold plaintext — fix its permissions, or point STAGING at a directory you own"
+  [[ -d "$d" ]] \
+    || die "$(esc_str "$d") exists and is not a directory — remove it, or point STAGING elsewhere"
+  owner="$(dir_owner "$d")"
+  [[ -n "$owner" ]] \
+    || die "could not read who owns $(esc_str "$d") — this check is the only thing standing between a restore's plaintext and a directory somebody else controls, so it is not skipped: install GNU coreutils (stat), or point STAGING at a directory on a filesystem that reports ownership"
+  if (( owner != EUID )); then
+    die "$(esc_str "$d") is owned by uid $owner, not by this process (uid $EUID); whoever owns it can replace anything under it while a restore is writing plaintext there — $(ownership_advice "$d" "$owner")"
+  fi
+}
+
+# What to do about a staging directory somebody else owns. Under sudo the
+# likeliest story is a directory the operator made earlier without it, in which
+# case chown is the fix; otherwise the fix is a directory of one's own. Mirrors
+# ownershipAdvice in go/internal/restore/staging.go.
+ownership_advice() {  # ownership_advice DIR OWNER-UID
+  if (( EUID == 0 )); then
+    printf 'chown -R root %s if it is yours, or point STAGING at a directory root owns' "$(esc_str "$1")"
+  elif (( $2 == 0 )); then
+    printf 'run this command as root, or point STAGING at a directory you own'
+  else
+    printf 'point STAGING at a directory you own'
+  fi
+}
+
+# The numeric owner of a path, or nothing at all when neither tool can say.
+# stat -c is GNU (and busybox); ls -ldn is the fallback for anything else, and
+# its third field is the numeric owner on every implementation that supports
+# -n. Callers treat "nothing" as a refusal, never as a pass.
+dir_owner() {  # dir_owner DIR
+  local u=""
+  u="$(stat -c %u -- "$1" 2>/dev/null || true)"
+  # shellcheck disable=SC2012  # ls, not find: the only field taken is the
+  # numeric owner in a fixed column, never a filename, so the parsing hazard
+  # SC2012 warns about does not arise — and find's %U is a GNU extension, which
+  # is exactly what this line is the fallback for.
+  [[ "$u" =~ ^[0-9]+$ ]] || u="$(ls -ldn -- "$1" 2>/dev/null | awk 'NR == 1 { print $3 }' || true)"
+  [[ "$u" =~ ^[0-9]+$ ]] || u=""
+  printf '%s' "$u"
 }
 
 # ---------------------------------------------------------------------------
@@ -572,10 +659,18 @@ sha512_of() { sha512sum < "$1" | awk '{print $1}'; }
 ingest_one() {
   local src="$1" dst="$2" want="$3"
   local base name got alt
-  base="${src##*/}"; name="$base"
+  base="${src##*/}"
+  # $name is this function's own copy of the on-disc name, and it exists only
+  # to be printed. The name comes off the media, where Rock Ridge lets it carry
+  # any byte a filesystem will hold — an ESC among them, which raw on a
+  # terminal retitles the operator's window or worse. So it is escaped once,
+  # here, and every message below prints $name; $base stays raw for the tests
+  # and the paths, where the bytes have to be the real ones. The Go reader
+  # escapes centrally instead, in its Printer (ui.visible).
+  name="$(esc_str "$base")"
   # An operator who has just been told to run par2 against sidecars-disc03.par2
   # needs to have seen where it came from.
-  [[ "${dst##*/}" == "$base" ]] || name="$base (staged as ${dst##*/})"
+  [[ "${dst##*/}" == "$base" ]] || name="$name (staged as $(esc_str "${dst##*/}"))"
 
   if [[ -f "$dst" ]]; then
     if [[ -n "$want" ]]; then
@@ -598,7 +693,7 @@ ingest_one() {
         if [[ "$base" == *.squashfs.age ]]; then
           # The partial salvage — and its map file — stay under the .copy name:
           # zeros and all, it is more raw material for par2.
-          step "keeping the partial copy as ${alt##*/} for par2 to combine during '$PROG restore'"
+          step "keeping the partial copy as $(esc_str "${alt##*/}") for par2 to combine during '$PROG restore'"
         else
           rm -f -- "$alt" "$alt.mapfile"
         fi
@@ -634,12 +729,12 @@ ingest_one() {
     if [[ "$base" == *.squashfs.age ]]; then
       alt="$dst.copy$(date +%s)"
       warn "already have $name, and it differs from the copy on this disc"
-      step "ingesting this disc's copy as ${alt##*/} for par2 to combine during '$PROG restore'"
+      step "ingesting this disc's copy as $(esc_str "${alt##*/}") for par2 to combine during '$PROG restore'"
       copy_file_robustly "$src" "$alt" || return 1
       return 0
     fi
     warn "already have $name, and it differs from the copy on this disc; keeping the staged copy"
-    step "delete $dst and ingest this disc again if you want the disc's copy instead"
+    step "delete $(esc_str "$dst") and ingest this disc again if you want the disc's copy instead"
     return 0
   fi
 
@@ -729,8 +824,10 @@ cmd_verify_disc() {
   # be recorded as "disc 7 verified" and disc 7 is never read again.
   want="$(printf 'disc%02d.squashfs.age' "$n")"
   actual="$(disc_identity "$mp")"
+  # The image's name is read off the media; escaped before printing, like every
+  # other byte this command repeats back from a disc.
   [[ "$actual" == "$want" ]] \
-    || die "the drive holds ${actual:-an unrecognised disc}, not disc $n — insert disc $n"
+    || die "the drive holds $(esc_str "${actual:-an unrecognised disc}"), not disc $n — insert disc $n"
   # ARCHIVE_NAME is a writer setting this script does not define, so a restorer
   # with a reader-side config has nothing to compare against — and every real
   # disc carries an archive name, so an unguarded expansion died here under
@@ -738,8 +835,11 @@ cmd_verify_disc() {
   # happens to be loaded and disagrees with the disc.
   if [[ -f "$mp/MANIFEST.txt" && -n "${ARCHIVE_NAME:-}" ]]; then
     marc="$(sed -n 's/^archive name[[:space:]]*:[[:space:]]*//p' "$mp/MANIFEST.txt" | head -1 || true)"
+    # The comparison is against the raw field; only what is PRINTED is escaped.
+    # MANIFEST.txt is a plain text file on the disc, so its archive-name line is
+    # as much the media's choice as a filename is.
     [[ -z "$marc" || "$marc" == "$ARCHIVE_NAME" ]] \
-      || warn "this disc belongs to archive '$marc', not '$ARCHIVE_NAME'"
+      || warn "this disc belongs to archive '$(esc_str "$marc")', not '$ARCHIVE_NAME'"
   fi
 
   log "verifying disc $n at $mp"
@@ -770,7 +870,9 @@ copy_file_robustly() {
   # an operator with a full disk off to install ddrescue instead of freeing
   # space. (The assignment's status drives the &&, so set -e is safe here.)
   err="$(cp -- "$src" "$dst" 2>&1)" && return 0
-  warn "copy failed: ${err:-unknown error copying $(basename "$src")}"
+  # cp quotes the path it failed on back at us, and that path is a name off the
+  # media — so what reaches the terminal is escaped, here and below.
+  warn "copy failed: $(esc_str "${err:-unknown error copying ${src##*/}}")"
   if command -v ddrescue >/dev/null 2>&1; then
     warn "falling back to ddrescue (gaps become zeros; par2 should repair)"
     # Keep an existing mapfile so a repeated attempt resumes where it stopped;
@@ -783,7 +885,7 @@ copy_file_robustly() {
     # and the caller's "copied incompletely" warning could never fire. A mapfile
     # status other than '+' means bytes are still missing.
     if grep -qE '^0x[0-9A-Fa-f]+ +0x[0-9A-Fa-f]+ +[?*/-]' "$dst.mapfile" 2>/dev/null; then
-      warn "$(basename "$src"): unreadable regions remain — see $dst.mapfile"; rc=1
+      warn "$(esc_str "${src##*/}"): unreadable regions remain — see $(esc_str "$dst.mapfile")"; rc=1
     fi
     [[ "$(stat -c%s "$dst" 2>/dev/null || echo x)" == "$(stat -c%s "$src" 2>/dev/null || echo y)" ]] || rc=1
     return "$rc"
@@ -821,9 +923,9 @@ check_complete() {
 
 cmd_ingest() {
   # Ingest writes ciphertext, but restore decrypts into the same tree and the
-  # README tells people to point STAGING at /var/tmp, which is 1777.
-  secure_staging
-  mkdir -p "$ENC_DIR"
+  # README tells people to point STAGING at /var/tmp, which is 1777. secure_dir
+  # creates $ENC_DIR as well as vetting it, so there is no bare mkdir here.
+  secure_staging "$ENC_DIR"
   # A .part from an interrupted copy must never be mistaken for a finished
   # file. Its ddrescue mapfile dies with it: a mapfile that outlives its data
   # marks regions of the DELETED file as already read, so the next attempt
@@ -843,7 +945,9 @@ cmd_ingest() {
     # then keeps reporting the old mount point. Nothing else in the loop notices.
     this_id="$(disc_identity "$mp")"
     if [[ -n "$prev_id" && "$this_id" == "$prev_id" ]]; then
-      warn "this is the same disc as last time (${this_id:-unrecognised}) — the tray may not have opened"
+      # disc_identity is a filename read off the disc, so it is escaped before
+      # it reaches a terminal, exactly like the names ingest_one prints.
+      warn "this is the same disc as last time ($(esc_str "${this_id:-unrecognised}")) — the tray may not have opened"
       confirm "Read it again anyway?" || { unmount_disc; continue; }
     fi
     prev_id="$this_id"
@@ -936,21 +1040,38 @@ prepare_image() {
   local enc="$1" base plain intact
   base="$(basename "$enc" .age)"
   plain="$RESTORE_DIR/$base"
-  mkdir -p "$RESTORE_DIR"
+  # Cheap, and re-checked per image on purpose: every caller secures the
+  # staging tree up front, but a long restore gives a co-tenant time, and this
+  # is the last moment before a decrypted image is written under $RESTORE_DIR.
+  secure_dir "$RESTORE_DIR"
 
   # The cache below is only worth having if what it hands back is known good.
   # A previous run that died on the hash check left its corrupt plaintext right
   # here, and returning it unchecked would make the next restore "succeed".
+  #
+  # And "known good" reaches only as far as the ownership of the directory the
+  # two files are read from: the image and the sidecar it is checked against
+  # both live in staging, so anyone who can write there can plant a matching
+  # pair and have it extracted with no age authentication at all. secure_dir
+  # above is what makes this check mean anything.
   if [[ -f "$plain" ]]; then
     if [[ -f "$ENC_DIR/$base.sha512" ]]; then
-      cp -f "$ENC_DIR/$base.sha512" "$RESTORE_DIR/"
+      cp -f -- "$ENC_DIR/$base.sha512" "$RESTORE_DIR/"
       if ( cd "$RESTORE_DIR" && sha512sum -c --status "$base.sha512" ); then
         step "reusing verified $base"; PREPARED_IMG="$plain"; return 0
       fi
       warn "cached $base is corrupt — discarding and decrypting again"
       rm -f -- "$plain"
     else
-      PREPARED_IMG="$plain"; return 0
+      # No recorded plaintext hash, so nothing here can vouch for what is at
+      # this path — and it need not be ours: $RESTORE_DIR is shared by every
+      # set that passes through this staging area, so a disc02.squashfs left by
+      # an earlier restore of a DIFFERENT archive would be handed over as this
+      # set's disc 2 and extracted over the destination unchecked. Discarding
+      # costs one decryption, which is what reusing it was saving.
+      # reuseDecrypted in go/internal/restore/restore.go discards here too.
+      warn "no recorded plaintext hash to check the existing $base in $RESTORE_DIR against — discarding it and decrypting again"
+      rm -f -- "$plain"
     fi
   fi
 
@@ -1009,7 +1130,7 @@ prepare_image() {
 
   age_d -o "$plain.part" "$enc" \
     || { rm -f -- "$plain.part"; die "decryption failed for $base"; }
-  mv "$plain.part" "$plain"
+  mv -- "$plain.part" "$plain"
 
   # Delete on failure: a rejected image left behind is what the cache above
   # would otherwise pick up and trust on the next run. age authenticates as it
@@ -1017,7 +1138,7 @@ prepare_image() {
   # that was encrypted and the 150-byte sidecar recording its hash — and the
   # sidecar is the one with its own parity, so say how to put it back.
   if [[ -f "$ENC_DIR/$base.sha512" ]]; then
-    cp -f "$ENC_DIR/$base.sha512" "$RESTORE_DIR/"
+    cp -f -- "$ENC_DIR/$base.sha512" "$RESTORE_DIR/"
     ( cd "$RESTORE_DIR" && sha512sum -c --status "$base.sha512" ) \
       || { rm -f -- "$plain"; die "decrypted image $base does not match the hash in $base.sha512; the ciphertext decrypted cleanly, so either the image is not what was backed up or that sidecar has rotted — $(sidecar_repair_hint "$disc"), then retry"; }
   else
@@ -1115,6 +1236,20 @@ refuse_symlinked_dirs() {
 # pathsPresent has, and no worse than it: that name is chosen by whoever could
 # plant a file in the backed-up tree, and this guard is against whoever can
 # plant a link in the destination, and it takes both to slip past it.
+#
+# The listing IS the guard, so this fails closed on anything that would leave
+# it with nothing to compare. It used to run the listing with stderr on
+# /dev/null and never look at the exit status: a listing that failed, or one
+# whose format had drifted past the parse, produced an empty directory list —
+# and an empty list is indistinguishable from "this image holds no directories
+# a link could be planted at", so the guard returned 0 and the restore went
+# ahead unguarded, looking exactly like a guard that had run. Now the exit
+# status is checked, the number of listing lines the parse recognised is
+# checked, and either one failing stops the restore by name.
+#
+# The listing is read whole rather than streamed for one reason: its exit
+# status has to be taken before a single line of it is believed, and at the
+# head of a pipeline that status is the easiest thing in shell to drop.
 refuse_symlinks_at_dirs() {  # refuse_symlinks_at_dirs IMAGE DEST
   local img="$1" d="${2%/}"; [[ -n "$d" ]] || d="/"
   local -a bad=()
@@ -1122,15 +1257,57 @@ refuse_symlinks_at_dirs() {  # refuse_symlinks_at_dirs IMAGE DEST
   # A destination that is itself a link is caught above; the belt to that
   # brace, so this guard is complete on its own.
   [[ -L "$d" ]] && bad+=( "$(esc_str "$d")" )
-  # The listing shows raw names, one per line: mode, owner, size, date, time,
-  # then the path with squashfs-root/ in front of it. Directories only, and the
-  # root itself dropped: it is $d, tested above.
-  while IFS= read -r p; do
+
+  # unsquashfs's own stderr is deliberately NOT silenced: when this dies, the
+  # reason it gives should be readable next to what the tool itself said.
+  local listing="" rc=0
+  listing="$(unsquashfs -ll "$img")" || rc=$?
+  (( rc == 0 )) || die "could not list the directories of ${img##*/}: 'unsquashfs -ll' exited $rc. That listing is the only thing that says which paths this image holds as directories, and without it a symlink planted in $d cannot be told from one the backup itself carries — so the restore stops here rather than extract past a check that compared nothing. Fix or re-ingest that image and retry, or restore it with the Go reader on the disc (brb-linux-amd64)."
+
+  # One pass over the listing, printing the count of entries it recognised
+  # first and the archive-relative directory paths after it.
+  #
+  # The parse is the same one listedDir makes in go/internal/restore/extract.go
+  # rather than the anchored date-and-time regex this used to carry: the line
+  # is "<mode> <user>/<group> <size> <date> <time> <path>", so the path is
+  # everything after the single space that follows the fifth field, whatever it
+  # contains, and neither a padded size column nor a differently formatted
+  # timestamp can push a real directory out of the list. Nothing is trimmed off
+  # the end: a trailing '\r' is part of a name.
+  local -a parsed=()
+  mapfile -t parsed < <(printf '%s\n' "$listing" | LC_ALL=C awk '
+    BEGIN { root = "squashfs-root" }
+    {
+      rest = $0; fields = 1
+      for (i = 0; i < 5; i++) {
+        sub(/^ +/, "", rest)
+        j = index(rest, " ")
+        if (j == 0) { fields = 0; break }
+        rest = substr(rest, j)
+      }
+      if (!fields || length(rest) < 2) next
+      path = substr(rest, 2)
+      # Recognised as a listing entry: the archive root, or something under it.
+      if (path != root && index(path, root "/") != 1) next
+      n++
+      # Kept: directories under the root. The root itself is $d, tested above.
+      if (substr($0, 1, 1) == "d" && path != root) dirs[++k] = substr(path, length(root) + 2)
+    }
+    END { print n + 0; for (i = 1; i <= k; i++) print dirs[i] }
+  ')
+  # Every image this format produces lists at least its own root, so a count of
+  # zero means the listing was not in the shape this parses — not that the
+  # image is empty.
+  [[ "${parsed[0]:-}" =~ ^[1-9][0-9]*$ ]] \
+    || die "could not read the directory listing of ${img##*/}: 'unsquashfs -ll' succeeded, but not one line of it was in the '<mode> <user>/<group> <size> <date> <time> squashfs-root/<path>' form this reads. This guard has nothing to compare and will not pass by default, so the restore stops here. Please report the unsquashfs version; meanwhile restore with the Go reader carried on every disc (brb-linux-amd64 / brb-linux-aarch64)."
+
+  local i
+  for (( i = 1; i < ${#parsed[@]}; i++ )); do
+    p="${parsed[i]}"
     [[ -L "$d/$p" ]] || continue
     bad+=( "$(esc_str "$d/$p -> $(readlink -- "$d/$p" 2>/dev/null || true)")" )
     (( ${#bad[@]} < 5 )) || break
-  done < <(unsquashfs -ll "$img" 2>/dev/null \
-           | LC_ALL=C awk '/^d/ && sub(/^[^ ]+ +[^ ]+ +[0-9]+ +[0-9-]+ +[0-9:]+ squashfs-root\//, "") { print }')
+  done
   if (( ${#bad[@]} == 0 )); then return 0; fi
   local list; list="$(printf '%s, ' "${bad[@]}")"; list="${list%, }"
   die "$d contains symlink(s) where ${img##*/} holds directories ($list); unsquashfs -f would set the archive's directory mode, owner and times on whatever they point at — remove them, or restore into an empty directory and merge by hand"
@@ -1155,11 +1332,13 @@ cmd_restore() {
       *) die "unknown option: $1" ;;
     esac
   done
-  resolve_identity
   # Ingest writes ciphertext into staging; the restore path produces plaintext
-  # in the same tree, in a directory the README puts under /var/tmp.
-  secure_staging
-  mkdir -p "$dest" "$RESTORE_DIR"
+  # in the same tree, in a directory the README puts under /var/tmp. Before
+  # resolve_identity, not after: a public set's key is read out of $ENC_DIR,
+  # so that directory has to be one of ours before anything is read from it.
+  secure_staging "$ENC_DIR" "$RESTORE_DIR"
+  resolve_identity
+  mkdir -p -- "$dest"
   warn "$RESTORE_DIR will hold DECRYPTED images (mode 0700, but plaintext on disk)"
   (( EUID == 0 )) || warn "not running as root: ownership will not be restored"
 
@@ -1353,13 +1532,13 @@ cmd_mount() {
   [[ -n "${1:-}" && -n "$mp" ]] || die "usage: $PROG mount <disc-number> <mount-point>"
   n="$(num_arg "$1" 'disc number')"
   (( EUID == 0 )) || die "mounting requires root"
+  secure_staging "$ENC_DIR" "$RESTORE_DIR"
   resolve_identity
-  secure_staging
   local enc img
   enc="$(printf '%s/disc%02d.squashfs.age' "$ENC_DIR" "$n")"
   [[ -f "$enc" ]] || die "no image for disc $n in $ENC_DIR"
   prepare_image "$enc"; img="$PREPARED_IMG"
-  mkdir -p "$mp"
+  mkdir -p -- "$mp"
   mount -o loop,ro "$img" "$mp" || die "mount failed"
   ok "disc $n mounted read-only at $mp"
   step "unmount with: umount $mp"
@@ -1441,11 +1620,11 @@ cmd_index() {
 
 cmd_list() {
   need age; need unsquashfs; need sha512sum
-  resolve_identity
   local n
   [[ -n "${1:-}" ]] || die "usage: $PROG list <disc-number>"
   n="$(num_arg "$1" 'disc number')"
-  secure_staging
+  secure_staging "$ENC_DIR" "$RESTORE_DIR"
+  resolve_identity
   local enc img
   enc="$(printf '%s/disc%02d.squashfs.age' "$ENC_DIR" "$n")"
   [[ -f "$enc" ]] || die "no image for disc $n in $ENC_DIR"
