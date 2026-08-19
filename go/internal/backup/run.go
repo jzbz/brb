@@ -520,9 +520,12 @@ func (r *runner) buildDiscDirs(ctx context.Context, total int) error {
 	return nil
 }
 
-// The published key lives at the disc root rather than in data/, which is
-// where both readers' find_identity looks and where each README's restore
-// recipe points, so it needs no special handling on the way back in.
+// The published key lives at the disc root rather than in data/, beside
+// README.md, which is where that README's manual restore recipe points
+// (age -d -i /mnt/identity.txt). Neither reader's identity search looks at a
+// disc root or at ingested staging on its own — a brb-driven restore of a
+// public set needs AGE_IDENTITY pointed at a copy of this file, and the
+// on-disc README says so.
 //
 // Being outside data/ also means it is not a member of sidecars.par2 — par2
 // will not take a path above its own working directory. It is protected
@@ -549,9 +552,18 @@ func (r *runner) writePublicIdentity(n int) error {
 		return nil
 	}
 	path := filepath.Join(r.dirs.Discs, discDirName(n), doc.PublicIdentityName)
-	// A resumed run reaches discs an earlier run already laid out.
-	if _, err := os.Lstat(path); err == nil {
+	// A resumed run reaches discs an earlier run already laid out. Keep the
+	// file only if it really is this set's key: a run killed between the
+	// create and the write leaves a truncated one, and keeping that would put
+	// a disc on the shelf whose "key" is an empty file. The key is stable
+	// across a resume now (see preparePublicIdentity), so anything that is
+	// not byte-for-byte the expected key is simply wrong and is rewritten.
+	if existing, err := agecrypt.ReadX25519IdentityFile(path); err == nil &&
+		existing.String() == r.publicIdentity.String() {
 		return nil
+	}
+	if err := os.Remove(path); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return fmt.Errorf("backup: disc %d: replacing %s: %w", n, path, err)
 	}
 	if err := agecrypt.WritePublicIdentityFile(path, r.publicIdentity); err != nil {
 		return fmt.Errorf("backup: disc %d: %w", n, err)

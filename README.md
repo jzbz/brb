@@ -818,8 +818,11 @@ cryptographic terms, no protection at all, and that is the intent. What it buys
 is that nothing else about the format changes: same age container, same par2
 over the same ciphertext, same `SHA512SUMS`, same two readers. A public set is
 an ordinary set that happens to carry its own key, not a second on-disc format —
-which is why it costs no new code on the restore side and no new way for a
-restore to go wrong.
+so the manual recipe on the disc (`age -d -i /mnt/identity.txt …`) needs nothing
+new. One honest limit: neither `brb` reader searches a disc root or its own
+staging for a key on its own, so a `brb restore` of a public set wants
+`AGE_IDENTITY` pointed at a copy of the disc's `identity.txt`; the on-disc README
+says exactly that in its worked example.
 
 **The key is always freshly generated.** `AGE_RECIPIENTS_FILE` is not consulted
 and neither is `AGE_IDENTITY`, deliberately: publishing a key you already use

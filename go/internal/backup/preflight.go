@@ -14,6 +14,7 @@ import (
 
 	"github.com/jzbz/brb/internal/agecrypt"
 	"github.com/jzbz/brb/internal/config"
+	"github.com/jzbz/brb/internal/doc"
 	"github.com/jzbz/brb/internal/tools"
 	"github.com/jzbz/brb/internal/ui"
 )
@@ -39,9 +40,6 @@ func (r *runner) preflight(ctx context.Context) error {
 	if err := r.loadRecipients(); err != nil {
 		return err
 	}
-	if err := r.loadIdentity(); err != nil {
-		return err
-	}
 	if err := r.tools.ProbeISO(ctx); err != nil {
 		return fmt.Errorf("backup: %w", err)
 	}
@@ -59,6 +57,15 @@ func (r *runner) preflight(ctx context.Context) error {
 			"and ownership is recorded as yours")
 	}
 	if err := r.prepareState(ctx); err != nil {
+		return err
+	}
+	// After prepareState: a public archive's key is minted for a fresh set and
+	// reloaded for a resumed one, and only then can the round-trip identity be
+	// chosen, because under PUBLIC_ARCHIVE it IS that key.
+	if err := r.preparePublicIdentity(); err != nil {
+		return err
+	}
+	if err := r.loadIdentity(); err != nil {
 		return err
 	}
 	return r.confirmStaging()
@@ -97,10 +104,12 @@ func (r *runner) requireTools(ctx context.Context) error {
 
 // loadRecipients reads the age public keys every image will be encrypted to.
 //
-// Under PUBLIC_ARCHIVE it does not read them at all; see mintPublicIdentity.
+// Under PUBLIC_ARCHIVE it reads nothing: the recipient is the archive's own
+// key, which preparePublicIdentity mints or reloads once prepareState has
+// decided whether this run is fresh or resumed.
 func (r *runner) loadRecipients() error {
 	if r.cfg.PublicArchive {
-		return r.mintPublicIdentity()
+		return nil
 	}
 	path := r.cfg.AgeRecipientsFile
 	recs, err := agecrypt.ParseRecipientsFile(path)
@@ -119,34 +128,90 @@ func (r *runner) loadRecipients() error {
 	return nil
 }
 
-// mintPublicIdentity generates the keypair a public archive is encrypted to and
-// keeps the secret half on the runner, for writeDiscDirs to put on every disc.
+// preparePublicIdentity establishes the keypair a public archive is encrypted
+// to: minted for a fresh set, reloaded for a resumed one. It runs after
+// prepareState, because which of the two it must do is exactly what
+// prepareState decides.
 //
-// The key is generated here and used for this one archive. AGE_RECIPIENTS_FILE
-// is deliberately not consulted, and neither is AGE_IDENTITY: publishing a key
-// the operator already uses would retroactively expose every other set
-// encrypted to it, turning one flag into a disclosure of unrelated backups.
-// A fresh key can only ever disclose the archive it was made for.
+// The key is generated for this one archive. AGE_RECIPIENTS_FILE is
+// deliberately not consulted, and neither is AGE_IDENTITY: publishing a key the
+// operator already uses would retroactively expose every other set encrypted to
+// it, turning one flag into a disclosure of unrelated backups. A fresh key can
+// only ever disclose the archive it was made for.
+//
+// THE KEY IS WRITTEN TO STAGING HERE, BEFORE ANY DISC IS BUILT. It used to live
+// only in this process's memory until buildDiscDirs put it on the discs at the
+// very end of a completed run — so a run interrupted mid-set took its key to
+// the grave, and the resumed run minted a new one, encrypted the remaining
+// discs to that, and stamped it onto every disc directory, including the ones
+// whose images were encrypted to the dead key. Those discs verified clean and
+// were permanently undecryptable. Persisting the key first, and recording the
+// mode and public key in state.json so a resume can check both, is what
+// closes that.
 //
 // Encrypting to a key that is then shipped in the clear is, in cryptographic
 // terms, no encryption at all. That is the intent — the ciphertext, par2 layout
 // and both readers stay exactly as they are, so a public set is an ordinary set
 // that happens to carry its own key, rather than a second on-disc format.
-func (r *runner) mintPublicIdentity() error {
-	id, err := agecrypt.GenerateIdentity()
-	if err != nil {
-		return fmt.Errorf("backup: public archive: %w", err)
+func (r *runner) preparePublicIdentity() error {
+	if !r.cfg.PublicArchive {
+		return nil
 	}
+	path := r.publicIdentityPath()
+	resumed := r.st != nil && r.st.DiscsDone > 0
+
+	var id *age.X25519Identity
+	if resumed {
+		// prepareState has already refused a mode mismatch, so the state says
+		// this is a public set. Its key must be exactly the persisted one:
+		// discs 1..N are encrypted to it and nothing else can open them.
+		var err error
+		id, err = agecrypt.ReadX25519IdentityFile(path)
+		if err != nil {
+			return fmt.Errorf("backup: --resume: this set is a public archive but its key cannot be read "+
+				"from %s: %w — the %d disc(s) already written are encrypted to that key and nothing else "+
+				"can open them, so the set cannot be continued without it; start over", path, err, r.st.DiscsDone)
+		}
+		got := id.Recipient().String()
+		if got != r.st.PublicKey {
+			return fmt.Errorf("backup: --resume: %s holds the key for %s but the resume state recorded %s; "+
+				"the file was replaced since the set was started, so continuing would encrypt the "+
+				"remaining discs to a key that opens none of the finished ones; start over",
+				path, got, r.st.PublicKey)
+		}
+		r.p.OK("public archive resumed with its recorded key %s", got)
+	} else {
+		var err error
+		id, err = agecrypt.GenerateIdentity()
+		if err != nil {
+			return fmt.Errorf("backup: public archive: %w", err)
+		}
+		// startFresh removed any stale copy, so O_EXCL here can only trip on a
+		// concurrent run in the same staging, which is a refusal worth having.
+		if err := agecrypt.WriteIdentityFile(path, id); err != nil {
+			return fmt.Errorf("backup: public archive: persisting the key: %w", err)
+		}
+		r.st.PublicArchive = true
+		r.st.PublicKey = id.Recipient().String()
+		r.p.Warn("PUBLIC_ARCHIVE: this set will NOT be confidential")
+		r.p.Step("a keypair was generated for this archive alone, and its secret key")
+		r.p.Step("is written to identity.txt on every disc, so anyone holding a disc")
+		r.p.Step("can read it. Nothing here protects the contents.")
+		r.p.Step("public key: %s", id.Recipient())
+		r.p.Step("key kept in %s until the set is finished", path)
+	}
+
 	r.publicIdentity = id
 	r.recipients = []age.Recipient{id.Recipient()}
 	r.pubkeys = []string{id.Recipient().String()}
-
-	r.p.Warn("PUBLIC_ARCHIVE: this set will NOT be confidential")
-	r.p.Step("a keypair was generated for this archive alone, and its secret key")
-	r.p.Step("is written to identity.txt on every disc, so anyone holding a disc")
-	r.p.Step("can read it. Nothing here protects the contents.")
-	r.p.Step("public key: %s", id.Recipient())
 	return nil
+}
+
+// publicIdentityPath is where a public archive's key lives in staging for the
+// life of the set: beside the ciphertext, under the same name it carries on
+// the discs.
+func (r *runner) publicIdentityPath() string {
+	return filepath.Join(r.dirs.Enc, doc.PublicIdentityName)
 }
 
 // readPubkeys returns the age1 public keys of a recipients file verbatim, for
@@ -177,6 +242,19 @@ func readPubkeys(path string) ([]string, error) {
 // burned.
 func (r *runner) loadIdentity() error {
 	if !r.opts.VerifyRoundTrip {
+		return nil
+	}
+	// A public archive is encrypted to its own minted key and to nothing else,
+	// so that is the only identity that can round-trip it. Reading the
+	// operator's AGE_IDENTITY here made --verify-roundtrip fail on disc 1 —
+	// after mksquashfs, encrypt and par2 — for the one mode whose premise is
+	// that no pre-existing key is involved.
+	if r.cfg.PublicArchive {
+		if r.publicIdentity == nil {
+			return errors.New("backup: --verify-roundtrip: public archive key not prepared (internal ordering error)")
+		}
+		r.identities = []age.Identity{r.publicIdentity}
+		r.p.Step("round-trip verification enabled, using the archive's own key")
 		return nil
 	}
 	path := r.cfg.AgeIdentity
@@ -293,6 +371,11 @@ func (r *runner) prepareState(ctx context.Context) error {
 	if old.DiscsDone == 0 {
 		return r.startFresh(indexPath)
 	}
+	// Only once discs exist does the mode matter: before that nothing has been
+	// encrypted to anything, and startFresh above simply begins again.
+	if err := old.checkPublicMode(r.cfg.PublicArchive); err != nil {
+		return err
+	}
 	if _, err := os.Stat(indexPath); errors.Is(err, fs.ErrNotExist) {
 		// A run that got as far as encrypting the index deletes the plaintext
 		// one; resuming such a set only has the later steps left to do.
@@ -339,6 +422,12 @@ func (r *runner) startFresh(indexPath string) error {
 	}
 	if err := os.Remove(indexPath); err != nil && !errors.Is(err, fs.ErrNotExist) {
 		return fmt.Errorf("backup: removing stale index %s: %w", indexPath, err)
+	}
+	// A key left by an earlier public set that never got as far as disc 1
+	// (nothing was encrypted to it — the .age check above just proved so) must
+	// not be picked up by this one, whichever mode this one is in.
+	if err := os.Remove(r.publicIdentityPath()); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return fmt.Errorf("backup: removing stale public-archive key %s: %w", r.publicIdentityPath(), err)
 	}
 	r.st = newState(r.cfg.ArchiveName, r.cfg.SourceDir, r.packRatio, r.started)
 	return nil

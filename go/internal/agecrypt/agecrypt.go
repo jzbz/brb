@@ -83,6 +83,33 @@ func ParseIdentityFile(path string) ([]age.Identity, error) {
 	return ids, nil
 }
 
+// ReadX25519IdentityFile reads an identity file that must hold exactly one
+// X25519 secret key and returns it with its type intact, so the caller can ask
+// it for its recipient. ParseIdentityFile erases the type behind age.Identity,
+// which is right for decrypting but useless for the one place brb needs to
+// prove a reloaded key is the key a set was encrypted to.
+func ReadX25519IdentityFile(path string) (*age.X25519Identity, error) {
+	ids, err := ParseIdentityFile(path)
+	if err != nil {
+		return nil, err
+	}
+	var found *age.X25519Identity
+	for _, id := range ids {
+		x, ok := id.(*age.X25519Identity)
+		if !ok {
+			return nil, fmt.Errorf("agecrypt: identity file %s: holds a key that is not X25519", path)
+		}
+		if found != nil {
+			return nil, fmt.Errorf("agecrypt: identity file %s: holds more than one key", path)
+		}
+		found = x
+	}
+	if found == nil {
+		return nil, fmt.Errorf("agecrypt: identity file %s: no key", path)
+	}
+	return found, nil
+}
+
 // GenerateIdentity generates a fresh X25519 age keypair.
 func GenerateIdentity() (*age.X25519Identity, error) {
 	id, err := age.GenerateX25519Identity()

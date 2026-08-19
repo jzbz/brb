@@ -61,6 +61,18 @@ type State struct {
 	// ScanRawSize is the raw byte total the scan reported, recorded so a
 	// resumed run can notice the source tree changed size underneath it.
 	ScanRawSize int64 `json:"scan_raw_size"`
+	// PublicArchive records that the set is being built under PUBLIC_ARCHIVE,
+	// and PublicKey is the age recipient it is encrypted to. Both exist so a
+	// resume can refuse to change its mind: the mode is a per-invocation flag,
+	// and a resume that dropped it would silently encrypt the rest of the set
+	// to the operator's ordinary recipients while the finished discs stay on
+	// the archive's own key — half a set unlabelled and the other half
+	// unopenable. PublicKey additionally lets the resume prove the key file it
+	// reloads is the one the finished discs were actually encrypted to.
+	// Absent from an ordinary set's state file, and from every state file
+	// written before the mode existed, which reads correctly as "not public".
+	PublicArchive bool   `json:"public_archive,omitempty"`
+	PublicKey     string `json:"public_key,omitempty"`
 }
 
 // newState returns the state a fresh run starts from.
@@ -225,6 +237,25 @@ func (s *State) checkResume(archive, source string) error {
 		return fmt.Errorf("%w: state was recorded for archive %q, configuration says %q "+
 			"(set ARCHIVE_NAME=%s to continue that set)",
 			ErrStateMismatch, s.Archive, archive, s.Archive)
+	}
+	return nil
+}
+
+// checkPublicMode rejects a resume that would change whether the set is a
+// public archive. Either direction splits the set between two recipient sets:
+// see the PublicArchive field. Kept apart from checkResume so the message can
+// name the flag to pass rather than the config key to edit.
+func (s *State) checkPublicMode(public bool) error {
+	switch {
+	case s.PublicArchive && !public:
+		return fmt.Errorf("%w: this set was started as a PUBLIC archive (key %s) but this run is not; "+
+			"resume it with --public-archive (or PUBLIC_ARCHIVE=1), or start over",
+			ErrStateMismatch, s.PublicKey)
+	case !s.PublicArchive && public:
+		return fmt.Errorf("%w: this set was started as an ordinary archive, encrypted to AGE_RECIPIENTS_FILE; "+
+			"--public-archive cannot be added to a set mid-way, because the discs already written would "+
+			"not open with the key it publishes; drop the flag to resume, or start over",
+			ErrStateMismatch)
 	}
 	return nil
 }

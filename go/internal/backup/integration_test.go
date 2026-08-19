@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"math/rand"
@@ -16,6 +17,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"filippo.io/age"
 
 	"github.com/jzbz/brb/internal/agecrypt"
 	"github.com/jzbz/brb/internal/config"
@@ -1270,4 +1273,204 @@ func readFileString(t *testing.T, path string) string {
 		t.Fatalf("reading %s: %v", path, err)
 	}
 	return string(b)
+}
+
+// TestPublicArchiveSurvivesInterruptionAndResume is the regression test for a
+// critical defect: the minted key used to live only in process memory until the
+// end of a completed run, so a public backup interrupted mid-set took its key
+// with it, and the resume minted a new one, encrypted the rest of the set to
+// that, and stamped it onto every disc — including the discs whose images were
+// encrypted to the dead key. Those verified clean and were undecryptable
+// forever. The run here is interrupted for real, after disc 1 is protected and
+// state is saved, exactly the window the defect lived in.
+func TestPublicArchiveSurvivesInterruptionAndResume(t *testing.T) {
+	ctx := context.Background()
+	set := realTools(t, ctx)
+	noSystemDist(t)
+
+	src := t.TempDir()
+	ratioTree(t, src, 24, 2<<20, false) // incompressible: several discs, slow enough to catch
+	cfg := ratioConfig(t, src)
+	cfg.PublicArchive = true
+	cfg.AgeRecipientsFile = filepath.Join(t.TempDir(), "no-such-recipients.txt")
+	cfg.AgeIdentity = ""
+
+	runCtx, cancel := context.WithCancel(ctx)
+	p, _ := capturingPrinter()
+	done := make(chan error, 1)
+	go func() { done <- Run(runCtx, Options{Cfg: cfg, UI: p, Tools: set}) }()
+
+	statePath := filepath.Join(cfg.Staging, "state.json")
+	var st *State
+	for i := 0; i < 8000; i++ {
+		if s, err := LoadState(statePath); err == nil && s.DiscsDone >= 1 {
+			st = s
+			break
+		}
+		select {
+		case err := <-done:
+			t.Fatalf("the run finished before it could be interrupted: %v", err)
+		default:
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	cancel()
+	<-done
+	if st == nil {
+		t.Fatal("never saw a completed disc to interrupt after")
+	}
+
+	// What the defect hinged on: at this moment the key must already be on
+	// disk, and the state must know the set is public and which key it is.
+	if !st.PublicArchive || st.PublicKey == "" {
+		t.Fatalf("interrupted state does not record the public archive: %+v", st)
+	}
+	keyPath := filepath.Join(cfg.Dirs().Enc, doc.PublicIdentityName)
+	keyA, err := agecrypt.ReadX25519IdentityFile(keyPath)
+	if err != nil {
+		t.Fatalf("the interrupted run left no readable key at %s: %v", keyPath, err)
+	}
+	if keyA.Recipient().String() != st.PublicKey {
+		t.Fatalf("staging key %s does not match state %s", keyA.Recipient(), st.PublicKey)
+	}
+
+	// The two ways a resume could change its mind, both refused. Resuming
+	// without the flag: this state is public. Both must leave staging alone.
+	cfgOff := *cfg
+	cfgOff.PublicArchive = false
+	keysFor(t, &cfgOff)
+	if err := Run(ctx, Options{Cfg: &cfgOff, UI: yesPrinter(), Tools: set, Resume: true}); err == nil {
+		t.Fatal("resuming a public set without --public-archive was accepted")
+	} else if !errors.Is(err, ErrStateMismatch) || !strings.Contains(err.Error(), "--public-archive") {
+		t.Fatalf("resume without the flag: got %v, want an ErrStateMismatch naming --public-archive", err)
+	}
+
+	// Now the real resume, with the flag. It must reload key A, not mint.
+	resumeUI, resumeLog := capturingPrinter()
+	if err := Run(ctx, Options{Cfg: cfg, UI: resumeUI, Tools: set, Resume: true}); err != nil {
+		t.Fatalf("resumed Run: %v\n%s", err, resumeLog.String())
+	}
+	if !strings.Contains(resumeLog.String(), "resumed with its recorded key") {
+		t.Errorf("the resume did not report reloading the key:\n%s", resumeLog.String())
+	}
+	if strings.Contains(resumeLog.String(), "a keypair was generated") {
+		t.Errorf("the resume minted a new keypair:\n%s", resumeLog.String())
+	}
+
+	// Every disc — the ones from before the interruption and the ones after —
+	// must decrypt with the identity.txt that disc itself carries, and all
+	// those files must be key A.
+	dirs := cfg.Dirs()
+	total := discCount(t, dirs.Discs)
+	if total < 2 {
+		t.Fatalf("the set has %d disc(s); the interruption did not split it", total)
+	}
+	keyRe := regexp.MustCompile(`AGE-SECRET-KEY-1[A-Z0-9]{20,}`)
+	for n := 1; n <= total; n++ {
+		dd := filepath.Join(dirs.Discs, discDirName(n))
+		onDisc, err := agecrypt.ReadX25519IdentityFile(filepath.Join(dd, doc.PublicIdentityName))
+		if err != nil {
+			t.Fatalf("disc %d: %v", n, err)
+		}
+		if onDisc.String() != keyA.String() {
+			t.Errorf("disc %d carries a different key than the one the set was started with", n)
+		}
+		for _, name := range []string{"MANIFEST.txt", "README.md"} {
+			if got := keyRe.FindString(readFileString(t, filepath.Join(dd, name))); got != keyA.String() {
+				t.Errorf("disc %d: %s prints key %q, want the set's key", n, name, got)
+			}
+		}
+		img := filepath.Join(dd, "data", imageName(n)+".age")
+		out := filepath.Join(t.TempDir(), imageName(n))
+		if _, err := agecrypt.Decrypt(ctx, img, out, []age.Identity{onDisc}, nil); err != nil {
+			t.Errorf("disc %d does not decrypt with the key it carries: %v", n, err)
+		}
+	}
+	// A finished set removes its state; the key stays in staging with the
+	// rest of the ciphertext until the operator wipes it.
+	if _, err := os.Stat(statePath); !os.IsNotExist(err) {
+		t.Errorf("the completed resume left its state behind (stat err: %v)", err)
+	}
+}
+
+// TestOrdinaryArchiveRefusesToTurnPublicOnResume is the mirror: adding the flag
+// to a set that began ordinary would encrypt the remaining discs to a minted
+// key and publish that key onto discs it cannot open.
+func TestOrdinaryArchiveRefusesToTurnPublicOnResume(t *testing.T) {
+	ctx := context.Background()
+	set := realTools(t, ctx)
+	noSystemDist(t)
+
+	src := t.TempDir()
+	ratioTree(t, src, 24, 2<<20, false)
+	cfg := ratioConfig(t, src)
+
+	runCtx, cancel := context.WithCancel(ctx)
+	p, _ := capturingPrinter()
+	done := make(chan error, 1)
+	go func() { done <- Run(runCtx, Options{Cfg: cfg, UI: p, Tools: set}) }()
+	statePath := filepath.Join(cfg.Staging, "state.json")
+	seen := false
+	for i := 0; i < 8000 && !seen; i++ {
+		if s, err := LoadState(statePath); err == nil && s.DiscsDone >= 1 {
+			seen = true
+			break
+		}
+		select {
+		case err := <-done:
+			t.Fatalf("the run finished before it could be interrupted: %v", err)
+		default:
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	cancel()
+	<-done
+	if !seen {
+		t.Fatal("never saw a completed disc to interrupt after")
+	}
+
+	pub := *cfg
+	pub.PublicArchive = true
+	err := Run(ctx, Options{Cfg: &pub, UI: yesPrinter(), Tools: set, Resume: true})
+	if err == nil {
+		t.Fatal("resuming an ordinary set with --public-archive was accepted")
+	}
+	if !errors.Is(err, ErrStateMismatch) {
+		t.Fatalf("got %v, want ErrStateMismatch", err)
+	}
+	if _, err := os.Stat(filepath.Join(cfg.Dirs().Enc, doc.PublicIdentityName)); !os.IsNotExist(err) {
+		t.Errorf("the refused resume left a key in staging (stat err: %v)", err)
+	}
+}
+
+// TestPublicArchiveRoundTripUsesTheMintedKey: --verify-roundtrip used to load
+// the operator's AGE_IDENTITY, which is not a recipient of a public archive, so
+// the combination failed on disc 1 after mksquashfs, encrypt and par2 — or, with
+// no operator identity at all, was refused in preflight. The only key that can
+// round-trip a public set is the archive's own.
+func TestPublicArchiveRoundTripUsesTheMintedKey(t *testing.T) {
+	ctx := context.Background()
+	set := realTools(t, ctx)
+	noSystemDist(t)
+
+	cfg := integrationConfig(t, 4, 4<<20)
+	enoughSpace(t, cfg)
+	cfg.PackRatio = 1.05
+	cfg.PublicArchive = true
+	// No operator identity anywhere: a public archive must not need one, even
+	// for the round-trip.
+	cfg.AgeRecipientsFile = filepath.Join(t.TempDir(), "no-such-recipients.txt")
+	cfg.AgeIdentity = filepath.Join(t.TempDir(), "no-such-identity.txt")
+
+	p, log := capturingPrinter()
+	p.SetAssumeYes(true)
+	if err := Run(ctx, Options{Cfg: cfg, UI: p, Tools: set, VerifyRoundTrip: true}); err != nil {
+		t.Fatalf("Run with --verify-roundtrip on a public archive: %v\n%s", err, log.String())
+	}
+	if !strings.Contains(log.String(), "using the archive's own key") {
+		t.Errorf("round-trip did not use the minted key:\n%s", log.String())
+	}
+	if !strings.Contains(log.String(), "round-trip") {
+		t.Errorf("no evidence the round-trip ran at all:\n%s", log.String())
+	}
 }

@@ -149,8 +149,10 @@ go build -mod=vendor ./cmd/brb
 {{end}}
 ```sh
 export STAGING=/var/tmp/restore
-export AGE_IDENTITY=/path/to/identity.txt
-
+{{if .PublicIdentity}}cp /mnt/{{.PublicIdentityFile}} "$STAGING"/   # the tool does not read the disc root itself
+export AGE_IDENTITY="$STAGING"/{{.PublicIdentityFile}}
+{{else}}export AGE_IDENTITY=/path/to/identity.txt
+{{end}}
 ./{{.Run}} ingest                             # prompts for each disc, any order
 ./{{.Run}} index thesis                       # which disc holds a given path?
 ./{{.Run}} restore /path/to/destination
