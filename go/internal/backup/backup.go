@@ -53,7 +53,7 @@ import (
 // and in the ISO application id. It must stay equal to brb.sh's VERSION
 // (brb.sh:61): both are printed on the same disc, and a restorer comparing
 // them must not be told the reader and the writer are different releases.
-const Version = "1.0.0"
+const Version = "0.1.0"
 
 // shrinkMargin is the safety factor applied to a measured compression ratio
 // before an over-budget disc is re-packed with it: at exactly the measured
