@@ -957,6 +957,22 @@ Known and deliberate, but you should hear them before you rely on this:
 - **A single file larger than one disc cannot be stored.** `brb` detects this
   during `plan`/`backup` and stops rather than silently dropping it. Exclude it,
   use larger media, or split it yourself.
+- **A disc is checked against its set, but the set is not signed.** age encrypts
+  to a *public* key, and `MANIFEST.txt` on every disc names it — so anyone
+  holding one disc can build another that decrypts, matches its own hashes and
+  par2, and extracts. Two checks make that hard rather than trivial: the index
+  staged from the first disc is pinned, and a later disc carrying a different
+  one is refused; and each image must hold exactly the files the index says
+  that disc holds. Together they force a forger to ship the genuine index (which
+  they cannot read) and then match it (which they therefore cannot do). Be clear
+  about the limits. This detects that the discs of a set **disagree with each
+  other** — it cannot say which one is lying, and if the forgery is the first
+  disc you ingest, the genuine discs are what gets refused. It gives nothing
+  when a single self-consistent forged disc is all you have. And a filename
+  containing a newline cannot survive the line-based listing the check reads, so
+  for a set holding one the check says out loud that it could not be made exact,
+  and does not refuse. It is not a signature; the format has no signing key.
+
 - **A restore overwrites its destination.** `unsquashfs -f` replaces existing
   files with the backup's versions, mode and mtime included, and `--yes` answers
   the confirmation that would otherwise have stopped it. A destination holding a

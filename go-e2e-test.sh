@@ -517,5 +517,236 @@ else
   ck "  ... byte-identical to the source" $?
 fi
 
+sect "a disc that does not belong to the set"
+# age encrypts to a PUBLIC key, and MANIFEST.txt on every disc prints the
+# recipients the set was encrypted to. Anyone holding ONE disc can therefore
+# pack a squashfs image of their own choosing, encrypt it to that key, write
+# its .sha512 sidecars, its par2 volumes and a SHA512SUMS over the lot, and
+# hand back a disc that decrypts, verifies clean, passes par2 and is extracted
+# by 'unsquashfs -f' into the operator's destination. None of it needs the
+# private key, and nothing on the read path used to ask whether a disc
+# belonged to the operator's SET.
+#
+# Two halves answer it, and neither is any use alone: the index staged from the
+# first disc is PINNED, which forces an attacker to ship the genuine index
+# (they cannot forge one they cannot read); and each image is CROSS-CHECKED
+# against the rows that index gives its disc, which the forged image then
+# cannot satisfy. What it catches is that the discs of a set DISAGREE — not
+# which of them is lying, and nothing at all about a single disc forged in both
+# halves at once. It is not a signature; this format has no signing key.
+#
+# xcompat-test.sh owns the both-readers half of this, including the pin at
+# ingest, which needs a pty. What only this suite has is a set this
+# implementation wrote itself, forged with the same tools an attacker would
+# reach for.
+#
+# The patterns below are how the checks read the reader's messages, kept in one
+# place so a wording that lands differently is one edit to reconcile. Each is
+# asserted both ways — present where a refusal or a degradation is required,
+# absent from the genuine restore this suite already made — so a pattern too
+# loose fails one half and one too tight fails the other.
+XCHK_RX='index.*(disagree|differ|does not|do not|not list|unexpected)|(disagree|differ|does not|do not|not list|unexpected).*index'
+DEGRADE_RX='newline|cross-?check'
+
+# The genuine restore of the resumed multi-disc set, up at the top of this
+# file, is the regression guard: it already proved the tree comes back
+# byte-identical. What is added here is that it came back QUIETLY. A
+# cross-check that refuses, or silently gives up on, a legitimate set has taken
+# the tool away from its operator — a worse outcome than the forgery it guards
+# against — and the source tree that restore covered holds a filename with a
+# TAB in it, which the index escapes as \t and 'unsquashfs -ll' prints
+# literally. A comparison that forgot to unescape the index rows would refuse
+# that disc; one that degraded on every escaped name would quietly check
+# nothing. A tab is not a newline, and neither reader may treat it as one.
+! grep -qiE "$XCHK_RX" "$W/restore.log"
+ck "the genuine multi-disc restore claimed no disagreement between image and index" $?
+! grep -qiE "$DEGRADE_RX" "$W/restore.log"
+ck "  ... and did not degrade the check over the filename holding a tab" $?
+
+# A set of its own to forge a disc of: small, but genuinely multi-disc, because
+# the refusal has to hold on a disc reached AFTER a good one has been read and
+# extracted — which is the shape of the attack, one disc of a set that is
+# otherwise the operator's own.
+FG=$W/fg
+mkdir -p "$FG/src"
+for i in $(seq -w 1 12); do head -c 3000000 /dev/urandom > "$FG/src/blob-$i.bin"; done
+cat > "$W/cfg/forge" <<EOF
+SOURCE_DIR="$FG/src"
+STAGING="$FG/stage"
+AGE_RECIPIENTS_FILE="$W/cfg/recipients.txt"
+AGE_IDENTITY="$W/cfg/identity.txt"
+DISC_CAPACITY_BYTES=40000000
+RESERVE_BYTES=12000000
+PAR2_BLOCKS=40
+ARCHIVE_NAME="go-forge"
+EOF
+"$BRB" --yes -c "$W/cfg/forge" backup </dev/null > "$W/fg-backup.log" 2>&1
+ck "fixture: a set to forge a disc of" $?
+n_fg=$(find "$FG/stage/discs" -mindepth 1 -maxdepth 1 -type d -name 'disc*' 2>/dev/null | wc -l)
+(( n_fg >= 2 )); ck "  ... spanning $n_fg discs" $?
+FG_N=2   # the disc whose image is replaced
+
+# The index's paths for one disc, spelled the way the index spells them.
+fg_rows() { # fg_rows DISC
+  age -d -i "$W/cfg/identity.txt" "$FG/stage/enc/index.tsv.gz.age" 2>/dev/null \
+    | gzip -dc 2>/dev/null | awk -F'\t' -v d="$1" '$1+0==d { print $2 }'
+}
+
+# forge_image OUT NAME... — a squashfs image whose root holds exactly the named
+# regular files, with contents that were never in anybody's backup. mksquashfs
+# without -keep-as-directory puts the directory's CONTENTS at the image root,
+# which is the shape brb's own images have: 'unsquashfs -ll' prints them as
+# squashfs-root/<name>.
+forge_image() {
+  local out=$1; shift
+  local tree=$out.tree n
+  rm -rf "$tree" "$out"; mkdir -p "$tree" || return 1
+  for n in "$@"; do
+    printf 'planted by whoever read the recipients out of MANIFEST.txt\n' > "$tree/$n" || return 1
+  done
+  mksquashfs "$tree" "$out" -noappend -no-progress -quiet >/dev/null 2>&1 || return 1
+  [[ -s $out ]]
+}
+
+# forge_staging TAG IMAGE — a private copy of the set's staging with disc
+# $FG_N's image replaced by IMAGE and every artifact a reader checks
+# regenerated over it: the ciphertext sidecar, the plaintext sidecar and the
+# par2 set. All of it with the public key out of the recipients file, which is
+# the same key MANIFEST.txt prints on every disc.
+#
+# The result is then verified the way a reader will, ciphertext and plaintext
+# both, and this fails if any of it comes back damaged: a refusal that could be
+# explained by a corrupt image would say nothing about the cross-check.
+forge_staging() {
+  local tag=$1 img=$2
+  local st=$FG/$tag enc base tmp
+  base=$(printf 'disc%02d.squashfs' "$FG_N")
+  rm -rf "$st"
+  cp -a "$FG/stage" "$st" || return 1
+  rm -rf "$st/restore"
+  enc=$st/enc; tmp=$st/.forge
+  [[ -f "$enc/$base.age" ]] || { echo "fixture: no $base.age in staging to forge over" >&2; return 1; }
+  mkdir -p "$tmp" || return 1
+  cp -f "$img" "$tmp/$base" || return 1
+  rm -f "$enc/$base.age"
+  age -e -R "$W/cfg/recipients.txt" -o "$enc/$base.age" "$tmp/$base" || return 1
+  ( cd "$enc" && sha512sum "$base.age" ) > "$enc/$base.age.sha512" || return 1
+  ( cd "$tmp" && sha512sum "$base" ) > "$enc/$base.sha512" || return 1
+  rm -f "$enc/$base".age*.par2
+  ( cd "$enc" && par2 create -q -q -b40 -- "$base.age.par2" "$base.age" ) >/dev/null 2>&1 || return 1
+  ( cd "$enc" && sha512sum -c --quiet "$base.age.sha512" ) >/dev/null 2>&1 || return 1
+  ( cd "$enc" && par2 verify -q -- "$base.age.par2" ) >/dev/null 2>&1 || return 1
+  rm -f "$tmp/$base"
+  age -d -i "$W/cfg/identity.txt" -o "$tmp/$base" "$enc/$base.age" || return 1
+  ( cd "$tmp" && sha512sum -c --quiet "$enc/$base.sha512" ) >/dev/null 2>&1 || return 1
+  rm -rf "$tmp"
+  cat > "$W/cfg/$tag" <<EOF
+SOURCE_DIR="$FG/src"
+STAGING="$st"
+AGE_RECIPIENTS_FILE="$W/cfg/recipients.txt"
+AGE_IDENTITY="$W/cfg/identity.txt"
+DISC_CAPACITY_BYTES=40000000
+RESERVE_BYTES=12000000
+PAR2_BLOCKS=40
+ARCHIVE_NAME="go-forge"
+EOF
+}
+
+# The attacker's disc: two files nobody backed up, and — deliberately — one
+# path the index really does give this disc. The two strangers are what the
+# cross-check must catch. The third is what makes the --only check below mean
+# anything: a reader asks an image whether it holds the requested path before
+# extracting it, and an image holding none of it is skipped without being
+# compared with anything at all. An attacker who wants their bytes handed to an
+# operator who typed --only names their file after a file the index says is
+# there, so that is the disc this fixture builds.
+fg_one=$(fg_rows "$FG_N" | head -1)
+[[ -n "$fg_one" && "$fg_one" != *[\\/]* ]]
+ck "fixture: the index gives disc $FG_N a flat path to ask for ($fg_one)" $?
+forge_image "$FG/img-alien" 'passwd' 'authorized_keys' "$fg_one"
+ck "fixture: a squashfs holding two files nobody backed up, plus that one" $?
+fg_rows "$FG_N" | grep -qxE 'passwd|authorized_keys'
+(( $? != 0 )); ck "  ... and the index gives disc $FG_N neither of the strangers" $?
+forge_staging alien "$FG/img-alien"
+ck "fixture: it is disc $FG_N's image now, and sidecars and par2 all accept it" $?
+
+# The destination is NOT empty afterwards and must not be asserted to be: disc
+# 1 is genuine and is extracted before the forged disc is reached. The property
+# is that nothing the attacker chose came out of it.
+rm -rf "$W/fg-out"; mkdir -p "$W/fg-out"
+"$BRB" --yes --no-color -c "$W/cfg/alien" restore "$W/fg-out" > "$W/fg-alien.log" 2>&1
+(( $? != 0 )); ck "restore refuses a disc whose image is not what the index says it holds" $?
+(( $(find "$W/fg-out" \( -name passwd -o -name authorized_keys \) | wc -l) == 0 ))
+ck "  ... and not one file the forged image chose was written" $?
+grep -qiE "$XCHK_RX" "$W/fg-alien.log"
+ck "  ... saying the image and the index disagree" $?
+
+# --only narrows the EXTRACTION, not the disc: the image still holds the whole
+# disc, so the whole of it is still compared with the whole of that disc's
+# index rows however few paths were asked for. Nothing narrows this disc away
+# — it holds the path being asked for — so without the cross-check this run
+# ends 0 having written the attacker's version of a file the operator named.
+# That is why it is not enough for it to exit non-zero: the file must not be
+# there either.
+rm -rf "$W/fg-out-only"; mkdir -p "$W/fg-out-only"
+"$BRB" --yes --no-color -c "$W/cfg/alien" restore "$W/fg-out-only" --only "$fg_one" > "$W/fg-only.log" 2>&1
+(( $? != 0 )); ck "restore --only is refused by the same disc" $?
+[[ ! -e "$W/fg-out-only/$fg_one" ]]
+ck "  ... and the forged $fg_one it asked for was not written" $?
+
+# The limit, written down as a passing check rather than left implied: a forged
+# image whose files agree with the index is extracted, because with one disc
+# forged in both halves there is nothing left to compare it against. Overselling
+# this guard would be worse than not having it.
+mapfile -t fg_agree < <(fg_rows "$FG_N")
+(( ${#fg_agree[@]} >= 2 ))
+ck "fixture: the index gives disc $FG_N ${#fg_agree[@]} row(s)" $?
+printf '%s\n' "${fg_agree[@]}" | grep -q '[\\/]'
+(( $? != 0 )); ck "  ... all of them flat, unescaped names this fixture can use as filenames" $?
+forge_image "$FG/img-agreeing" "${fg_agree[@]}"
+ck "fixture: an image holding exactly those paths, with contents nobody backed up" $?
+forge_staging agreeing "$FG/img-agreeing"
+ck "fixture: it is disc $FG_N's image now, and sidecars and par2 all accept it" $?
+rm -rf "$W/fg-out-agree"; mkdir -p "$W/fg-out-agree"
+"$BRB" --yes --no-color -c "$W/cfg/agreeing" restore "$W/fg-out-agree" > "$W/fg-agree.log" 2>&1
+ck "a forgery whose files agree with the index IS extracted — the limit this guard does not cover" $?
+[[ -s "$W/fg-out-agree/$fg_one" ]] && ! cmp -s "$FG/src/$fg_one" "$W/fg-out-agree/$fg_one"
+ck "  ... and what came out is the forgery's content, not the backup's" $?
+
+sect "a filename with a newline degrades the cross-check, and never refuses"
+# 'unsquashfs -ll' is line-based, so a file called "new<newline>line.txt" is
+# listed as two half-lines and no line-based listing can carry it faithfully —
+# which is why the index has an escaping contract at all. The cross-check has
+# to notice and say so, and must NOT refuse: a backup tool that cannot restore
+# a legitimate set is worse than one that misses an exotic attack. Its own tiny
+# set, because a newline in a name breaks 'find | wc -l' and every count this
+# suite takes of the main source tree.
+NL=$W/nl
+mkdir -p "$NL/src"
+printf 'y' > "$NL/src/$(printf 'new\nline.txt')"
+printf 'w' > "$NL/src/plain.txt"
+head -c 300000 /dev/urandom > "$NL/src/blob.bin"
+(( $(find "$NL/src" -type f -printf 'x' | wc -c) == 3 ))
+ck "fixture: three files, one of them named across a line break" $?
+cat > "$W/cfg/nl" <<EOF
+SOURCE_DIR="$NL/src"
+STAGING="$NL/stage"
+AGE_RECIPIENTS_FILE="$W/cfg/recipients.txt"
+AGE_IDENTITY="$W/cfg/identity.txt"
+DISC_CAPACITY_BYTES=40000000
+RESERVE_BYTES=12000000
+PAR2_BLOCKS=40
+ARCHIVE_NAME="go-newline"
+EOF
+"$BRB" --yes -c "$W/cfg/nl" backup </dev/null > "$W/nl-backup.log" 2>&1
+ck "a backup of it exits 0" $?
+mkdir -p "$NL/out"
+"$BRB" --yes --no-color -c "$W/cfg/nl" restore "$NL/out" > "$W/nl-restore.log" 2>&1
+ck "and it still restores" $?
+diff -r --no-dereference "$NL/src" "$NL/out" >/dev/null 2>&1
+ck "  ... byte-identical to the source" $?
+grep -qiE "$DEGRADE_RX" "$W/nl-restore.log"
+ck "  ... having said the cross-check could not be made exact for that disc" $?
+
 printf '\n%d passed, %d failed, %d xfail\n' "$pass" "$fail" "$xfail"
 (( fail == 0 ))

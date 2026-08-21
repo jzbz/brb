@@ -44,23 +44,67 @@ func (o Options) indexDiscs(ctx context.Context, want []string) (map[string][]in
 	if len(want) == 0 {
 		return nil, nil
 	}
+	hits := make(map[string]map[int]bool, len(want))
+	bad, err := o.scanIndex(ctx, func(disc int, p string) {
+		for _, w := range want {
+			if covers(w, p) {
+				if hits[w] == nil {
+					hits[w] = map[int]bool{}
+				}
+				hits[w][disc] = true
+			}
+		}
+	})
+	if err != nil {
+		return nil, err
+	}
+	if bad > 0 {
+		o.UI.Warn("%d record(s) in %s do not parse and were ignored; %s if a path seems to be missing",
+			bad, indexName, o.sidecarRepairHint(0))
+	}
+
+	out := make(map[string][]int, len(hits))
+	for w, set := range hits {
+		out[w] = sortedDiscs(set)
+	}
+	return out, nil
+}
+
+// scanIndex decrypts the staged index and hands every record it holds to fn as
+// a disc number and an unescaped path. It reports how many records did not
+// parse, so each caller can decide what an incomplete answer is worth to it.
+//
+// One reader, because the read side now asks the index two questions — "which
+// disc(s) hold this path", for --only, and "exactly which paths does this disc
+// hold", for the per-image cross-check in [Options.auditImage] — and a second
+// walk written for the second question would be a second set of decisions
+// about unescaping, about a bare CR in a name, and about a record that will not
+// parse. The two answers would then drift apart precisely where a forged disc
+// wants them to: the guard compares an image against the index, and it is worth
+// nothing if its idea of what the index says differs from the one the rest of
+// the restore uses.
+//
+// Errors keep the shape [Options.indexDiscs] established: [errNoIndex] wrapped
+// when the staging area simply has no index, so callers can fall back rather
+// than refuse, and anything else means the index is there and would not read.
+func (o Options) scanIndex(ctx context.Context, fn func(disc int, path string)) (bad int, err error) {
 	encDir := o.dirs().Enc
 	idx := filepath.Join(encDir, indexName)
 	if _, err := os.Stat(idx); err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
-			return nil, fmt.Errorf("%w in %s", errNoIndex, encDir)
+			return 0, fmt.Errorf("%w in %s", errNoIndex, encDir)
 		}
-		return nil, fmt.Errorf("restore: %s: %w", idx, err)
+		return 0, fmt.Errorf("restore: %s: %w", idx, err)
 	}
 	// The identities are loaded once per command and shared, so reading the
 	// index here does not cost a second passphrase prompt before the images are
 	// decrypted. See Options.ids.
 	ids, err := o.identities()
 	if err != nil {
-		return nil, err
+		return 0, err
 	}
 	if err := o.checkIndexIntact(ctx, idx); err != nil {
-		return nil, err
+		return 0, err
 	}
 
 	pr, pw := io.Pipe()
@@ -72,11 +116,10 @@ func (o Options) indexDiscs(ctx context.Context, want []string) (map[string][]in
 	hint := o.sidecarRepairHint(0)
 	gz, err := gzip.NewReader(pr)
 	if err != nil {
-		return nil, fmt.Errorf("restore: reading %s (%s): %w", idx, hint, err)
+		return 0, fmt.Errorf("restore: reading %s (%s): %w", idx, hint, err)
 	}
 	defer gz.Close()
 
-	hits := make(map[string]map[int]bool, len(want))
 	sc := bufio.NewScanner(gz)
 	sc.Buffer(make([]byte, 0, 64<<10), maxIndexLine)
 	// The default ScanLines drops a trailing '\r', and the index stores a CR in
@@ -84,11 +127,10 @@ func (o Options) indexDiscs(ctx context.Context, want []string) (map[string][]in
 	// backslash, tab, newline — and CR cannot). Splitting must not eat name
 	// bytes, or the file becomes unfindable by its own real name.
 	sc.Split(scanLinesKeepCR)
-	bad := 0
 	for i := 0; sc.Scan(); i++ {
 		if i%4096 == 0 {
 			if err := ctx.Err(); err != nil {
-				return nil, err
+				return bad, err
 			}
 		}
 		line := sc.Text()
@@ -105,28 +147,78 @@ func (o Options) indexDiscs(ctx context.Context, want []string) (map[string][]in
 			bad++
 			continue
 		}
-		for _, w := range want {
-			if covers(w, p) {
-				if hits[w] == nil {
-					hits[w] = map[int]bool{}
-				}
-				hits[w][disc] = true
-			}
-		}
+		fn(disc, p)
 	}
 	if err := sc.Err(); err != nil {
-		return nil, fmt.Errorf("restore: reading %s (%s): %w", idx, hint, err)
+		return bad, fmt.Errorf("restore: reading %s (%s): %w", idx, hint, err)
 	}
-	if bad > 0 {
-		o.UI.Warn("%d record(s) in %s do not parse and were ignored; %s if a path seems to be missing",
-			bad, indexName, hint)
-	}
+	return bad, nil
+}
 
-	out := make(map[string][]int, len(hits))
-	for w, set := range hits {
-		out[w] = sortedDiscs(set)
+// discRows is what the index says one disc holds: every regular-file path it
+// puts on that disc, and — when the comparison in [Options.auditImage] cannot
+// be made exact — the reason why.
+//
+// The writer indexes regular files only. Directories, symlinks and specials are
+// the skeleton, which is replicated onto every disc of the set on purpose (see
+// pack.Bin.Skeleton), so they are in no index and are not comparable this way.
+// That is why the cross-check looks at the image's files and nothing else: a
+// guard that compared directories would refuse every legitimate restore of
+// every set brb has ever written.
+type discRows struct {
+	// paths holds the archive paths the index puts on this disc.
+	paths map[string]bool
+	// inexact, when non-empty, says in operator-facing terms why this disc's
+	// image must not be judged against paths. It is a degradation, never a
+	// refusal: see [Options.indexRowsForDisc].
+	inexact string
+}
+
+// indexRowsForDisc reads the index and collects what it says disc n holds.
+//
+// The index is read once per disc rather than once per restore. A full-set
+// restore of a $HOME-sized archive has a million records in it, and holding
+// every disc's rows at once to save a few seconds of gunzip would cost hundreds
+// of megabytes on the machine least able to spare it — while the pass being
+// saved is nothing beside par2-verifying and decrypting the 25 GB image the
+// rows are about to be compared against.
+//
+// Two conditions come back as [discRows.inexact] rather than as an error,
+// because a backup tool that cannot restore a legitimate set is worse than one
+// that misses an exotic attack:
+//
+//   - A path on this disc whose name contains a newline. brb deliberately
+//     supports those — it is why the index has an escaping contract at all —
+//     but "unsquashfs -ll" is line-based, so such a file arrives as two lines
+//     of which only the first fragment parses, and the comparison would report
+//     a file the image does not hold and one it does not list. See listedDir.
+//   - Records that do not parse. The rows read off a damaged index are not the
+//     whole of what the disc holds, so every unread row would look like a file
+//     missing from the image.
+func (o Options) indexRowsForDisc(ctx context.Context, n int) (*discRows, error) {
+	rows := &discRows{paths: map[string]bool{}}
+	newlines := 0
+	bad, err := o.scanIndex(ctx, func(disc int, p string) {
+		if disc != n {
+			return
+		}
+		if strings.Contains(p, "\n") {
+			newlines++
+		}
+		rows.paths[p] = true
+	})
+	if err != nil {
+		return nil, err
 	}
-	return out, nil
+	switch {
+	case newlines > 0:
+		rows.inexact = fmt.Sprintf("the index puts %d path(s) whose name contains a newline on this disc, "+
+			"and 'unsquashfs -ll' is line-based, so the image's file list cannot be read back exactly", newlines)
+	case bad > 0:
+		rows.inexact = fmt.Sprintf("%d record(s) in %s do not parse, so the index's list for this disc is incomplete (%s)",
+			bad, indexName, o.sidecarRepairHint(n))
+	}
+	return rows, nil
 }
 
 // sortedDiscs renders a disc-number set as an ascending slice.

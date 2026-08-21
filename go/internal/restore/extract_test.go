@@ -193,7 +193,7 @@ func TestRestoreAcrossDiscsToleratesTheArchivesOwnSymlinks(t *testing.T) {
 	}
 }
 
-// With --only, refuseSymlinksAtImageDirs checks only the directories the
+// With --only, auditImage's symlink guard checks only the directories the
 // extraction touches, so a symlink to a FILE somewhere else in a live tree
 // does not block fetching one file back into it — but the same link is refused
 // when the extraction would pass through it.
@@ -229,7 +229,7 @@ func TestRestoreOnlyChecksOnlyTheDirectoriesItTouches(t *testing.T) {
 }
 
 // The traversal guard is NOT narrowed by --only, and the comment on
-// refuseSymlinksAtImageDirs used to read as though it were. A symlink that
+// auditImage's symlink guard used to read as though it were. A symlink that
 // resolves to a DIRECTORY is refused wherever it sits under the destination,
 // even when the extraction would never go near it: refuseSymlinkedDirs runs
 // once, before the first image, over the whole tree. That is what README.md's

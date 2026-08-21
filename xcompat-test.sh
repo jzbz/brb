@@ -1224,7 +1224,7 @@ assert0 "go brb refuses a destination that is a symlink, spelled with a trailing
 # refuse_symlinked_dirs / refuseSymlinkedDirs — the guard against unsquashfs -f
 # traversing a link and writing the archive's files outside the destination.
 # There is a SECOND, per-image guard, refuse_symlinks_at_dirs /
-# refuseSymlinksAtImageDirs, for the case that guard cannot see: a link
+# auditImage (formerly refuseSymlinksAtImageDirs), for the case that guard cannot see: a link
 # resolving to a FILE, at a path the IMAGE holds as a directory. Nothing
 # escapes through that one — unsquashfs finds the path taken and carries on —
 # but when it finishes the directory it applies the archive's mode, owner and
@@ -1698,6 +1698,425 @@ if (( HAVE_SCRIPT )); then
   done
 else
   skip "public-archive ingest (both readers)" "no script(1) for a pty"
+fi
+
+# ---------------------------------------------------------------------------
+head_s "16. a disc that does not belong to this set"
+# ---------------------------------------------------------------------------
+# age encrypts to a PUBLIC key, and MANIFEST.txt on every disc prints the
+# recipients the set was encrypted to. So anyone who gets hold of ONE disc can
+# read that key, pack a squashfs image of their own choosing, encrypt it to
+# that key, compute its .sha512 sidecars and its par2 volumes, write a
+# SHA512SUMS over the lot, and hand back a disc that decrypts, verifies clean,
+# passes par2 and is extracted by 'unsquashfs -f' straight into the operator's
+# destination — with the restore's privileges, which the README recommends be
+# root's. None of that needs the private key. Nothing on the read path used to
+# ask whether a disc belonged to the operator's SET at all.
+#
+# The mitigation is in two halves, and neither one is any use alone:
+#
+#   HALF 1 — THE INDEX IS PINNED AT INGEST. Every disc of one set carries the
+#     same index.tsv.gz.age, because the writer copies one file onto all of
+#     them; a disc whose index differs from the one already staged is refused.
+#     The attacker cannot forge an index — it is encrypted to a key they do not
+#     hold — so this leaves them one move: ship the genuine index, byte for
+#     byte, which needs no key at all.
+#
+#   HALF 2 — EACH IMAGE IS CROSS-CHECKED AT RESTORE. The regular files an image
+#     holds must be exactly the paths the index gives that disc. Having been
+#     forced to ship the genuine index, the attacker cannot make their image
+#     agree with it: they cannot read it to find out what it says.
+#
+# What this does NOT do is pinned here too, deliberately, as passing checks,
+# because a guard oversold is worse than no guard at all:
+#
+#   * It detects that the discs of a set DISAGREE. It cannot say which disc is
+#     lying — ingest the forged one first and its index becomes the pinned one
+#     and the genuine discs are the ones refused. The operator is told the set
+#     contradicts itself and has to decide.
+#   * It is no protection whatever against a SELF-CONSISTENT forgery: one disc,
+#     a forged image, and index rows that agree with it. The attacker controls
+#     both halves and there is nothing left to compare. "a forgery the index
+#     agrees with is extracted" below is that limit written down as a test, so
+#     that nobody reads this section as more than it is.
+#   * It is not a signature. Nothing in this format authenticates the sender;
+#     there is no signing key to check.
+#
+# The two readers are written separately and their wordings will never be
+# identical, so every message this section reads is matched through one of the
+# three patterns named here — one place for the integrator to retune when a
+# wording lands differently. Each pattern is asserted BOTH ways: present on the
+# run that must refuse or degrade, and absent from the genuine restores that
+# must not. A pattern too loose fails the absent half, one too tight fails the
+# present half, so neither half can quietly pass on a pattern that is matching
+# the wrong line.
+XCHK_RX='index.*(disagree|differ|does not|do not|not list|unexpected)|(disagree|differ|does not|do not|not list|unexpected).*index'
+PIN_RX='index.*differ|differ.*index'
+DEGRADE_RX='newline|cross-?check'
+
+# The set forged below is the multi-disc one from section 8, and the disc
+# forged is disc 2 rather than disc 1: the refusal has to hold on a disc
+# reached after a genuine one has already been read and extracted, which is
+# the shape of the attack — one disc of a set that is otherwise the operator's
+# own.
+XCHK_SET=$T/m-go
+XCHK_SRC=$T/m-src
+XCHK_N=2
+FORGE=$T/forge; mkdir -p "$FORGE"
+
+# index_rows_for STAGE DISC — the index's paths for one disc, spelled the way
+# the index spells them (escaped: \t, \n, \\).
+index_rows_for() { idx_plain "$1" | awk -F'\t' -v d="$2" '$1+0==d { print $2 }'; }
+
+# restore_from CFG sh|go DEST LOGFILE [args...] — one restore, whichever
+# reader, with the exit status left for the caller to judge.
+restore_from() {
+  local cfg=$1 who=$2 dest=$3 lf=$4; shift 4
+  case $who in
+    sh) bash "$BRB_SH" --yes -c "$cfg" restore "$dest" "$@" > "$lf" 2>&1 ;;
+    go) "$BRB_GO" --yes --no-color -c "$cfg" restore "$dest" "$@" > "$lf" 2>&1 ;;
+  esac
+}
+
+# ---- the regression guard: a genuine set must still restore ---------------
+# This is the most important check in the section. A cross-check that refuses
+# a legitimate disc has taken the whole tool away from its operator, which is
+# a worse outcome than the attack it guards against — so the genuine
+# multi-disc set is restored by both readers, byte for byte, and their logs
+# are required to say nothing about a disagreement and nothing about a
+# degraded check.
+genuine_restores() { # genuine_restores sh|go
+  local who=$1; local dest=$T/out-xchk-genuine-$who
+  rm -rf "$dest" "$XCHK_SET/restore"; mkdir -p "$dest"
+  restore_from "$T/cfg/m" "$who" "$dest" "$LOG/xchk-genuine-$who.log" || return 1
+  diff -r --no-dereference "$XCHK_SRC" "$dest" >&2
+}
+if (( n_m >= 2 )); then
+  for who in sh go; do
+    case $who in sh) name="brb.sh" ;; go) name="go brb" ;; esac
+    assert0 "$name restores the genuine $n_m-disc set, byte-identical to the source" genuine_restores "$who"
+    assertN "  ... without claiming any image disagrees with the index" \
+      grep -qiE "$XCHK_RX" "$LOG/xchk-genuine-$who.log"
+    assertN "  ... and without degrading the cross-check on ordinary names" \
+      grep -qiE "$DEGRADE_RX" "$LOG/xchk-genuine-$who.log"
+  done
+  unset name
+fi
+
+# ---- the forged disc -------------------------------------------------------
+# forge_image OUT NAME... — a squashfs image whose root holds exactly the named
+# regular files, with contents that were never in anybody's backup. mksquashfs
+# without -keep-as-directory puts the directory's CONTENTS at the image root,
+# which is the shape the writer produces: 'unsquashfs -ll' prints them as
+# squashfs-root/<name>, the same as a real disc image.
+forge_image() {
+  local out=$1; shift
+  local tree=$out.tree n
+  rm -rf "$tree" "$out"; mkdir -p "$tree" || return 1
+  for n in "$@"; do
+    printf 'planted by whoever read the recipients out of MANIFEST.txt\n' > "$tree/$n" || return 1
+  done
+  mksquashfs "$tree" "$out" -noappend -no-progress -quiet >/dev/null 2>&1 || return 1
+  [[ -s $out ]]
+}
+
+# forge_into_staging STAGE DISC IMAGE — everything the attacker does, and
+# nothing they cannot: IMAGE replaces disc DISC's encrypted image in STAGE, and
+# every artifact a reader checks before extracting is regenerated over it — the
+# ciphertext sidecar, the plaintext sidecar, and the par2 set. The encryption
+# uses the set's own recipients file, which is nothing but the public key
+# printed in MANIFEST.txt on every disc.
+#
+# The forgery is then verified the way a reader will, and this fails if any of
+# it comes back damaged: a refusal below that could be explained by a corrupt
+# image would prove nothing about the cross-check. The plaintext side is
+# checked too, by decrypting — a wrong plaintext sidecar is refused a step
+# earlier than the guard under test, and would send every check here down the
+# right path for the wrong reason.
+forge_into_staging() {
+  local st=$1 n=$2 img=$3
+  local base; base=$(printf 'disc%02d.squashfs' "$n")
+  local enc=$st/enc tmp=$st/.forge
+  rm -rf "$tmp"; mkdir -p "$tmp" || return 1
+  [[ -f "$enc/$base.age" ]] || { echo "fixture: $base.age is not in staging to forge over" >&2; return 1; }
+  cp -f "$img" "$tmp/$base" || return 1
+  age -e -R "$RCP" -o "$enc/$base.age" "$tmp/$base" || return 1
+  ( cd "$enc" && sha512sum "$base.age" ) > "$enc/$base.age.sha512" || return 1
+  ( cd "$tmp" && sha512sum "$base" ) > "$enc/$base.sha512" || return 1
+  rm -f "$enc/$base".age*.par2 "$enc/$base.age".copy*
+  ( cd "$enc" && par2 create -q -q -b40 -- "$base.age.par2" "$base.age" ) >/dev/null 2>&1 || return 1
+  rm -rf "$st/restore"
+  ( cd "$enc" && sha512sum -c --quiet "$base.age.sha512" ) >&2 || return 1
+  ( cd "$enc" && par2 verify -q -- "$base.age.par2" ) >/dev/null 2>&1 || return 1
+  rm -f "$tmp/$base"
+  age -d -i "$ID" -o "$tmp/$base" "$enc/$base.age" || return 1
+  ( cd "$tmp" && sha512sum -c --quiet "$enc/$base.sha512" ) >&2 || return 1
+  rm -rf "$tmp"
+}
+
+# forged_copy KIND — a private copy of the multi-disc staging with disc 2's
+# image replaced. Both readers share the copy, one after the other: a refused
+# restore reads staging and writes only its own restore/ directory, which every
+# run below clears first.
+#
+#   alien     — an image holding files the index never heard of. This is the
+#               attack: the genuine index came off a genuine disc, and a forged
+#               image cannot agree with an index its author cannot read.
+#   agreeing  — an image holding exactly the paths the index gives disc 2, with
+#               different contents. This is the forgery the cross-check cannot
+#               catch, and it is asserted to restore rather than to be refused.
+forged_copy() {
+  local kind=$1; local st=$T/xchk-$kind
+  rm -rf "$st"
+  cp -a "$XCHK_SET" "$st" || return 1
+  rm -rf "$st/restore"
+  mkcfg "$T/cfg/xchk-$kind" "$st" "$XCHK_SRC" 'DISC_CAPACITY_BYTES=40000000' 'RESERVE_BYTES=12000000'
+  local rows
+  case $kind in
+    alien)
+      # Two files nobody backed up, and — deliberately — ONE path the index
+      # really does give this disc. The two strangers are what the cross-check
+      # must catch. The third is what makes the --only check below mean
+      # something: both readers ask an image whether it holds the requested
+      # path before they extract it, and an image holding none of it is skipped
+      # without ever being compared with anything. An attacker who wants their
+      # bytes handed to an operator who typed --only names their file after a
+      # file the index says is there, so that is the disc this fixture builds.
+      rows=$(index_rows_for "$XCHK_SET" "$XCHK_N")
+      [[ -n "$rows" ]] || { echo "the index gives disc $XCHK_N no rows at all" >&2; return 1; }
+      # Disjoint from the index in the part that has to be, and asserted rather
+      # than assumed: a stranger that happened to be a name the index gives
+      # disc 2 would weaken the very check this fixture exists for.
+      if grep -qxE 'passwd|authorized_keys' <<<"$rows"; then
+        echo "the index really does give disc $XCHK_N one of the forged names" >&2; return 1
+      fi
+      local one; one=$(head -1 <<<"$rows")
+      if [[ "$one" == *[\\/]* ]]; then
+        echo "disc $XCHK_N's first index row is not the flat unescaped name this fixture assumes" >&2; return 1
+      fi
+      forge_image "$FORGE/img-alien" 'passwd' 'authorized_keys' "$one" || return 1
+      forge_into_staging "$st" "$XCHK_N" "$FORGE/img-alien" || return 1
+      ;;
+    agreeing)
+      local -a rowv=()
+      mapfile -t rowv < <(index_rows_for "$XCHK_SET" "$XCHK_N")
+      (( ${#rowv[@]} >= 2 )) || { echo "the index gives disc $XCHK_N ${#rowv[@]} row(s)" >&2; return 1; }
+      # The rows become literal file names here, so this fixture only holds
+      # where they need no unescaping and name no directories — true of the
+      # blob set, and asserted so that changing that set cannot silently forge
+      # an image full of backslashes.
+      if printf '%s\n' "${rowv[@]}" | grep -q '[\\/]'; then
+        echo "disc $XCHK_N's index rows are not the flat unescaped names this fixture assumes" >&2; return 1
+      fi
+      forge_image "$FORGE/img-agreeing" "${rowv[@]}" || return 1
+      forge_into_staging "$st" "$XCHK_N" "$FORGE/img-agreeing" || return 1
+      ;;
+  esac
+}
+
+# forged_staging_ready KIND — a fixture that failed to build must not let the
+# checks below pass by accident. A restore that dies on a missing config file
+# also exits non-zero and also writes nothing, which is indistinguishable from
+# a guard refusing the disc; the first version of this section proved it, by
+# reporting a clean PASS for a refusal that had never happened.
+forged_staging_ready() {
+  local kind=$1; local st=$T/xchk-$kind
+  local img; img=$(printf 'disc%02d.squashfs.age' "$XCHK_N")
+  [[ -f "$T/cfg/xchk-$kind" && -s "$st/enc/index.tsv.gz.age" && -s "$st/enc/$img" ]] \
+    || { echo "fixture: the $kind staging was never built" >&2; return 1; }
+  # ...and disc $XCHK_N's image really was replaced: the genuine ciphertext is
+  # still there in the set this was copied from, to compare against.
+  ! cmp -s "$XCHK_SET/enc/$img" "$st/enc/$img" \
+    || { echo "fixture: disc $XCHK_N's image in the $kind staging is the genuine one" >&2; return 1; }
+}
+
+# alien_refused sh|go LOGNAME [restore args...] — the forged disc is refused,
+# and nothing the attacker chose is written.
+#
+# The destination is NOT empty afterwards and must not be asserted to be: disc
+# 1 is genuine and is extracted before the forged disc is reached. What is
+# asserted is that none of the forged image's own files came out, which is the
+# property an operator is harmed by losing.
+alien_refused() {
+  local who=$1 lf=$LOG/$2; shift 2
+  local dest=$T/out-xchk-alien-$who rc=0 n
+  forged_staging_ready alien || return 1
+  rm -rf "$dest" "$T/xchk-alien/restore"; mkdir -p "$dest"
+  restore_from "$T/cfg/xchk-alien" "$who" "$dest" "$lf" "$@" || rc=$?
+  (( rc != 0 )) || { echo "extracted a disc whose image holds nothing the index gives it" >&2; return 1; }
+  n=$(find "$dest" \( -name passwd -o -name authorized_keys \) | wc -l)
+  (( n == 0 )) || { echo "$n file(s) the forged image chose landed in the destination" >&2; return 1; }
+}
+
+# alien_refused_only sh|go — --only narrows the EXTRACTION, not the disc. The
+# path asked for is one the index gives the forged disc AND one the forged
+# image holds, so nothing narrows this disc away: both readers ask the image
+# whether it holds the requested path, this one says yes, and without the
+# cross-check the run ends 0 having written the attacker's version of a file
+# the operator asked for by name. That is the whole attack in miniature, and it
+# is why this check does not settle for a non-zero exit: it requires that the
+# requested path was not written either.
+alien_refused_only() {
+  local who=$1; local lf=$LOG/xchk-alien-only-$who.log one
+  one=$(index_rows_for "$XCHK_SET" "$XCHK_N" | head -1)
+  [[ -n "$one" ]] || { echo "the index gives disc $XCHK_N no rows to ask for" >&2; return 1; }
+  alien_refused "$who" "xchk-alien-only-$who.log" --only "$one" || return 1
+  local dest=$T/out-xchk-alien-$who
+  [[ ! -e "$dest/$one" ]] \
+    || { echo "refused, but the forged $one was written to the destination anyway" >&2; return 1; }
+}
+
+# agreeing_extracts sh|go — the documented limit, asserted as a pass. The
+# forged image is extracted, and what lands is the forgery's content and not
+# the backup's: a check that merely exited 0 could be a restore that did
+# nothing at all.
+agreeing_extracts() {
+  local who=$1; local dest=$T/out-xchk-agreeing-$who one
+  forged_staging_ready agreeing || return 1
+  rm -rf "$dest" "$T/xchk-agreeing/restore"; mkdir -p "$dest"
+  restore_from "$T/cfg/xchk-agreeing" "$who" "$dest" "$LOG/xchk-agreeing-$who.log" || return 1
+  one=$(index_rows_for "$XCHK_SET" "$XCHK_N" | head -1)
+  [[ -n "$one" && -s "$dest/$one" ]] || { echo "${one:-the first row} was not extracted at all" >&2; return 1; }
+  if cmp -s "$XCHK_SRC/$one" "$dest/$one"; then
+    echo "fixture: $one came back identical to the source, so nothing was forged" >&2; return 1
+  fi
+}
+
+if (( n_m >= 2 )); then
+  assert0 "fixture: disc $XCHK_N's image replaced by one holding files the index never names, with sidecars and par2 regenerated over it" \
+    forged_copy alien
+  for who in sh go; do
+    case $who in sh) name="brb.sh" ;; go) name="go brb" ;; esac
+    assert0 "$name refuses disc $XCHK_N when its image is not what the index says that disc holds" \
+      alien_refused "$who" "xchk-alien-$who.log"
+    assert0 "  ... and says the image and the index disagree" \
+      grep -qiE "$XCHK_RX" "$LOG/xchk-alien-$who.log"
+    assert0 "$name refuses it under --only too, which narrows the extraction and not the disc" \
+      alien_refused_only "$who"
+  done
+  unset name
+
+  assert0 "fixture: disc $XCHK_N's image replaced by one holding exactly the paths the index gives that disc" \
+    forged_copy agreeing
+  for who in sh go; do
+    case $who in sh) name="brb.sh" ;; go) name="go brb" ;; esac
+    # Not a bug and not an oversight: with one disc forged in both halves there
+    # is nothing left to compare it against. Written down so the section above
+    # cannot be read as claiming more than it does.
+    assert0 "$name extracts a forgery whose files agree with the index — the limit this guard does not cover" \
+      agreeing_extracts "$who"
+  done
+  unset name
+else
+  skip "the forged-image cross-check (both readers)" \
+       "the multi-disc set in section 8 has fewer than two discs, so no disc can be forged behind a genuine one"
+fi
+
+# ---- a name with a newline degrades the check, and never refuses -----------
+# 'unsquashfs -ll' is line-based, so a file called "new<newline>line.txt" is
+# listed as two half-lines and no line-based listing can carry it faithfully —
+# which is why the index has an escaping contract at all. The cross-check has
+# to notice that and say so, and must NOT refuse: a backup tool that cannot
+# restore a legitimate set is worse than one that misses an exotic attack. The
+# set built in section 3 carries exactly that name.
+nl_restores() { # nl_restores sh|go
+  local who=$1; local st=$T/nl-$who dest=$T/out-nl-$who cfg=$T/cfg/nl-$who
+  rm -rf "$st" "$dest"; mkdir -p "$dest"
+  cp -a "$T/stage-idx" "$st" || return 1
+  rm -rf "$st/restore"
+  mkcfg "$cfg" "$st" "$IDXSRC"
+  restore_from "$cfg" "$who" "$dest" "$LOG/nl-$who.log" || return 1
+  diff -r --no-dereference "$IDXSRC" "$dest" >&2
+}
+for who in sh go; do
+  case $who in sh) name="brb.sh" ;; go) name="go brb" ;; esac
+  assert0 "$name still restores a set holding a filename with a newline, byte-identical" nl_restores "$who"
+  assert0 "  ... having said the cross-check could not be made exact for that disc" \
+    grep -qiE "$DEGRADE_RX" "$LOG/nl-$who.log"
+done
+unset name
+
+# ---- the index is pinned at ingest ----------------------------------------
+if (( HAVE_SCRIPT )); then
+  ingest_disc() { # ingest_disc sh|go CFG MOUNTPOINT LOGFILE
+    case $1 in
+      # As in section 9: brb.sh asks twice per disc and takes 'q' to stop, the
+      # Go build asks for Enter and then confirms "Another disc?".
+      sh) run_pty "$4" $'\nq\n' "bash '$BRB_SH' -c '$2' ingest '$3'" ;;
+      go) run_pty "$4" $'\n\n'  "'$BRB_GO' --no-color -c '$2' ingest '$3'" ;;
+    esac
+  }
+
+  # The false-refusal side of the pin, written first because it is the one that
+  # matters most: every disc of one set carries the identical index, so
+  # ingesting a whole set disc by disc into one staging area must be completely
+  # untouched by this. An implementation that pinned too eagerly would refuse
+  # its own disc 2 here, and a set nobody can ingest is a worse outcome than
+  # the forgery the pin exists for.
+  ingest_whole_set() { # ingest_whole_set sh|go
+    local who=$1; local st=$T/ing-m-$who cfg=$T/cfg/ing-m-$who d n=0
+    rm -rf "$st"; mkdir -p "$st/enc"
+    mkcfg "$cfg" "$st" "$XCHK_SRC" 'DISC_CAPACITY_BYTES=40000000' 'RESERVE_BYTES=12000000'
+    for d in "$XCHK_SET"/discs/disc*; do
+      n=$((n+1))
+      ingest_disc "$who" "$cfg" "$d" "$LOG/ing-m-$who-$(basename "$d").log" \
+        || { echo "$(basename "$d") of a single set was refused" >&2; return 1; }
+    done
+    (( n == n_m )) || { echo "walked $n disc(s) of a $n_m-disc set" >&2; return 1; }
+    (( $(find "$st/enc" -maxdepth 1 -name 'disc*.squashfs.age' | wc -l) == n_m )) \
+      || { echo "staging holds fewer than $n_m image(s) after ingesting them all" >&2; return 1; }
+    cmp -s "$st/enc/index.tsv.gz.age" "$XCHK_SET/enc/index.tsv.gz.age"
+  }
+  restore_ingested_set() { # restore_ingested_set sh|go
+    local who=$1; local dest=$T/out-ing-m-$who
+    rm -rf "$dest" "$T/ing-m-$who/restore"; mkdir -p "$dest"
+    restore_from "$T/cfg/ing-m-$who" "$who" "$dest" "$LOG/restore-ing-m-$who.log" || return 1
+    diff -r --no-dereference "$XCHK_SRC" "$dest" >&2
+  }
+
+  # And the refusal. Two sets, each internally consistent — every hash, every
+  # sidecar and every par2 set on both discs is genuine — ingested into one
+  # staging area. Their indexes differ, and that is the only thing wrong with
+  # the pair: it is either two sets being mixed or one of the discs is not what
+  # it claims, and neither is something to warn about and carry on from.
+  #
+  # Note which staged copy has to survive. The disc's SHA512SUMS records a hash
+  # for its own index, so the reconciliation that ran before this guard existed
+  # took the second disc's index for "this disc's verified copy" and REPLACED
+  # the pinned one with it. "Refused" therefore has to mean the staged bytes did
+  # not move, not merely that something was printed.
+  ingest_foreign_index_refused() { # ingest_foreign_index_refused sh|go
+    local who=$1; local st=$T/ing-mix-$who cfg=$T/cfg/ing-mix-$who
+    rm -rf "$st"; mkdir -p "$st/enc"
+    mkcfg "$cfg" "$st" "$SRC"
+    ingest_disc "$who" "$cfg" "$GOD" "$LOG/ing-mix-first-$who.log" \
+      || { echo "the first disc, of an ordinary set, was refused" >&2; return 1; }
+    cmp -s "$st/enc/index.tsv.gz.age" "$T/stage-go/enc/index.tsv.gz.age" \
+      || { echo "fixture: the first disc's index is not what landed in staging" >&2; return 1; }
+    if ingest_disc "$who" "$cfg" "$XCHK_SET/discs/disc01" "$LOG/ing-mix-$who.log"; then
+      echo "a disc carrying another set's index was accepted" >&2; return 1
+    fi
+    cmp -s "$st/enc/index.tsv.gz.age" "$T/stage-go/enc/index.tsv.gz.age" \
+      || { echo "the pinned index was overwritten by the other disc's" >&2; return 1; }
+  }
+
+  indexes_really_differ() { ! cmp -s "$T/stage-go/enc/index.tsv.gz.age" "$XCHK_SET/enc/index.tsv.gz.age"; }
+  assert0 "fixture: the reference set and the multi-disc set carry different encrypted indexes" indexes_really_differ
+
+  for who in sh go; do
+    case $who in sh) name="brb.sh" ;; go) name="go brb" ;; esac
+    assert0 "$name ingests all $n_m discs of one set into one staging area — the same index on each is not a conflict" \
+      ingest_whole_set "$who"
+    assert0 "  ... and the set that came off those discs restores byte-identical to the source" \
+      restore_ingested_set "$who"
+    assert0 "$name refuses a disc whose index differs from the one already staged, and leaves the staged index alone" \
+      ingest_foreign_index_refused "$who"
+    assert0 "  ... naming the index as the reason" grep -qiE "$PIN_RX" "$LOG/ing-mix-$who.log"
+  done
+  unset name
+else
+  skip "the pinned index at ingest (both readers)" \
+       "script(1) is not installed; ingest reads its disc prompts from /dev/tty and cannot be driven from a pipe"
 fi
 
 printf '\n%d passed, %d failed, %d xfail (known divergences), %d skipped\n' \

@@ -12,6 +12,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -231,12 +232,15 @@ func Restore(ctx context.Context, o Options, ro RestoreOptions) error {
 			}
 		}
 
-		// The destination may already hold a symlink at a path this image
-		// holds as a directory — planted, or an honest one under a live $HOME
-		// — and unsquashfs -f applies the archive directory's mode, owner and
-		// times through it to whatever it points at. Refused per image,
-		// against this image's own directory list.
-		if err := o.refuseSymlinksAtImageDirs(ctx, plain, ro.Dest, here); err != nil {
+		// One listing of this image, two refusals taken off it. The
+		// destination may already hold a symlink at a path this image holds as
+		// a directory — planted, or an honest one under a live $HOME — and
+		// unsquashfs -f applies the archive directory's mode, owner and times
+		// through it to whatever it points at. And the image itself may not be
+		// the one the set's index describes, which is how a disc forged
+		// against the set's PUBLIC recipient key gets extracted into the
+		// destination. Both are refused per image, before a byte is written.
+		if err := o.auditImage(ctx, plain, ro.Dest, here, im.N); err != nil {
 			return err
 		}
 
@@ -405,7 +409,7 @@ func (o Options) confirmNonEmptyDest(dest string) error {
 // the destination. A symlink to a file, or a dangling one, is left alone here:
 // at a path the archive holds as a file unsquashfs unlinks and replaces it as
 // an entry, which is safe, and at a path the archive holds as a directory it
-// is caught per image by refuseSymlinksAtImageDirs, which knows which paths
+// is caught per image by the symlink half of auditImage, which knows which paths
 // those are. Within one run this needs checking only before the first image:
 // the skeleton on every disc makes a path either a directory or a leaf across
 // the whole set, so nothing a disc extracts turns into a traversal for the
@@ -518,7 +522,27 @@ func (o Options) extractImage(ctx context.Context, image, dest string, only []st
 // trailing '\r' is part of a name. A name holding '\n' cannot survive a
 // line-based listing; the second half of it will fail to parse and be skipped.
 func listedDir(line string) (string, bool) {
-	if !strings.HasPrefix(line, "d") {
+	return listedEntry(line, 'd')
+}
+
+// listedFile turns one line of an "unsquashfs -ll" listing into an
+// archive-relative REGULAR FILE path, and answers ok=false for everything else
+// — a directory, a symlink, a device, a fifo, a socket, or chatter.
+//
+// Regular files are the only entries the index and an image can be compared
+// over, because they are the only entries the index has: every other kind is
+// skeleton, replicated onto every disc of the set (see [discRows]). A hard link
+// is listed as a regular file under each of its names, which is also how the
+// index carries it — pack.Unit keeps every name of one inode on the same disc —
+// so link groups compare equal without a special case.
+func listedFile(line string) (string, bool) {
+	return listedEntry(line, '-')
+}
+
+// listedEntry is the shared field walk behind [listedDir] and [listedFile],
+// selecting on the type character the mode field opens with.
+func listedEntry(line string, kind byte) (string, bool) {
+	if len(line) == 0 || line[0] != kind {
 		return "", false
 	}
 	rest := line
@@ -553,9 +577,18 @@ func extractionTouches(only []string, dir string) bool {
 	return false
 }
 
-// refuseSymlinksAtImageDirs fails when the destination already holds a symlink
-// — to anything, or to nothing — at a path this image holds as a directory
-// and is about to extract.
+// auditImage runs the two per-image read-side guards off the ONE
+// "unsquashfs -ll" pass they share, and refuses the disc if either fails.
+//
+// One pass, because a listing of a 100 GB image is not a thing to ask for
+// twice: the guards want different lines out of the same stream — the
+// destination-symlink guard wants the archive's directories, the index
+// cross-check wants its regular files — so they read it together.
+//
+// # Guard 1: a symlink in the destination where the image has a directory
+//
+// It fails when the destination already holds a symlink — to anything, or to
+// nothing — at a path this image holds as a directory and is about to extract.
 //
 // refuseSymlinkedDirs catches a link that resolves to a directory, which is the
 // traversal case. This is the other case: a link that resolves to a file, or
@@ -588,7 +621,70 @@ func extractionTouches(only []string, dir string) bool {
 // narrowing it safely would mean covering every ancestor of every --only path
 // as well as everything under it. TestRestoreOnlyDoesNotExemptADirectorySymlink
 // pins it.
-func (o Options) refuseSymlinksAtImageDirs(ctx context.Context, image, dest string, only []string) error {
+//
+// # Guard 2: an image that is not the one the index describes (RVW-008)
+//
+// age encrypts to a PUBLIC key, and MANIFEST.txt on every disc prints the
+// recipients the set was encrypted to. Anyone who gets one disc can therefore
+// build a squashfs image of their own choosing, encrypt it to that key, compute
+// its .sha512 sidecars and par2 volumes and write a SHA512SUMS over the lot.
+// Every check on the read path passed such a disc: it decrypts, it verifies, it
+// par2s clean, and unsquashfs -f writes the attacker's tree into the operator's
+// destination. Nothing asked whether the disc belonged to the operator's SET.
+//
+// The attacker holds the public key and not the private one, and the mitigation
+// is shaped by what that does and does not let them do:
+//
+//   - They CAN copy the genuine index.tsv.gz.age from a real disc onto a forged
+//     one, byte for byte; copying ciphertext needs no key. So pinning the index
+//     across discs (reconcileIndex, at ingest) does not catch them on its own.
+//   - They CANNOT READ that index, so they cannot know which paths it says their
+//     disc carries, and cannot make a forged image agree with it. Having been
+//     forced by the pin to ship the genuine index, they are caught here.
+//
+// So: the set of regular-file paths the image holds must equal the set of paths
+// the index puts on that disc. Neither half of the pair is worth anything
+// alone.
+//
+// What this is NOT, stated plainly because overselling it is worse than not
+// having it:
+//
+//   - It is not a signature. Real sender authentication needs a signing key,
+//     and the on-disc format does not have one. This detects that the discs of
+//     a set DISAGREE, nothing more.
+//   - It does not say which disc is lying. The index is pinned from the FIRST
+//     disc ingested, so if that one was the forgery, the genuine discs are the
+//     ones refused. The operator is told the set disagrees with itself and has
+//     to decide — which is still far better than silently extracting an
+//     attacker's tree.
+//   - It gives NO protection when a single disc is involved and that disc is
+//     the forgery: the attacker controls the image and the index both, and a
+//     self-consistent pair is all this compares.
+//
+// Only REGULAR FILES are compared, and only because they are the only entries
+// the index has — see [discRows] and [listedFile]. --only narrows what is
+// extracted, never what is compared: the image still holds the whole disc, so
+// the whole image is judged against the whole of that disc's index rows
+// whatever the operator asked for.
+//
+// The comparison degrades to a loud warning rather than a refusal whenever it
+// cannot be made exact — no index, an index that will not read, a name holding
+// a newline, a listing that will not parse. A backup tool that cannot restore a
+// legitimate set is worse than one that misses an exotic attack. See
+// [Options.crossCheckRows].
+func (o Options) auditImage(ctx context.Context, image, dest string, only []string, disc int) error {
+	name := filepath.Base(image)
+	// Read before the listing starts: the index is small, and a disc that
+	// cannot be cross-checked at all should say so before minutes of listing.
+	rows := o.crossCheckRows(ctx, disc, name)
+	// want is consumed as the listing goes past, so only the index's side is
+	// ever held in memory — the image's million entries stream through it, and
+	// whatever is left at the end is what the index has and the image does not.
+	var want map[string]bool
+	if rows != nil {
+		want = rows.paths
+	}
+
 	pr, pw := io.Pipe()
 	done := make(chan error, 1)
 	go func() {
@@ -598,6 +694,8 @@ func (o Options) refuseSymlinksAtImageDirs(ctx context.Context, image, dest stri
 	}()
 
 	var bad []string
+	var extra []string
+	extraN, matched, unparsed := 0, 0, 0
 	sc := bufio.NewScanner(pr)
 	sc.Buffer(make([]byte, 0, 64<<10), maxIndexLine)
 	sc.Split(scanLinesKeepCR)
@@ -609,19 +707,49 @@ func (o Options) refuseSymlinksAtImageDirs(ctx context.Context, image, dest stri
 				return err
 			}
 		}
-		rel, ok := listedDir(sc.Text())
-		if !ok || !extractionTouches(only, rel) {
+		line := sc.Text()
+		if rel, ok := listedDir(line); ok {
+			if !extractionTouches(only, rel) {
+				continue
+			}
+			p := filepath.Join(dest, filepath.FromSlash(rel))
+			fi, err := os.Lstat(p)
+			if err != nil || fi.Mode()&fs.ModeSymlink == 0 {
+				continue
+			}
+			target, _ := os.Readlink(p)
+			bad = append(bad, fmt.Sprintf("%s -> %s", p, target))
+			// Five named links are enough to act on. Stopping early is only
+			// safe while nothing else needs the rest of the listing; the
+			// cross-check needs all of it, or every unread file would look
+			// like one the image does not hold.
+			if len(bad) >= maxNamedSamples && want == nil {
+				break
+			}
 			continue
 		}
-		p := filepath.Join(dest, filepath.FromSlash(rel))
-		fi, err := os.Lstat(p)
-		if err != nil || fi.Mode()&fs.ModeSymlink == 0 {
+		if want == nil {
 			continue
 		}
-		target, _ := os.Readlink(p)
-		bad = append(bad, fmt.Sprintf("%s -> %s", p, target))
-		if len(bad) >= 5 {
-			break
+		if rel, ok := listedFile(line); ok {
+			if want[rel] {
+				delete(want, rel)
+				matched++
+				continue
+			}
+			extraN++
+			if len(extra) < maxNamedSamples {
+				extra = append(extra, rel)
+			}
+			continue
+		}
+		if len(line) > 0 && line[0] == '-' {
+			// A line that opens like a file entry and does not yield a path
+			// under squashfs-root/. No name can produce one — a '\n' in a name
+			// splits the line, but the fragment that carries the mode still
+			// parses — so this is a listing format this parser does not know,
+			// and the file list read off the image is not the whole of it.
+			unparsed++
 		}
 	}
 	// Drain and close so the child is never left writing into a full pipe, then
@@ -629,18 +757,107 @@ func (o Options) refuseSymlinksAtImageDirs(ctx context.Context, image, dest stri
 	_, _ = io.Copy(io.Discard, pr)
 	pr.Close()
 	if err := <-done; err != nil {
-		return fmt.Errorf("restore: listing the directories of %s: %w", filepath.Base(image), err)
+		return fmt.Errorf("restore: listing the directories of %s: %w", name, err)
 	}
 	if err := sc.Err(); err != nil {
-		return fmt.Errorf("restore: reading the listing of %s: %w", filepath.Base(image), err)
+		return fmt.Errorf("restore: reading the listing of %s: %w", name, err)
 	}
 	if len(bad) > 0 {
 		return fmt.Errorf("restore: %s holds symlink(s) where %s has directories (%s); unsquashfs -f would apply the "+
 			"backup's directory mode, owner and times THROUGH them to whatever they point at — "+
 			"remove them, or restore into an empty directory and merge by hand",
-			dest, filepath.Base(image), strings.Join(bad, ", "))
+			dest, name, strings.Join(bad, ", "))
 	}
-	return nil
+	if want == nil {
+		return nil
+	}
+	if unparsed > 0 {
+		o.warnUncheckedAgainstIndex(name, fmt.Sprintf("%d line(s) of its 'unsquashfs -ll' listing do not parse as entries, "+
+			"so the file list read off the image is not the whole of it", unparsed))
+		return nil
+	}
+	return o.crossCheckVerdict(name, disc, matched, extraN, extra, want)
+}
+
+// maxNamedSamples bounds how many offending paths a refusal prints. An image
+// that disagrees with the index disagrees about every file in it — ten thousand
+// lines of proof help nobody, and five name the problem.
+const maxNamedSamples = 5
+
+// crossCheckVerdict turns the tally [Options.auditImage] took off the listing
+// into either silence or the refusal RVW-008 is about.
+func (o Options) crossCheckVerdict(name string, disc, matched, extraN int, extra []string, missing map[string]bool) error {
+	if extraN == 0 && len(missing) == 0 {
+		o.UI.Step("%s matches the index: %d file(s), exactly the ones it puts on disc %d", name, matched, disc)
+		return nil
+	}
+	var parts []string
+	if extraN > 0 {
+		parts = append(parts, fmt.Sprintf("%d file(s) are in the image and not in the index's list for disc %d (%s)",
+			extraN, disc, quoteVisible(extra)))
+	}
+	if len(missing) > 0 {
+		parts = append(parts, fmt.Sprintf("%d file(s) are in that list and not in the image (%s)",
+			len(missing), quoteVisible(firstSorted(missing, maxNamedSamples))))
+	}
+	return fmt.Errorf("restore: %s does not match the index: %s — every disc of one set carries the same index, and the "+
+		"staged one is pinned at ingest from the first disc read, so either this image does not belong to that set or that "+
+		"index does not. Nothing was extracted from it. Which of the two is lying cannot be told from here: if the disc "+
+		"ingested first was the substituted one, this refusal names the genuine discs. Ingest the set again into an empty "+
+		"staging directory, and see which disc disagrees with the rest",
+		name, strings.Join(parts, "; "))
+}
+
+// crossCheckRows fetches what the index says disc n holds, or nil when the
+// comparison cannot be made — in which case it says so, loudly, once per image.
+//
+// Every one of these is a degradation and not a refusal, for the reason on
+// [Options.auditImage]: a set whose index rotted, or a set written before there
+// was an index, or a set holding a file with a newline in its name must still
+// restore. Each of them leaves the operator without this guard for that disc,
+// so each of them says exactly that rather than passing in silence.
+func (o Options) crossCheckRows(ctx context.Context, n int, name string) *discRows {
+	if n == 0 {
+		// Only reachable for an image this program did not name, since
+		// selectImages reads the number out of the file name.
+		o.warnUncheckedAgainstIndex(name, "its file name does not say which disc of the set it is")
+		return nil
+	}
+	rows, err := o.indexRowsForDisc(ctx, n)
+	switch {
+	case errors.Is(err, errNoIndex):
+		o.warnUncheckedAgainstIndex(name, fmt.Sprintf("there is no %s in %s, so nothing here can say what disc %d should hold",
+			indexName, o.dirs().Enc, n))
+		return nil
+	case err != nil:
+		o.warnUncheckedAgainstIndex(name, fmt.Sprintf("the index would not read (%v)", err))
+		return nil
+	case rows.inexact != "":
+		o.warnUncheckedAgainstIndex(name, rows.inexact)
+		return nil
+	}
+	return rows
+}
+
+// warnUncheckedAgainstIndex is the one place the degradation is announced, so
+// that its wording is identical whatever the reason and a suite — or an
+// operator — can grep for it. brb.sh prints the same sentence.
+func (o Options) warnUncheckedAgainstIndex(name, why string) {
+	o.UI.Warn("%s was NOT checked against the index: %s — an image substituted for this disc would not be caught", name, why)
+}
+
+// firstSorted names up to n of a path set, in sorted order so that two runs
+// over the same staging area produce the same message.
+func firstSorted(set map[string]bool, n int) []string {
+	out := make([]string, 0, len(set))
+	for p := range set {
+		out = append(out, p)
+	}
+	sort.Strings(out)
+	if len(out) > n {
+		out = out[:n]
+	}
+	return out
 }
 
 // pathRestored reports whether a requested archive path now exists under dest.

@@ -934,6 +934,78 @@ ingest_public_identity() {  # ingest_public_identity MOUNTPOINT
   step "staged the archive's published key as $dst — this set opens with nothing but the discs"
 }
 
+# refuse_foreign_index MOUNTPOINT — the index staged from the FIRST disc is the
+# one this staging area belongs to, and a later disc carrying a different one
+# is refused rather than merged.
+#
+# WHY THIS EXISTS, AND WHAT IT IS HALF OF. age encrypts to a PUBLIC key, and
+# MANIFEST.txt on every disc names the recipients the set was encrypted to. So
+# anyone who gets hold of one disc can build a squashfs image of their own
+# choosing, encrypt it to that same public key, write the .sha512 sidecars, the
+# par2 volumes and a SHA512SUMS over the lot, and hand back a disc that
+# decrypts, verifies clean, repairs clean, and is extracted by `unsquashfs -f`
+# straight into the operator's destination. Nothing else on the read path ever
+# asks whether a disc belongs to the operator's SET.
+#
+# What the forger does NOT have is the private key, and that cuts two ways:
+#
+#   They CAN copy the genuine index.tsv.gz.age off a real disc onto their
+#   forgery, byte for byte — copying ciphertext needs no key at all. Comparing
+#   the index across discs therefore catches nothing on its own.
+#
+#   They CANNOT read it. So they cannot know which paths it says their disc
+#   carries, and cannot make a forged image agree with it.
+#
+# This function is the first half: it pins the index, which forces a forger
+# down the first road — ship the genuine index, or be refused here. The second
+# half, refuse_foreign_image below, then holds the image to what that index
+# says. Neither half is worth anything without the other.
+#
+# WHAT IT DOES NOT DO. It detects that the discs of a set DISAGREE. It cannot
+# say which of them is lying: ingest the forgery first and its index becomes
+# the pinned one, and the genuine discs are what gets refused. It is not a
+# signature, and this format has no signing key to make it one — nothing here
+# authenticates a disc, it only holds a set to being self-consistent.
+#
+# WHY A REFUSAL AND NOT THE USUAL "keeping the staged copy". Every disc of one
+# set carries the identical index, because the writer copies one file onto all
+# of them; two that differ mean either two sets are being ingested into one
+# staging area — where their same-named images would then be taken for damaged
+# copies of each other — or one of the discs is not from this set. Both are
+# things the operator must decide, and both are exactly the shape the published
+# key already refuses a few lines above. The keep-both behaviour is deliberately
+# left alone for IMAGES: two partially rotted pressings of one image are
+# combined by par2 on purpose, which is a different situation entirely.
+#
+# ROT IS NOT DISAGREEMENT, and this is the one nuance that keeps a legitimate
+# restore working: a disc whose own SHA512SUMS (or index sidecar) says its
+# index is not the bytes it should be is DAMAGED, not different, so it is left
+# to ingest_one, which keeps the staged copy and counts the bad file. Only a
+# copy the disc itself vouches for — or one with no recorded hash at all, where
+# nothing says it is damaged — is read as a second, disagreeing index.
+#
+# The cost is that ingest no longer silently heals a staged index that has
+# rotted, because "replace the staged index with this disc's" is precisely the
+# substitution a forger wants. The message below says so, and says how to do it
+# on purpose.
+#
+# Runs before any data file is staged, so a refused disc leaves nothing behind.
+refuse_foreign_index() {  # refuse_foreign_index MOUNTPOINT
+  local mp="$1" src="$1/data/index.tsv.gz.age" dst="$ENC_DIR/index.tsv.gz.age" want
+  [[ -f "$src" && -f "$dst" ]] || return 0
+  cmp -s -- "$src" "$dst" && return 0
+  # The same two witnesses cmd_ingest uses for every other file, in the same
+  # order: the disc's SHA512SUMS, then the per-file sidecar beside it.
+  want="${DISC_SUMS[data/index.tsv.gz.age]:-}"
+  if [[ -z "$want" && -f "$src.sha512" ]]; then want="$(awk '{print tolower($1); exit}' "$src.sha512")"; fi
+  if [[ -n "$want" && "$(sha512_of "$src")" != "$want" ]]; then
+    warn "the index on this disc differs from the staged one, but does not match the hash this disc records for it either — reading that as rot on this disc, not as a second set"
+    return 0
+  fi
+  unmount_disc
+  die "the disc at $(esc_str "$mp") carries a different index (index.tsv.gz.age) from the one already in $dst, and every disc of one set carries the identical index: either two different sets are being ingested into one staging area, or one of these discs is not from your set. Nothing from this disc has been staged. Ingest each set into a STAGING of its own; if instead the STAGED index is the rotted one, $(sidecar_repair_hint 0), or delete $dst and ingest this disc again to take its copy."
+}
+
 # refuse_escaping_sums MOUNTPOINT — every name in a disc's SHA512SUMS has to be
 # a path ON that disc, or the one command whose whole job is the integrity claim
 # is not making it.
@@ -1133,6 +1205,11 @@ cmd_ingest() {
     # before any of its same-named files can be taken for damaged copies of
     # this set's.
     ingest_public_identity "$mp" || bad=$(( bad + 1 ))
+    # And the index second, for the same reason and by the same rule: it is the
+    # one file every disc of a set carries identically, so a disc whose copy
+    # disagrees is either from another set or forged. Both checks run before a
+    # single data file is copied, so a refused disc leaves staging untouched.
+    refuse_foreign_index "$mp"
     while IFS= read -r f; do
       base="${f##*/}"
       want="${DISC_SUMS[data/$base]:-}"
@@ -1473,45 +1550,105 @@ refuse_symlinked_dirs() {
 # plant a link in the destination, and it takes both to slip past it.
 #
 # The listing IS the guard, so this fails closed on anything that would leave
-# it with nothing to compare. It used to run the listing with stderr on
-# /dev/null and never look at the exit status: a listing that failed, or one
-# whose format had drifted past the parse, produced an empty directory list —
-# and an empty list is indistinguishable from "this image holds no directories
-# a link could be planted at", so the guard returned 0 and the restore went
-# ahead unguarded, looking exactly like a guard that had run. Now the exit
-# status is checked, the number of listing lines the parse recognised is
-# checked, and either one failing stops the restore by name.
-#
-# The listing is read whole rather than streamed for one reason: its exit
-# status has to be taken before a single line of it is believed, and at the
-# head of a pipeline that status is the easiest thing in shell to drop.
+# it with nothing to compare (see list_image, which is where that failing is
+# now done).
 refuse_symlinks_at_dirs() {  # refuse_symlinks_at_dirs IMAGE DEST [ONLY]
   local img="$1" d only="${3:-}"
   d="$(dir_path "$2")"; [[ -n "$d" ]] || d="/"
   local -a bad=()
-  local p
+  local p e
   # A destination that is itself a link is caught above; the belt to that
   # brace, so this guard is complete on its own.
   [[ -L "$d" ]] && bad+=( "$(esc_str "$d")" )
 
+  # One listing per image, shared with the cross-check below; a second call for
+  # the same image costs nothing.
+  list_image "$img"
+
+  for e in ${IMAGE_ENTRIES[@]+"${IMAGE_ENTRIES[@]}"}; do
+    [[ "${e:0:1}" == "d" ]] || continue
+    p="${e:1}"
+    if [[ -n "$only" ]] && ! extraction_touches "$only" "$p"; then continue; fi
+    [[ -L "$d/$p" ]] || continue
+    bad+=( "$(esc_str "$d/$p -> $(readlink -- "$d/$p" 2>/dev/null || true)")" )
+    (( ${#bad[@]} < 5 )) || break
+  done
+  if (( ${#bad[@]} == 0 )); then return 0; fi
+  local list; list="$(printf '%s, ' "${bad[@]}")"; list="${list%, }"
+  die "$d holds symlink(s) where $(esc_str "${img##*/}") has directories ($list); unsquashfs -f would apply the backup's directory mode, owner and times THROUGH them to whatever they point at — remove them, or restore into an empty directory and merge by hand"
+}
+
+# One image, listed once. Two guards need that listing — the symlink guard
+# above needs the paths the image holds as DIRECTORIES, and refuse_foreign_image
+# below needs the paths it holds as REGULAR FILES — and an image is a whole
+# disc, so asking `unsquashfs -ll` the second question separately would be a
+# second pass over 25 GB. Both call this; the second call is a no-op.
+#
+# What it leaves behind, for the image named in IMAGE_LISTED:
+#
+#   IMAGE_ENTRIES  one line per entry the parse recognised and kept, tagged by
+#                  its first character, because a path may contain anything at
+#                  all — spaces, tabs, a leading 'd' — and a tag character is
+#                  the only prefix that cannot be mistaken for part of one:
+#                    d<path>  a directory, archive-relative
+#                    f<path>  a regular file, archive-relative and escaped
+#                             exactly as the index escapes a path (backslash
+#                             first, then tab — indexfmt.EscapePath), so the
+#                             cross-check compares one spelling with itself
+#                  The archive root itself is recognised but kept out: it is
+#                  the destination directory, not an entry inside it.
+#   IMAGE_STRAY    how many listing lines the parse did NOT recognise. Zero for
+#                  every listing this format produces, because `unsquashfs -ll`
+#                  writes nothing to stdout but entries — so a non-zero count
+#                  means either a name that a line-based listing cannot carry
+#                  (a newline in a filename splits its entry over two lines,
+#                  and this project supports such names on purpose) or an
+#                  unsquashfs whose output has drifted. Either way the file
+#                  list is no longer known to be complete, which is why the
+#                  cross-check degrades to a warning rather than refusing on it.
+#
+# The parse is the one listedDir makes in go/internal/restore/extract.go rather
+# than an anchored date-and-time regex: the line is "<mode> <user>/<group>
+# <size> <date> <time> <path>", so the path is everything after the single
+# space that follows the fifth field, whatever it contains, and neither a
+# padded size column nor a differently formatted timestamp can push a real
+# entry out of the list. Nothing is trimmed off the end: a trailing '\r' is
+# part of a name. Only '-' entries are files: a symlink's line ends in
+# " -> target", which is why they are not comparable to an index row and why
+# every disc's replicated skeleton of directories, symlinks and specials stays
+# out of the cross-check entirely.
+#
+# This fails closed. It used to run the listing with stderr on /dev/null and
+# never look at the exit status: a listing that failed, or one whose format had
+# drifted past the parse, produced an empty list — and an empty list is
+# indistinguishable from "this image holds no directories a link could be
+# planted at", so the guard returned 0 and the restore went ahead unguarded,
+# looking exactly like a guard that had run. Now the exit status is checked and
+# so is the number of lines the parse recognised, and either one failing stops
+# the restore by name.
+#
+# The listing is read whole rather than streamed for one reason: its exit
+# status has to be taken before a single line of it is believed, and at the
+# head of a pipeline that status is the easiest thing in shell to drop.
+#
+# So the whole listing sits in memory, as it already did, and the entries
+# parsed out of it sit beside it — a disc holding a million files costs a few
+# hundred megabytes here for as long as one image is being prepared. That is
+# the price of not reading the image a second time, and it is paid per image,
+# not per set.
+IMAGE_ENTRIES=()
+IMAGE_STRAY=0
+IMAGE_LISTED=""
+list_image() {  # list_image IMAGE
+  [[ "$IMAGE_LISTED" == "$1" ]] && return 0
+  local img="$1" listing="" rc=0 summary last
   # unsquashfs's own stderr is deliberately NOT silenced: when this dies, the
   # reason it gives should be readable next to what the tool itself said.
-  local listing="" rc=0
   listing="$(unsquashfs -ll "$img")" || rc=$?
-  (( rc == 0 )) || die "could not list the directories of $(esc_str "${img##*/}"): 'unsquashfs -ll' exited $rc. That listing is the only thing that says which paths this image holds as directories, and without it a symlink planted in $d cannot be told from one the backup itself carries — so the restore stops here rather than extract past a check that compared nothing. Fix or re-ingest that image and retry, or restore it with the Go reader on the disc (brb-linux-amd64)."
+  (( rc == 0 )) || die "could not list the contents of $(esc_str "${img##*/}"): 'unsquashfs -ll' exited $rc. That listing is the only thing that says which paths this image holds as directories — without which a symlink planted in the destination cannot be told from one the backup itself carries — and which files it holds, which is what the index is cross-checked against. Both guards would have nothing to compare, so the restore stops here rather than extract past a check that compared nothing. Fix or re-ingest that image and retry, or restore it with the Go reader on the disc (brb-linux-amd64)."
 
-  # One pass over the listing, printing the count of entries it recognised
-  # first and the archive-relative directory paths after it.
-  #
-  # The parse is the same one listedDir makes in go/internal/restore/extract.go
-  # rather than the anchored date-and-time regex this used to carry: the line
-  # is "<mode> <user>/<group> <size> <date> <time> <path>", so the path is
-  # everything after the single space that follows the fifth field, whatever it
-  # contains, and neither a padded size column nor a differently formatted
-  # timestamp can push a real directory out of the list. Nothing is trimmed off
-  # the end: a trailing '\r' is part of a name.
-  local -a parsed=()
-  mapfile -t parsed < <(printf '%s\n' "$listing" | LC_ALL=C awk '
+  IMAGE_ENTRIES=()
+  mapfile -t IMAGE_ENTRIES < <(printf '%s\n' "$listing" | LC_ALL=C awk '
     BEGIN { root = "squashfs-root" }
     {
       rest = $0; fields = 1
@@ -1521,33 +1658,184 @@ refuse_symlinks_at_dirs() {  # refuse_symlinks_at_dirs IMAGE DEST [ONLY]
         if (j == 0) { fields = 0; break }
         rest = substr(rest, j)
       }
-      if (!fields || length(rest) < 2) next
+      if (!fields || length(rest) < 2) { stray++; next }
       path = substr(rest, 2)
       # Recognised as a listing entry: the archive root, or something under it.
-      if (path != root && index(path, root "/") != 1) next
+      if (path != root && index(path, root "/") != 1) { stray++; next }
       n++
-      # Kept: directories under the root. The root itself is $d, tested above.
-      if (substr($0, 1, 1) == "d" && path != root) dirs[++k] = substr(path, length(root) + 2)
+      if (path == root) next
+      rel = substr(path, length(root) + 2)
+      kind = substr($0, 1, 1)
+      if (kind == "d") { print "d" rel; next }
+      if (kind != "-") next
+      # The index escaping contract, in the order indexfmt fixes it: backslash
+      # first, then tab. Doing it the other way round turns a literal tab into
+      # "\\t", which reads back as a backslash and a t. A newline cannot appear
+      # here — it is what split the line in the first place, and stray counts it.
+      gsub(/\\/, "\\\\", rel)
+      gsub(/\t/, "\\t", rel)
+      print "f" rel
     }
-    END { print n + 0; for (i = 1; i <= k; i++) print dirs[i] }
+    END { print "#" n + 0 " " stray + 0 }
   ')
-  # Every image this format produces lists at least its own root, so a count of
-  # zero means the listing was not in the shape this parses — not that the
-  # image is empty.
-  [[ "${parsed[0]:-}" =~ ^[1-9][0-9]*$ ]] \
-    || die "could not read the directory listing of $(esc_str "${img##*/}"): 'unsquashfs -ll' succeeded, but not one line of it was in the '<mode> <user>/<group> <size> <date> <time> squashfs-root/<path>' form this reads. This guard has nothing to compare and will not pass by default, so the restore stops here. Please report the unsquashfs version; meanwhile restore with the Go reader carried on every disc (brb-linux-amd64 / brb-linux-aarch64)."
+  # END always runs, and always last, so the summary is the final line — unless
+  # awk produced nothing at all, which the empty summary below turns into the
+  # same refusal as a listing that did not parse.
+  summary=""
+  if (( ${#IMAGE_ENTRIES[@]} > 0 )); then
+    last=$(( ${#IMAGE_ENTRIES[@]} - 1 ))
+    summary="${IMAGE_ENTRIES[last]}"
+    unset "IMAGE_ENTRIES[last]"
+  fi
+  # Every image this format produces lists at least its own root, so a
+  # recognised count of zero means the listing was not in the shape this parses
+  # — not that the image is empty.
+  [[ "$summary" =~ ^#([1-9][0-9]*)\ ([0-9]+)$ ]] \
+    || die "could not read the listing of $(esc_str "${img##*/}"): 'unsquashfs -ll' succeeded, but not one line of it was in the '<mode> <user>/<group> <size> <date> <time> squashfs-root/<path>' form this reads. The guards below have nothing to compare and will not pass by default, so the restore stops here. Please report the unsquashfs version; meanwhile restore with the Go reader carried on every disc (brb-linux-amd64 / brb-linux-aarch64)."
+  IMAGE_STRAY="${BASH_REMATCH[2]}"
+  IMAGE_LISTED="$img"
+}
 
-  local i
-  for (( i = 1; i < ${#parsed[@]}; i++ )); do
-    p="${parsed[i]}"
-    if [[ -n "$only" ]] && ! extraction_touches "$only" "$p"; then continue; fi
-    [[ -L "$d/$p" ]] || continue
-    bad+=( "$(esc_str "$d/$p -> $(readlink -- "$d/$p" 2>/dev/null || true)")" )
-    (( ${#bad[@]} < 5 )) || break
+# refuse_foreign_image IMAGE DISC-NUMBER — this image must hold exactly the
+# files the index says disc N holds.
+#
+# THE OTHER HALF OF refuse_foreign_index. That one pins the index, which leaves
+# a forger — who has the set's public key, off MANIFEST.txt, but not its
+# private key — only one way to get a disc past ingest: copy the genuine
+# index.tsv.gz.age across, which needs no key. This is the check that then
+# catches them, because reading that index does need the key. They cannot know
+# which paths it claims their disc carries, so they cannot make their image
+# agree with it.
+#
+# WHAT IT GUARANTEES, EXACTLY. It detects that the discs of a set disagree with
+# each other. It does not say which one is lying: ingest the forged disc first
+# and ITS index is the pinned one, and the genuine discs are what this refuses.
+# And it gives no protection at all when the forgery is the only disc involved
+# — the forger then controls both the index and the image, and a self-consistent
+# pair passes. This is not a signature and cannot be turned into one: the format
+# carries no signing key, so nothing here authenticates a disc. What it buys is
+# that an attacker's tree is no longer extracted silently over the operator's
+# files on the strength of "it decrypted, so it must be ours".
+#
+# REGULAR FILES ONLY, on both sides. Every disc carries the whole directory
+# skeleton — directories, symlinks and specials are replicated onto every disc
+# by design, so that any disc restores on its own — and the index lists files.
+# Comparing anything else would refuse every legitimate restore ever made.
+#
+# --only NARROWS EXTRACTION, NOT THE DISC. The image holds the whole disc
+# whatever is being extracted from it, so the whole image is compared against
+# the whole of that disc's index rows regardless.
+#
+# WHERE IT DEGRADES, AND WHY IT MUST. `unsquashfs -ll` is line-based and this
+# format deliberately supports a filename containing a newline (that is why the
+# index has an escaping contract at all). Such a name is listed as two
+# half-lines, so the file list is no longer known to be complete and an exact
+# comparison would refuse a set that is perfectly good. A backup tool that
+# cannot restore a legitimate set is worse than one that misses an exotic
+# attack, so this warns loudly and extracts, rather than refusing, whenever
+# either side is not exactly comparable: the listing had lines it could not
+# parse, the index lists a newline in a path for this disc, the index is not in
+# staging to compare against, or the image's own name does not say which disc
+# it is. The warning names which, so the operator knows the check did not run.
+#
+# Restore only, deliberately: mount hands an image to the kernel read-only and
+# list prints its contents, and neither writes the archive's files into the
+# operator's tree, which is the thing this exists to stop. A disc being
+# inspected is one the operator is already looking at with their own eyes.
+refuse_foreign_image() {  # refuse_foreign_image IMAGE DISC-NUMBER
+  local img="$1" n="$2" name idx="$ENC_DIR/index.tsv.gz.age" why="" rows="" rc=0
+  name="$(esc_str "${img##*/}")"
+  list_image "$img"
+  if (( n <= 0 )); then
+    why="its name does not say which disc it is, and the index lists paths by disc number"
+  elif [[ ! -f "$idx" ]]; then
+    why="there is no index.tsv.gz.age in $ENC_DIR to check it against"
+  elif (( IMAGE_STRAY > 0 )); then
+    why="$IMAGE_STRAY line(s) of its listing are not entries this can parse, so a name in it is one a line-based listing cannot carry — a filename containing a newline is listed as two half-lines, and this format supports such names"
+  fi
+  if [[ -z "$why" ]]; then
+    # The index rows for THIS disc, tagged 'i' so that one awk below can take
+    # both sides down one pipe and still tell them apart. Small next to the
+    # image it is vouching for, so it is decrypted per disc rather than held.
+    # Exit 3 is this awk saying "a path here contains a newline": the escaped
+    # form is a backslash and an 'n', which is not the same thing as the "\\n"
+    # a literal backslash-then-n is written as, so the check walks the escapes
+    # rather than grepping for two characters. Any other non-zero status is age
+    # or gunzip failing, which is a different message.
+    rows="$(age_d "$idx" | gunzip -c | N="$n" LC_ALL=C awk -F'\t' '
+      function has_newline(s,   i, c) {
+        for (i = 1; i <= length(s); i++) {
+          c = substr(s, i, 1)
+          if (c != "\\") continue
+          i++
+          if (substr(s, i, 1) == "n") return 1
+        }
+        return 0
+      }
+      NF == 2 && $1 ~ /^[0-9]+$/ && $1 + 0 == ENVIRON["N"] + 0 {
+        if (index($2, "\\") && has_newline($2)) nl = 1
+        print "i" $2
+      }
+      END { exit (nl ? 3 : 0) }
+    ')" || rc=$?
+    case "$rc" in
+      0) ;;
+      3) why="the index lists a path for disc $n whose name contains a newline, which a line-based 'unsquashfs -ll' listing cannot carry faithfully" ;;
+      *) why="the index in $ENC_DIR could not be read (age or gunzip exited $rc)" ;;
+    esac
+  fi
+  if [[ -n "$why" ]]; then
+    warn "the cross-check of $name against the index is DEGRADED: $why. Extracting it WITHOUT the check that a disc from another set would fail."
+    return 0
+  fi
+
+  # Both sides down one pipe, each line tagged with where it came from, and
+  # compared in the order they were read so the examples below are the same
+  # ones on every run and on both readers.
+  local -a verdict=()
+  mapfile -t verdict < <( { printf '%s\n' ${IMAGE_ENTRIES[@]+"${IMAGE_ENTRIES[@]}"}
+                            printf '%s\n' "$rows"; } | LC_ALL=C awk '
+    {
+      t = substr($0, 1, 1); p = substr($0, 2)
+      if (t == "f") { if (!(p in img)) { img[p] = 1; ford[++nf] = p } }
+      else if (t == "i") { if (!(p in idx)) { idx[p] = 1; iord[++ni] = p } }
+    }
+    END {
+      # Bounded on purpose: a forged image can differ by every path it holds,
+      # and ten thousand lines of them is not a message anybody reads.
+      for (i = 1; i <= ni; i++) if (!(iord[i] in img)) { nm++; if (nm <= 3) print "M" iord[i] }
+      for (i = 1; i <= nf; i++) if (!(ford[i] in idx)) { ne++; if (ne <= 3) print "E" ford[i] }
+      print "=" nm + 0 " " ne + 0 " " ni + 0 " " nf + 0
+    }
+  ')
+  # As in list_image: awk's END is the last line out, so the verdict is the last
+  # element — and an awk that printed nothing at all leaves it empty, which the
+  # refusal below is the answer to.
+  local last=$(( ${#verdict[@]} - 1 )) counts=""
+  if (( last >= 0 )); then counts="${verdict[last]}"; fi
+  [[ "$counts" =~ ^=([0-9]+)\ ([0-9]+)\ ([0-9]+)\ ([0-9]+)$ ]] \
+    || die "could not compare $name with the index: the comparison produced no verdict at all, so nothing was checked and the restore stops here rather than extract past it. Please report this; meanwhile restore with the Go reader carried on every disc (brb-linux-amd64 / brb-linux-aarch64)."
+  local nmiss="${BASH_REMATCH[1]}" nextra="${BASH_REMATCH[2]}" nindex="${BASH_REMATCH[3]}"
+  if (( nmiss == 0 && nextra == 0 )); then
+    step "$name holds exactly the $nindex file(s) the index lists for disc $n"
+    return 0
+  fi
+
+  local -a miss=() extra=()
+  local i e
+  for (( i = 0; i < last; i++ )); do
+    e="${verdict[i]}"
+    # Both sides are paths off media nobody here wrote, and this goes to a
+    # terminal: escaped, like every other name this script prints.
+    case "${e:0:1}" in
+      M) miss+=( "$(esc_str "${e:1}")" ) ;;
+      E) extra+=( "$(esc_str "${e:1}")" ) ;;
+    esac
   done
-  if (( ${#bad[@]} == 0 )); then return 0; fi
-  local list; list="$(printf '%s, ' "${bad[@]}")"; list="${list%, }"
-  die "$d holds symlink(s) where $(esc_str "${img##*/}") has directories ($list); unsquashfs -f would apply the backup's directory mode, owner and times THROUGH them to whatever they point at — remove them, or restore into an empty directory and merge by hand"
+  local m_eg="" x_eg="" list
+  if (( ${#miss[@]} )); then list="$(printf '%s, ' "${miss[@]}")"; m_eg=" (e.g. ${list%, })"; fi
+  if (( ${#extra[@]} )); then list="$(printf '%s, ' "${extra[@]}")"; x_eg=" (e.g. ${list%, })"; fi
+  die "$name is not the disc $n the index describes: $nmiss of the $nindex path(s) the index lists for disc $n are not in this image$m_eg, and $nextra file(s) in this image are not in the index for disc $n$x_eg. One index was written for the whole set and copied onto every disc, so an intact set cannot disagree with itself like this: either two different sets have been ingested into one staging area, or one of these discs is not from your set. Nothing in this format signs a disc, so brb cannot tell you which one is honest. Ingest each set into a STAGING of its own; if this is the only set you ingested, treat the staging area as untrusted and re-ingest from discs you kept yourself. The discs that do match the index still restore one at a time with --disc N."
 }
 
 # extraction_touches ONLY DIR — will unsquashfs, asked for ONLY, create or
@@ -1725,6 +2013,14 @@ cmd_restore() {
       if (( ! KEEP_IMAGES )); then rm -f -- "$img"; fi
       continue
     fi
+    # Does this image belong to the set the staged index describes? Asked
+    # before the symlink guard because it is the more fundamental question —
+    # that one asks what this image would do to the destination, this one asks
+    # whether it is one of the operator's discs at all. Both read the same
+    # single listing (list_image). The disc number comes from the staged
+    # ciphertext's name, which is the name the disc's own data/ directory gave
+    # it, exactly as prepare_image reads it.
+    refuse_foreign_image "$img" "$(disc_number_of "$(basename "$enc")")"
     # The second symlink guard, per image: it needs the image's own list of
     # directories, which exists only now that it is decrypted, and the --only
     # path, which decides which of those directories extraction can reach.
@@ -1935,7 +2231,10 @@ COMMANDS
                              order); verifies each file against the disc and
                              keeps a second copy of a damaged image so par2 can
                              combine them
-  restore <dest> [opts]      repair, decrypt and extract
+  restore <dest> [opts]      repair, decrypt and extract; refuses any image that
+                             does not hold exactly the files the encrypted index
+                             says its disc holds, because the discs of one set
+                             have to agree with each other
                                --only <path>   extract one path, relative to the
                                                archive root, no leading '/';
                                                located via the encrypted index,

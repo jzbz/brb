@@ -422,6 +422,12 @@ func (o Options) removeStaleMapfile(dst string) {
 func (o Options) reconcileExisting(ctx context.Context, src, dst, want string) (staged bool, err error) {
 	name := ingestName(src, dst)
 
+	// The index is the one file whose staged copy is authoritative rather than
+	// merely first, so it is decided before the ordinary rules below get to it.
+	if isIndexName(dst) {
+		return o.reconcileIndex(ctx, src, dst, want)
+	}
+
 	if want != "" {
 		// The hash speaks first: a staged copy that matches is done, whatever a
 		// leftover map file claims — an interrupted salvage's map survives a
@@ -500,6 +506,111 @@ func (o Options) reconcileExisting(ctx context.Context, src, dst, want string) (
 // only kind of file whose alternate copies par2 can combine.
 func isImageName(dst string) bool {
 	return strings.HasSuffix(filepath.Base(dst), ".squashfs"+ageExt)
+}
+
+// isIndexName reports whether a staged path is the set's encrypted index, the
+// one file whose staged copy pins what the whole set is (see reconcileIndex).
+func isIndexName(dst string) bool {
+	return filepath.Base(dst) == indexName
+}
+
+// reconcileIndex decides what to do about an index that is already staged, and
+// refuses the disc when the two do not agree. It is half of the mitigation for
+// RVW-008; [Options.auditImage] is the other half, and neither is worth
+// anything alone.
+//
+// The writer copies ONE index file onto every disc of a set, so two discs of
+// one set carry it byte for byte. A difference therefore means one of three
+// things, and none of them is a disc to go on ingesting:
+//
+//   - The discs of two different sets are being ingested into one staging area.
+//     Their images would end up interleaved in one enc/ under one index that
+//     describes half of them, and a restore would extract both sets into the
+//     destination while reporting one.
+//   - The staged copy has rotted, or this disc's has.
+//   - One of the two discs is not from the operator's set at all. age encrypts
+//     to a PUBLIC key that MANIFEST.txt prints on every disc, so anyone holding
+//     one disc can master another that decrypts and verifies clean — see the
+//     RVW-008 note on [Options.auditImage]. Pinning the index is what forces
+//     such a disc to ship the GENUINE index, which is the only reason the
+//     image cross-check at restore can catch it: the attacker cannot read the
+//     index they were made to carry, so they cannot make their image agree
+//     with it.
+//
+// This is deliberately NOT the keep-both treatment images get. Two partially
+// rotted copies of an image are raw material par2 combines into a whole one, on
+// purpose; two different indexes are two different answers to "what is in this
+// set", and keeping both would just mean choosing one silently.
+//
+// The refusal is modelled on the public-archive key contract a few functions
+// down (ingestPublicIdentity): same shape, same reasoning, same remedy of
+// finishing or clearing the staging area before the other set goes into it.
+//
+// Rot is told apart from a foreign index by the disc's own SHA512SUMS, and only
+// where that can settle it:
+//
+//   - The staged copy is what this disc records the index should be, and the
+//     copy beside it on the medium is not. The disc agrees with the staged
+//     index and has simply lost its own copy of it; that is a warning, and the
+//     ingest carries on. This is the case the plain-file rules already handled
+//     ("already have %s, and it matches the hash on this disc"), and turning it
+//     into a failure would fail an honest disc for nothing.
+//   - Neither copy matches what the disc records. The disc contradicts itself,
+//     so it cannot be believed about anything, and it is reported as the
+//     damaged copy it is.
+//
+// A forged disc reaches neither: its sums file agrees with its index, because
+// the attacker wrote both. That is what leaves the refusal below for the case
+// where two self-consistent discs disagree with each other.
+//
+// Note what this does not do: a disc's image is staged before its index is
+// (dataFiles is sorted, and "disc07.squashfs.age" sorts before
+// "index.tsv.gz.age"), so the refusal here leaves that image in enc/. That is
+// not a hole. The image is inert until a restore extracts it, and the restore
+// cross-check refuses it there against the index that is still pinned.
+func (o Options) reconcileIndex(ctx context.Context, src, dst, want string) (staged bool, err error) {
+	name := ingestName(src, dst)
+	staged0, err := agecrypt.SumFile(ctx, dst)
+	if err != nil {
+		return false, fmt.Errorf("restore: hashing the staged %s: %w", name, err)
+	}
+	onDisc, err := agecrypt.SumFile(ctx, src)
+	if err != nil {
+		return false, fmt.Errorf("restore: hashing %s on the disc: %w", name, err)
+	}
+	if strings.EqualFold(staged0, onDisc) {
+		o.UI.Step("already have %s, and this disc's copy is identical — this disc belongs to the staged set", name)
+		return false, nil
+	}
+	if want != "" {
+		switch {
+		case strings.EqualFold(staged0, want):
+			// This disc vouches for the staged index and has lost its own
+			// copy of it. Nothing is wrong with the set, and nothing here
+			// needs restaging.
+			o.UI.Warn("already have %s, and it matches the hash on this disc — but this disc's copy is damaged "+
+				"and was not staged; %s if you need this disc's copy back", name, o.sidecarRepairHint(0))
+			return false, nil
+		case !strings.EqualFold(onDisc, want):
+			// The disc contradicts itself, so it cannot be believed about
+			// which set it belongs to either. Nothing is staged: the pinned
+			// index stays.
+			return false, &CopyProblem{
+				Name:    name,
+				Missing: -1,
+				Reason: "this disc's copy of the index matches neither the hash this disc itself records for it nor the " +
+					"index already staged, so this disc's copy is damaged; the staged index was kept — " +
+					o.sidecarRepairHint(0),
+			}
+		}
+	}
+	return false, fmt.Errorf("restore: this disc carries an index that differs from the one already staged at %s — "+
+		"every disc of one set carries the identical index, so this disc belongs to a different set, or one of the two "+
+		"indexes is not the set's at all. Nothing from this disc was added to the index, and it must not be ingested "+
+		"beside the other set's images: finish or clear %s before ingesting the other set. If both discs are meant to be "+
+		"from one set, one of them is not what it claims to be, and the images already staged cannot be told apart from "+
+		"here — ingest each disc into an empty staging directory and compare",
+		dst, o.Cfg.Staging)
 }
 
 // altCopyName is where a further pressing's copy of an already-staged file
