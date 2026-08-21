@@ -68,7 +68,15 @@ type Entry struct {
 	Kind Kind
 	// Size is the apparent size in bytes for regular files, and 0 otherwise.
 	Size int64
-	// Inode is the entry's inode number.
+	// Dev is the device number of the filesystem the entry lives on. It is
+	// only meaningful paired with Inode: an inode number identifies a file
+	// within one filesystem and nowhere else, so two unrelated files on two
+	// filesystems can carry the same Inode. Anything grouping hard links must
+	// key on the pair, never on Inode alone. A scan can hold more than one
+	// device even under Options.OneFileSystem — see the note there about a
+	// bind-mounted file.
+	Dev uint64
+	// Inode is the entry's inode number. Unique only within Dev.
 	Inode uint64
 	// Nlink is the entry's hard link count.
 	Nlink uint64
@@ -149,12 +157,26 @@ type Options struct {
 	// path is added to Result.SkippedMounts so the caller can report what was
 	// left behind.
 	//
-	// The boundary is enforced at directories only, which is what -xdev means:
-	// a NON-directory on another device — in practice a file bind mount, since
-	// symlinks are never followed — is an ordinary entry, charged to RawBytes,
-	// backed up, and absent from SkippedMounts. That is one file, never a
-	// subtree, and it is deliberate rather than overlooked; see
-	// TestOneFileSystemDoesNotStopAtANonDirectory for the case that pins it.
+	// The boundary is enforced at directories only. A NON-directory on another
+	// device — in practice a file bind mount, since symlinks are never followed
+	// — is an ordinary entry, charged to RawBytes, backed up with its contents,
+	// and absent from SkippedMounts.
+	//
+	// That is deliberate rather than overlooked, and it is what every tool
+	// spelling this option does: find -xdev, tar --one-file-system, rsync -x
+	// and cp -x all descend no further at a mounted directory and all copy a
+	// bind-mounted file's bytes. Excluding it instead would drop a file that is
+	// plainly there in ls out of a backup, silently — the worse failure for
+	// this program, and one no other tool would lead a user to expect. The
+	// danger the option exists to stop is an unbounded subtree, a NAS or an
+	// external drive; a bind-mounted file is one entry and cannot pull in a
+	// second. Container runtimes mount /etc/resolv.conf and /etc/hosts this
+	// way, so a backup of /etc from inside a container depends on it.
+	//
+	// The cost is that a scan holds more than one device even here, which is
+	// why Entry carries Dev and why anything grouping by inode must key on the
+	// pair. See TestOneFileSystemDoesNotStopAtANonDirectory for the case that
+	// pins the behaviour.
 	OneFileSystem bool
 	// OnEntry, when non-nil, is called for every kept entry in walk order.
 	OnEntry func(Entry)
@@ -292,7 +314,7 @@ func (w *walker) dir(ctx context.Context, abs, rel string, relOdd bool) error {
 		}
 		dev, ino, nlink := statIDs(info)
 
-		e := Entry{Rel: childRel, Kind: kindOf(info), Inode: ino, Nlink: nlink}
+		e := Entry{Rel: childRel, Kind: kindOf(info), Dev: dev, Inode: ino, Nlink: nlink}
 		if e.Kind == KindFile {
 			e.Size = info.Size()
 		}
@@ -321,7 +343,7 @@ func (w *walker) dir(ctx context.Context, abs, rel string, relOdd bool) error {
 		// Computed here rather than at the top of the loop so an entry a mask
 		// or an unreadable open dropped is never charged for it.
 		childOdd := relOdd || hasControl(name)
-		w.emit(e, dev, childOdd)
+		w.emit(e, childOdd)
 
 		if e.Kind == KindDir {
 			if w.opts.OneFileSystem && dev != w.rootDev {
@@ -340,11 +362,11 @@ func (w *walker) dir(ctx context.Context, abs, rel string, relOdd bool) error {
 
 // emit records a kept entry and updates the running totals. odd says whether
 // e.Rel holds a control byte; see [walker.dir] for why the caller computes it.
-func (w *walker) emit(e Entry, dev uint64, odd bool) {
+func (w *walker) emit(e Entry, odd bool) {
 	w.res.Entries = append(w.res.Entries, e)
 	if e.Kind == KindFile {
 		w.res.Files++
-		if w.chargeable(e, dev) {
+		if w.chargeable(e) {
 			w.res.RawBytes += e.Size
 		}
 	} else {
@@ -361,11 +383,11 @@ func (w *walker) emit(e Entry, dev uint64, odd bool) {
 // chargeable reports whether e's bytes should be added to the raw total. A
 // hard-linked inode is charged the first time one of its names is seen and
 // never again.
-func (w *walker) chargeable(e Entry, dev uint64) bool {
+func (w *walker) chargeable(e Entry) bool {
 	if e.Nlink <= 1 {
 		return true
 	}
-	id := fileID{dev: dev, ino: e.Inode}
+	id := fileID{dev: e.Dev, ino: e.Inode}
 	if _, dup := w.linked[id]; dup {
 		return false
 	}

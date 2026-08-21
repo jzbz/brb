@@ -21,6 +21,14 @@ func link(rel string, size int64, inode uint64) scan.Entry {
 	return scan.Entry{Rel: rel, Kind: scan.KindFile, Size: size, Inode: inode, Nlink: 2}
 }
 
+// linkOn is link, on a chosen filesystem. An inode number means nothing
+// without the device beside it, so a test about collisions has to say both.
+func linkOn(rel string, size int64, dev, inode uint64) scan.Entry {
+	e := link(rel, size, inode)
+	e.Dev = dev
+	return e
+}
+
 func dir(rel string) scan.Entry {
 	return scan.Entry{Rel: rel, Kind: scan.KindDir, Inode: hashInode(rel), Nlink: 2}
 }
@@ -464,4 +472,49 @@ func randomTree(rng *rand.Rand) (entries []scan.Entry, files []string, skeleton 
 	rng.Shuffle(len(entries), func(i, j int) { entries[i], entries[j] = entries[j], entries[i] })
 	sort.Strings(skeleton)
 	return entries, files, skeleton, bytes
+}
+
+// Two filesystems number their inodes independently, so the same inode number
+// on two devices is two unrelated files. Grouping on the inode alone merged
+// them into one unit charged a single file's size, which under-estimates the
+// disc: here the merged unit would report 100 bytes for 200 bytes of content,
+// and the shortfall lands on a disc already planned to be full. scan sets Dev
+// on every entry precisely so this cannot happen.
+func TestHardlinkGroupsOnDifferentDevicesDoNotCollide(t *testing.T) {
+	const ino = 4242 // the same number on both filesystems
+	entries := []scan.Entry{
+		linkOn("root/one", 100, 1, ino),
+		linkOn("root/two", 100, 1, ino),
+		linkOn("bindmount/one", 100, 2, ino),
+		linkOn("bindmount/two", 100, 2, ino),
+	}
+	p := New(entries)
+
+	if got, want := len(p.units), 2; got != want {
+		t.Fatalf("units = %d, want %d: one group per device, not one group total", got, want)
+	}
+	units, files, bytes := p.Remaining()
+	if units != 2 || files != 4 || bytes != 200 {
+		t.Fatalf("Remaining() = (%d,%d,%d), want (2,4,200)", units, files, bytes)
+	}
+
+	// Each unit must hold the two names from its own device and neither of the
+	// other's, or the group travels to a disc its hard links do not live on.
+	for _, u := range p.units {
+		var want []string
+		switch u.Paths[0] {
+		case "bindmount/one":
+			want = []string{"bindmount/one", "bindmount/two"}
+		case "root/one":
+			want = []string{"root/one", "root/two"}
+		default:
+			t.Fatalf("unexpected unit %v", u.Paths)
+		}
+		if !reflect.DeepEqual(u.Paths, want) {
+			t.Fatalf("unit = %v, want %v", u.Paths, want)
+		}
+		if u.Size != 100 {
+			t.Fatalf("unit %v size = %d, want 100", u.Paths, u.Size)
+		}
+	}
 }

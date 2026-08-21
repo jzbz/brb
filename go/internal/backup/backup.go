@@ -387,15 +387,16 @@ func (r *runner) scan(ctx context.Context) (*scan.Result, error) {
 		}
 	}
 	// A mount point under SOURCE_DIR is kept as an empty directory and its whole
-	// subtree left out, because the scan does not cross filesystems
-	// (scan.Options.OneFileSystem). That is deliberate — a backup of /home
-	// must not swallow the NAS mounted under it — but it used to be silent, and
-	// a silent omission of an entire subtree is a data-loss report waiting to
-	// happen. Say so, name the paths, and carry them into the manifest.
+	// subtree left out, because the scan does not descend into a mounted
+	// directory (scan.Options.OneFileSystem). That is deliberate — a backup of
+	// /home must not swallow the NAS mounted under it — but it used to be
+	// silent, and a silent omission of an entire subtree is a data-loss report
+	// waiting to happen. Say so, name the paths, and carry them into the
+	// manifest.
 	r.skippedMounts = res.SkippedMounts
 	if n := len(res.SkippedMounts); n > 0 {
-		r.p.Warn("%d mounted subtree(s) under %s are NOT included — brb does not cross filesystem "+
-			"boundaries; back each one up as its own SOURCE_DIR if you want it:", n, r.cfg.SourceDir)
+		r.p.Warn("%d mounted subtree(s) under %s are NOT included — brb does not descend into a "+
+			"mounted directory; back each one up as its own SOURCE_DIR if you want it:", n, r.cfg.SourceDir)
 		reportPaths(r.p, res.SkippedMounts)
 	}
 	// Two groups, because only one of them is handled: the index escapes tab and

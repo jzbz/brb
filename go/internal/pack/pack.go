@@ -85,34 +85,41 @@ type Packer struct {
 	pendingIdx []int
 }
 
+// linkGroup identifies one hard-linked inode uniquely across filesystems. It
+// mirrors the key the scanner charges bytes with, so the two agree by
+// construction about what "the same file" means.
+type linkGroup struct {
+	dev, ino uint64
+}
+
 // New builds units from entries.
 //
-// Regular files with a link count above one are grouped by inode; everything
-// else becomes a one-path unit. Non-file entries become the skeleton. The
-// result is deterministic: units are ordered by size descending with ties
-// broken by their first path.
+// Regular files with a link count above one are grouped by device and inode;
+// everything else becomes a one-path unit. Non-file entries become the
+// skeleton. The result is deterministic: units are ordered by size descending
+// with ties broken by their first path.
 //
-// Note that grouping uses the inode number alone, not the device-and-inode
-// pair. Two distinct hard-linked inodes on two different filesystems can
-// therefore collide into one unit. No data is lost when that happens — every
-// name still travels together onto one disc — but the group is charged for only
-// the larger of the two sizes, so a scan that crosses filesystems may slightly
-// under-estimate a disc. brb's own commands all but close the door on it:
-// backup scans with scan.Options.OneFileSystem set, which keeps every directory
-// on the root's device. The one thing that slips through is a bind-mounted
-// *file* from another filesystem, which -xdev does not stop (see
-// scan.Options.OneFileSystem) — and it would have to be hard-linked and share
-// an inode number with a link group on the root device before this mattered. A
-// caller of this package that scans without OneFileSystem accepts the
-// under-estimate outright.
+// Grouping keys on the device-and-inode pair, never on the inode alone. An
+// inode number is unique only within one filesystem, so two unrelated link
+// groups on two filesystems can share one. Collapsing them into a single unit
+// loses no data — every name still travels together onto one disc — but the
+// merged group is charged only the larger of the two sizes, and a disc packed
+// against an under-estimate is one that may not fit the disc it was planned
+// for. Keying on the pair cannot collide.
 //
-// (Nothing in the frozen on-disc format records an inode, so the grouping key
-// is an implementation choice, not a compatibility constraint — it could become
-// the device-and-inode pair the day a caller needs it to.)
+// This is not theoretical for a caller using scan.Options.OneFileSystem, which
+// bounds a scan to the root's device at directories but deliberately lets a
+// bind-mounted *file* from another filesystem through, exactly as find -xdev
+// does. That file is the second device in the tree. It has to be hard-linked
+// and share an inode number with a link group on the root device before the old
+// key mattered — rare, silent when it happened, and free to rule out.
+//
+// (Nothing in the frozen on-disc format records an inode or a device, so the
+// grouping key is an implementation choice, not a compatibility constraint.)
 func New(entries []scan.Entry) *Packer {
 	var skeleton []string
 	var singles []Unit
-	groups := make(map[uint64][]scan.Entry)
+	groups := make(map[linkGroup][]scan.Entry)
 
 	for _, e := range entries {
 		if e.Kind != scan.KindFile {
@@ -120,7 +127,8 @@ func New(entries []scan.Entry) *Packer {
 			continue
 		}
 		if e.Nlink > 1 && e.Inode != 0 {
-			groups[e.Inode] = append(groups[e.Inode], e)
+			id := linkGroup{dev: e.Dev, ino: e.Inode}
+			groups[id] = append(groups[id], e)
 			continue
 		}
 		singles = append(singles, Unit{Size: e.Size, Paths: []string{e.Rel}})

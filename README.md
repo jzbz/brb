@@ -942,13 +942,21 @@ Known and deliberate, but you should hear them before you rely on this:
   A resume re-scans the source and skips what is already on a disc, so files
   added since the run started are picked up on later discs and a set can span
   two points in time — it warns when the tree's measured size has changed.
-- **One filesystem at a time.** The scan does not cross a filesystem boundary
-  under `SOURCE_DIR`: a mount point inside the tree is reported at `plan` and
-  `backup` time and appears on the discs as an empty directory, and nothing
+- **One filesystem at a time.** The scan does not descend into a mounted
+  *directory* under `SOURCE_DIR`: the mount point is reported at `plan` and
+  `backup` time, appears on the discs as an empty directory, and nothing
   mounted there is backed up. Back a second filesystem up as its own set, or
   point `SOURCE_DIR` at it. This is what keeps a home directory backup from
   quietly swallowing an external drive or a network share that happened to be
   mounted under it that day.
+
+  The boundary is enforced at directories, which is what `find -xdev`,
+  `tar --one-file-system`, `rsync -x` and `cp -x` all mean by it. A single
+  *file* bind-mounted from another filesystem — `/etc/resolv.conf` inside a
+  container, say — is an ordinary entry and **is** backed up, contents and all.
+  It is one file and cannot pull a subtree in behind it, and leaving out
+  something plainly present in `ls` is the worse way for a backup to surprise
+  you.
 - **Files you cannot read are left out, and said so.** A file the scanning user
   has no permission to open is reported by the scan and excluded from the set —
   it is not written as an empty file, which would restore as a silent
