@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/jzbz/brb/internal/fsx"
 )
 
 // The staging directory's default lives under /var/tmp, which every local
@@ -98,6 +100,78 @@ func TestSecureStagingCreatesAndTightens(t *testing.T) {
 	err := e.opts().secureStaging(e.cfg.Dirs().Enc)
 	if err == nil || !strings.Contains(err.Error(), "not a directory") {
 		t.Fatalf("secureStaging over a file = %v, want a refusal", err)
+	}
+}
+
+// Index was the one command in this package that read and decrypted out of
+// the staging tree without securing it first. STAGING defaults under a
+// world-writable /var/tmp, so on a machine where brb has not run yet a local
+// user can put enc/ somewhere of their own, with an identity and an index of
+// their composition in it: restore, list, mount, ingest and burn all refuse
+// such a tree, while index decrypted the planted map of which disc holds what
+// and printed it as the operator's own. It refuses now, for the same reason
+// and with the same words as its siblings.
+func TestIndexRefusesASymlinkedEncDirectory(t *testing.T) {
+	e := newEnv(t)
+	e.writeIndex("1\tPhotos/2024/IMG_0001.JPG\n")
+
+	// Move the whole enc directory aside and leave a link where it was: this
+	// is the planted tree, and it holds a perfectly readable index — what must
+	// stop the command is where it sits, not whether it parses.
+	elsewhere := filepath.Join(e.dir, "theirs")
+	if err := os.Rename(e.cfg.Dirs().Enc, elsewhere); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(elsewhere, e.cfg.Dirs().Enc); err != nil {
+		t.Fatal(err)
+	}
+
+	var out bytes.Buffer
+	err := Index(context.Background(), e.opts(), "", &out)
+	if err == nil || !strings.Contains(err.Error(), "is a symlink") {
+		t.Fatalf("Index over a symlinked enc/ = %v, want the symlink refusal\n%s", err, e.log())
+	}
+	if !strings.HasPrefix(err.Error(), "restore: ") {
+		t.Errorf("the refusal lost its command prefix: %v", err)
+	}
+	if out.Len() != 0 {
+		t.Fatalf("the planted index was printed anyway: %q", out.String())
+	}
+}
+
+// checkIndexIntact reads the recorded hash and then, separately, hashes the
+// index. A backup replaces those two files one after the other as it finishes,
+// so an unlocked index run landing between them compared the old hash against
+// the new index and told the operator their archive had rotted and to run par2
+// repair — over a staging tree a backup was still writing. Holding the lock
+// turns that into the refusal every other command gives.
+func TestIndexRefusesWhileAnotherRunHoldsTheStagingLock(t *testing.T) {
+	e := newEnv(t)
+	e.writeIndex("1\tPhotos/2024/IMG_0001.JPG\n")
+
+	// Stand in for the backup already under way.
+	held, err := fsx.LockStaging(e.cfg.Staging)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer held.Release()
+
+	var out bytes.Buffer
+	err = Index(context.Background(), e.opts(), "", &out)
+	if err == nil || !strings.Contains(err.Error(), "another brb is using") {
+		t.Fatalf("Index during another run = %v, want the staging-in-use refusal\n%s", err, e.log())
+	}
+	if strings.Contains(err.Error(), "rotted") {
+		t.Fatalf("the operator was sent to repair an archive that is not damaged: %v", err)
+	}
+
+	// And the lock is not a one-way door: without this the test would pass
+	// against a build that refused every index run.
+	if err := held.Release(); err != nil {
+		t.Fatal(err)
+	}
+	if err := Index(context.Background(), e.opts(), "", &out); err != nil {
+		t.Fatalf("Index once the lock was free: %v\n%s", err, e.log())
 	}
 }
 

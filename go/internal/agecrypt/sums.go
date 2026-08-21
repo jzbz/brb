@@ -30,9 +30,33 @@ func WriteSumFile(sumPath, hex, name string) error {
 	return writeFileAtomic(sumPath, []byte(line))
 }
 
+// maxSumLine bounds one line of a checksum file: 128 hex characters, a
+// separator, and a name. A megabyte is far more than any path needs and is the
+// same ceiling the reader puts on an index or a manifest line.
+const maxSumLine = 1 << 20
+
+// maxSumLines bounds how much of a checksum file [ReadSumFile] will read.
+//
+// The line length was already capped and the line count was not, and this file
+// comes off a disc somebody else handed over: restore mounts it and hands the
+// path straight to VerifyDir, with nothing in between so much as looking at its
+// size. Every parsed line is retained in the returned map, so a SHA512SUMS of
+// distinct valid lines turns each byte of file into roughly 1.6 bytes of heap
+// until the process is killed — and a "disc" that is a directory rather than
+// real media has no size limit at all.
+//
+// A million is picked to be unreachable rather than tight: a brb disc
+// directory holds on the order of ten files, so this is five orders of
+// magnitude of headroom for anything the format might grow into, while still
+// bounding the map to a few hundred megabytes instead of to RAM. The count is
+// of lines read, not of entries stored, so a file of a million repeated names
+// stops here too rather than being scanned forever for free.
+const maxSumLines = 1 << 20
+
 // ReadSumFile parses a file in GNU sha512sum format and returns a map from
 // name to lowercase hex digest. Both the text-mode ("  ") and binary-mode
-// (" *") separators are accepted, as are blank lines and "#" comments.
+// (" *") separators are accepted, as are blank lines and "#" comments. A file
+// claiming more than [maxSumLines] files is refused rather than loaded.
 func ReadSumFile(path string) (map[string]string, error) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -42,8 +66,14 @@ func ReadSumFile(path string) (map[string]string, error) {
 
 	out := make(map[string]string)
 	sc := bufio.NewScanner(f)
-	sc.Buffer(make([]byte, 0, 64*1024), 1<<20)
+	sc.Buffer(make([]byte, 0, 64*1024), maxSumLine)
 	for n := 1; sc.Scan(); n++ {
+		if n > maxSumLines {
+			return nil, fmt.Errorf("agecrypt: %s has more than %d lines — refusing to read it, "+
+				"since loading it whole is how this process runs out of memory. A brb disc's %s lists "+
+				"a handful of files, so this one is damaged or was not written by brb",
+				path, maxSumLines, SumsName)
+		}
 		line := strings.TrimRight(sc.Text(), "\r")
 		if line == "" || strings.HasPrefix(line, "#") {
 			continue
@@ -120,9 +150,11 @@ func hashInRoot(ctx context.Context, root *os.Root, name string) (string, error)
 
 // WriteSums walks dir and writes a sha512sum-format file at sumPath covering
 // every regular file below it except SHA512SUMS itself. Names are recorded as
-// "./relative/path" and sorted, matching what the bash implementation's
-// "find . -type f | sort | xargs sha512sum" produces, so a disc written by
-// either implementation verifies with either.
+// "./relative/path" and sorted, which is what GNU sha512sum itself writes for
+// "find . -type f | sort | xargs sha512sum" — and brb.sh verifies a disc by
+// running `sha512sum -c --quiet --strict SHA512SUMS` over it (brb.sh:852), so
+// the names have to be the ones that command resolves. xcompat-test.sh pins
+// that a disc written here checks out under both readers.
 func WriteSums(ctx context.Context, dir, sumPath string) error {
 	return WriteSumsKnown(ctx, dir, sumPath, nil)
 }

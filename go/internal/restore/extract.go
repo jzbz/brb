@@ -573,9 +573,21 @@ func extractionTouches(only []string, dir string) bool {
 // shadow in the destination until it is created. It is checked per image
 // rather than once, and only against the archive's directories: the symlinks
 // disc 1 itself extracted, at paths the archive holds as symlinks or files,
-// are the very thing that must not stop disc 2. With --only, only the
-// directories that extraction will actually touch are checked, so a live
-// $HOME's unrelated symlinks do not block fetching one file back into it.
+// are the very thing that must not stop disc 2. With --only, this guard checks
+// only the directories extraction will actually touch, so the links to files
+// and the dangling links a live $HOME accumulates elsewhere do not block
+// fetching one file back into it.
+//
+// The narrowing stops there, and reading it as a statement about restore would
+// be wrong: refuseSymlinkedDirs runs once before the first image, takes no
+// only argument, and walks the whole destination, so a link resolving to a
+// DIRECTORY anywhere under dest refuses the run whatever --only says. That is
+// deliberate and ledgered — README.md's Limitations: "A destination holding a
+// symlink to a directory is refused outright, --yes or not" — because
+// unsquashfs -f follows such a link and writes outside the destination, and
+// narrowing it safely would mean covering every ancestor of every --only path
+// as well as everything under it. TestRestoreOnlyDoesNotExemptADirectorySymlink
+// pins it.
 func (o Options) refuseSymlinksAtImageDirs(ctx context.Context, image, dest string, only []string) error {
 	pr, pw := io.Pipe()
 	done := make(chan error, 1)
@@ -822,16 +834,20 @@ func List(ctx context.Context, o Options, n int, w io.Writer) error {
 	lw := w
 	var esc *escapingWriter
 	if ui.IsTerminal(w) {
-		esc = &escapingWriter{w: w}
+		esc = newEscapingWriter(w)
 		lw = esc
 	}
-	if err := o.Tools.UnsquashfsList(ctx, plain, lw); err != nil {
-		return fmt.Errorf("restore: listing %s: %w", filepath.Base(plain), err)
-	}
+	listErr := o.Tools.UnsquashfsList(ctx, plain, lw)
+	// Closed whatever happened, and before the error is reported: the escaped
+	// stream is buffered, so a listing that died half way through would
+	// otherwise print nothing at all rather than the part that was read.
 	if esc != nil {
-		if err := esc.Close(); err != nil {
-			return fmt.Errorf("restore: listing %s: %w", filepath.Base(plain), err)
+		if err := esc.Close(); err != nil && listErr == nil {
+			listErr = err
 		}
+	}
+	if listErr != nil {
+		return fmt.Errorf("restore: listing %s: %w", filepath.Base(plain), listErr)
 	}
 	o.UI.Step("the decrypted %s is still in %s — plaintext; remove it when you are done",
 		filepath.Base(plain), o.dirs().Restore)
@@ -844,12 +860,39 @@ func List(ctx context.Context, o Options, n int, w io.Writer) error {
 // pattern is matched case-insensitively as a plain substring, not as a regular
 // expression: brb.sh pipes the index through grep, where a path containing a
 // dot or a bracket quietly means something other than what the operator typed.
+//
+// It reads nothing but the staging tree, and it opens the way every other
+// command in this package does, for two reasons that are not obvious for a
+// command that only prints.
+//
+// The lock: checkIndexIntact reads the recorded hash and then, separately,
+// hashes the index. A backup replaces those same two files one after the other
+// at the end of its run (backup: the index, then its sidecar). An unlocked
+// index run that lands between them compares the old hash against the new
+// index and tells the operator their archive has rotted and to run par2 repair
+// — on a staging tree a backup is still writing. The lock is non-blocking, so
+// what they get instead is "another brb is using the staging directory", which
+// is true.
+//
+// The guard: STAGING defaults under a world-writable /var/tmp, so enc/ may be
+// a symlink or a directory belonging to somebody else, holding an identity and
+// an index of their composition. Every other command refuses such a tree;
+// index alone would decrypt the planted index with the planted key and print
+// it as the operator's own map of which disc holds what.
 func Index(ctx context.Context, o Options, pattern string, w io.Writer) error {
 	if err := o.check(); err != nil {
 		return err
 	}
 	if w == nil {
 		return errors.New("restore: no output writer given")
+	}
+	unlock, err := o.lockStaging()
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	if err := o.secureStaging(o.dirs().Enc); err != nil {
+		return err
 	}
 	ids, err := o.identities()
 	if err != nil {
@@ -956,17 +999,31 @@ func filterIndex(ctx context.Context, r io.Reader, pattern string, w io.Writer, 
 				return n, err
 			}
 		}
-		line := sc.Text()
-		if line == "" {
+		// The scanner's own bytes, not sc.Text(): one row per file in the set
+		// means a $HOME-sized index runs this loop a million times, and a
+		// string is materialised only on the branches that need one — the
+		// case-folded match and the terminal escaping. The record and its
+		// newline go to the bufio.Writer separately rather than through a
+		// concatenation that copies the whole row to append one byte.
+		line := sc.Bytes()
+		if len(line) == 0 {
 			continue
 		}
-		if needle != "" && !strings.Contains(strings.ToLower(line), needle) {
-			continue
+		if needle != "" || escape {
+			s := string(line)
+			if needle != "" && !strings.Contains(strings.ToLower(s), needle) {
+				continue
+			}
+			if escape {
+				s = escapeControls(s)
+			}
+			if _, err := out.WriteString(s); err != nil {
+				return n, err
+			}
+		} else if _, err := out.Write(line); err != nil {
+			return n, err
 		}
-		if escape {
-			line = escapeControls(line)
-		}
-		if _, err := out.WriteString(line + "\n"); err != nil {
+		if err := out.WriteByte('\n'); err != nil {
 			return n, err
 		}
 		n++
@@ -1015,10 +1072,25 @@ func escapeControls(s string) string {
 }
 
 // escapingWriter escapes control bytes line by line on the way to a terminal.
-// It buffers the trailing partial line; Close flushes it.
+// It buffers the trailing partial line; Close flushes it, and Close must be
+// called or the tail of the listing is lost.
+//
+// The destination is os.Stdout, which is unbuffered, and a disc packed with
+// small files lists a million entries — one write(2) each, where the sibling
+// index path has always batched its output through a bufio.Writer. The buffer
+// is a chunk of the child's own pipe writes, so the operator sees the listing
+// arrive at the same moments they did before; what goes is the syscall per
+// line, not the streaming.
 type escapingWriter struct {
-	w    io.Writer
+	w    *bufio.Writer
 	part []byte
+}
+
+// newEscapingWriter wraps w. os/exec copies a child's stdout in 32 KiB chunks,
+// so a buffer of the same size turns each of those into about one write(2)
+// instead of one per line.
+func newEscapingWriter(w io.Writer) *escapingWriter {
+	return &escapingWriter{w: bufio.NewWriterSize(w, 32<<10)}
 }
 
 // Write implements io.Writer over whole lines.
@@ -1031,19 +1103,26 @@ func (e *escapingWriter) Write(b []byte) (int, error) {
 		}
 		line := escapeControls(string(e.part[:i]))
 		e.part = e.part[i+1:]
-		if _, err := io.WriteString(e.w, line+"\n"); err != nil {
+		if _, err := e.w.WriteString(line); err != nil {
+			return len(b), err
+		}
+		if err := e.w.WriteByte('\n'); err != nil {
 			return len(b), err
 		}
 	}
 	return len(b), nil
 }
 
-// Close flushes a trailing line that never got its newline.
+// Close flushes a trailing line that never got its newline, and then the
+// buffer. It is safe to call more than once, so a caller that is already
+// failing can flush what was listed before reporting why the rest is missing.
 func (e *escapingWriter) Close() error {
-	if len(e.part) == 0 {
-		return nil
+	if len(e.part) > 0 {
+		part := e.part
+		e.part = nil
+		if _, err := e.w.WriteString(escapeControls(string(part))); err != nil {
+			return err
+		}
 	}
-	_, err := io.WriteString(e.w, escapeControls(string(e.part)))
-	e.part = nil
-	return err
+	return e.w.Flush()
 }

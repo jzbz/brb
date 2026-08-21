@@ -292,6 +292,53 @@ func TestIngestRefusesAKeyThatFailsTheDiscsHash(t *testing.T) {
 	}
 }
 
+// identity.txt is the one file taken off a disc that is read into memory
+// whole, and it is read before the disc's SHA512SUMS entry or the age parse
+// can say anything about it. A disc that names a huge file identity.txt used
+// to be answered by allocating all of it: on a small machine the ingest run
+// dies in the allocator, and the operator's diagnosis is an out-of-memory kill
+// rather than the name of the file that caused it. The size is judged first
+// now, and the disc is reported the way a damaged copy is — the rest of it
+// still ingests.
+func TestIngestRefusesAnAbsurdlyLargePublicKey(t *testing.T) {
+	e := newEnv(t)
+	_, key := publicKey(t)
+	mp := publicDisc(t, 1, key)
+
+	// Sparse, so the test does not write a megabyte: what matters is the size
+	// the reader sees. A real disc would carry gigabytes here.
+	f, err := os.OpenFile(filepath.Join(mp, doc.PublicIdentityName), os.O_RDWR|os.O_TRUNC, 0o644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Truncate(maxPublicIdentityBytes + 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	ig := &ingester{o: e.opts(), mountPoint: mp}
+	if _, err := ig.ingestDisc(context.Background()); err != nil {
+		t.Fatalf("ingestDisc: %v\n%s", err, e.log())
+	}
+	if ig.incomplete != 1 {
+		t.Fatalf("incomplete = %d, want the key counted as an incomplete copy\n%s", ig.incomplete, e.log())
+	}
+	if _, err := os.Stat(e.opts().stagedPublicIdentity()); err == nil {
+		t.Fatal("a file too large to be a key was staged as one")
+	}
+	// The refusal must name the size, not the hash: reaching the hash means
+	// the whole file was read first, which is the failure being prevented.
+	if !strings.Contains(e.log(), "a public archive's key is a few hundred") {
+		t.Fatalf("the size was not what was refused:\n%s", e.log())
+	}
+	// And the disc is still a disc: its image comes off as usual.
+	if _, err := os.Stat(filepath.Join(e.cfg.Dirs().Enc, encName(1))); err != nil {
+		t.Errorf("the image was not staged: %v", err)
+	}
+}
+
 // A private set's disc has no identity.txt, and ingest must not invent one.
 func TestIngestOfAPrivateDiscStagesNoKey(t *testing.T) {
 	e := newEnv(t)

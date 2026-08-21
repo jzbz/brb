@@ -266,7 +266,77 @@ secure_staging() {  # secure_staging [SUBDIR ...]
   umask 077
   local d
   secure_dir "$STAGING"
+  # After $STAGING has been vetted and never before, exactly as lock.go says:
+  # the lock file has to be created somewhere this process has already proven
+  # it owns.
+  lock_staging
   for d in "$@"; do secure_dir "$d"; done
+}
+
+# One exclusive lock on $STAGING/.brb.lock, held for the life of this command,
+# so that two brb runs cannot write into one staging tree at once. It is the
+# same lock on the same path with the same words as LockStaging in
+# go/internal/fsx/lock.go, and taking it here is what makes that lock mean
+# anything: the Go writer and every Go reader command take it, but a lock only
+# the Go build respects does not stop the case it was written for, which is a
+# stranger reading discs back with the script carried on the media while a
+# multi-day backup is still running. cmd_ingest's opening sweep of
+# $ENC_DIR/*.part is the concrete collision — those are the very files a Go
+# backup is writing at that moment, and deleting one ends the run at its
+# rename.
+#
+# OPPORTUNISTIC, deliberately. flock(1) is util-linux, which is not in this
+# reader's dependency set and may simply not exist on the rescue system someone
+# is holding a disc on. A reader that refused to restore because a locking tool
+# is missing would be a worse failure than the accident the lock prevents, so a
+# missing flock says so once and the run carries on unguarded.
+#
+# The descriptor is never closed: process exit releases the lock, however the
+# process ends. The file is never removed either — unlinking a file another
+# process is about to lock is how advisory locking is commonly got wrong, and
+# LockName in lock.go gives the same reason for the same file.
+BRB_LOCK_FD=""
+lock_staging() {
+  [[ -z "$BRB_LOCK_FD" ]] || return 0
+  if ! command -v flock >/dev/null 2>&1; then
+    step "flock is not installed, so this run cannot tell whether another brb is already using $STAGING — run one brb at a time"
+    return 0
+  fi
+  exec {BRB_LOCK_FD}>"$STAGING/.brb.lock" \
+    || die "could not open the staging lock $(esc_str "$STAGING/.brb.lock") — fix its permissions, or point STAGING at a directory you own"
+  flock -n "$BRB_LOCK_FD" \
+    || die "another brb is using the staging directory $(esc_str "$STAGING") — wait for it to finish, or point STAGING at a directory of its own; two runs sharing one staging tree can write the same image at the same time, and the result verifies clean and does not restore"
+}
+
+# dir_path DIR — the spelling of a directory path that lstat answers about the
+# directory ITSELF, for the guards that have to know whether it is a symlink.
+#
+# A path ending in a slash, or in "/.", is resolved THROUGH a symlink by the
+# kernel before lstat ever sees it: "ln -s real link" and then [[ -L link/ ]],
+# [[ -L link/. ]] are both false, and "find -P link/ -type l" starts inside the
+# target and never reports the link. So every trailing "/" and "/." comes off,
+# repeatedly — "${d%/}" strips exactly one, which left "dest//" defeating both
+# destination guards and "STAGING=/var/tmp/brb//" skipping secure_dir's first
+# rule outright while the extraction still went to the raw path. The Go reader
+# collapses the lot with filepath.Clean (go/internal/restore/extract.go), and
+# this is that, for the trailing components which are the ones that matter:
+# an interior "//" or "/./" names the same file to lstat and to unsquashfs
+# alike, so it can hide nothing.
+#
+# The result is handed to unsquashfs -d as well as to the guards, so the two
+# can never disagree about which directory they mean. "/" survives as "/", and
+# an empty argument stays empty for the caller to reject.
+dir_path() {  # dir_path DIR
+  local d="${1:-}"
+  while [[ -n "$d" && "$d" != "/" ]]; do
+    case "$d" in
+      */)  d="${d%/}" ;;
+      */.) d="${d%/.}" ;;
+      *)   break ;;
+    esac
+    [[ -n "$d" ]] || d="/"
+  done
+  printf '%s' "$d"
 }
 
 # secure_dir DIR — make one directory fit to hold plaintext, or die saying what
@@ -290,13 +360,9 @@ secure_staging() {  # secure_staging [SUBDIR ...]
 #     trusts a hash sidecar sitting in these same directories, and whoever owns
 #     the directory can write both halves of a matching pair.
 secure_dir() {
-  local d="$1" owner
+  local d owner
+  d="$(dir_path "$1")"
   [[ -n "$d" ]] || die "no STAGING directory configured — set STAGING in $CONFIG_FILE or in the environment"
-  # A trailing slash makes -L (and lstat, and Go's) resolve the link instead of
-  # reporting it, so "STAGING=/var/tmp/brb/" would walk straight past the first
-  # check. The rest of the script builds its paths as "$STAGING/enc" and does
-  # not care either way, so this is trimmed here and nowhere else.
-  d="${d%/}"; [[ -n "$d" ]] || d="/"
   if [[ -L "$d" ]]; then
     die "$(esc_str "$d") is a symlink (-> $(esc_str "$(readlink -- "$d" 2>/dev/null || true)")); a staging directory must be a real directory, because decrypted images are written into it by name and would follow the link — remove the link, or point STAGING at the directory itself"
   fi
@@ -431,7 +497,11 @@ cmd_doctor() {
   step "needs nothing but the Linux kernel"
 
   echo >&2
-  for t in ddrescue udisksctl findmnt eject pv; do
+  # Every name here is one this script actually runs. pv used to be on the list
+  # and never was: nothing in either implementation has ever invoked it, so it
+  # told an operator preparing a rescue system to install a package that changes
+  # nothing. flock replaces it because lock_staging does run it when it is there.
+  for t in ddrescue udisksctl findmnt eject flock; do
     if command -v "$t" >/dev/null 2>&1; then
       ok "$t  (optional)"
     else
@@ -440,6 +510,8 @@ cmd_doctor() {
   done
   step "ddrescue is the one worth having: cp stops at the first I/O error on a"
   step "scratched disc, ddrescue does not, and par2 needs the rest of the bytes"
+  step "flock is what stops two brb runs sharing one staging directory; without"
+  step "it a second run is not noticed, so run them one at a time"
 
   echo >&2
   command -v age  >/dev/null 2>&1 && step "age $(age --version 2>&1 | head -1)"
@@ -640,6 +712,58 @@ read_disc_sums() {  # read_disc_sums MOUNTPOINT
 # escape or parse.
 sha512_of() { sha512sum < "$1" | awk '{print $1}'; }
 
+# recorded_sum SUMFILE NAME — the digest SUMFILE records FOR NAME, printed on
+# stdout. Exit 0 with the digest; 1 when there is no usable entry for that name
+# (including no file at all); 2 when the file exists but does not parse, which
+# is a rotted sidecar and a different thing entirely from silence.
+#
+# WHY NOT `sha512sum -c`. Because it hashes whatever path each line names, and
+# the line comes off the media: ingest copies data/* into staging under the
+# on-disc name and never reads a sidecar's name field, so a disc carrying
+# "<digest of the empty file>  /dev/null" as discNN.squashfs.sha512 made
+# `sha512sum -c` exit 0 without touching the image at all. That turned the
+# plaintext cache — the one place a restore hands over an image age never
+# authenticated — into "reuse whatever is at this path", and the post-decryption
+# check into a no-op. The sidecar gets to record a digest; it does not get to
+# choose which file is hashed. recordedSum in go/internal/restore/restore.go
+# draws the line in the same place, and hashes the file itself afterwards.
+#
+# The parse is ReadSumFile/parseSumLine from go/internal/agecrypt/sums.go: an
+# optional leading backslash for an escaped name, 128 hex digits, one space or
+# tab, an optional second space or '*' for binary mode, then the name — of
+# which only the base is compared, as recordedSum compares filepath.Base. Blank
+# lines and '#' comments are skipped; one name listed twice with two different
+# digests is a refusal, not a coin toss. An escaped name is left escaped rather
+# than unescaped: no artifact this format writes contains a backslash, a newline
+# or a carriage return, so such a line simply matches nothing and reads as "no
+# digest recorded for this file", which is the safe answer.
+recorded_sum() {  # recorded_sum SUMFILE NAME
+  [[ -f "$1" ]] || return 1
+  local out=""
+  out="$(N="$2" LC_ALL=C awk '
+    { line = $0; sub(/\r$/, "", line) }
+    line == "" || substr(line, 1, 1) == "#" { next }
+    {
+      if (substr(line, 1, 1) == "\\") line = substr(line, 2)
+      if (length(line) < 130) { bad = 1; exit }
+      d = tolower(substr(line, 1, 128))
+      if (d !~ /^[0-9a-f]{128}$/) { bad = 1; exit }
+      sep = substr(line, 129, 1)
+      if (sep != " " && sep != "\t") { bad = 1; exit }
+      n = substr(line, 130)
+      c = substr(n, 1, 1)
+      if (c == " " || c == "*") n = substr(n, 2)
+      if (n == "") { bad = 1; exit }
+      sub(/.*\//, "", n)
+      if (n in seen && seen[n] != d) { bad = 1; exit }
+      seen[n] = d
+      if (n == ENVIRON["N"] && got == "") got = d
+    }
+    END { if (bad) exit 2; if (got == "") exit 1; print got }
+  ' "$1")" || return $?
+  printf '%s' "$out"
+}
+
 # ingest_one SRC DST WANT — bring one file off the disc into staging, or say
 # why not. DST is where it is stored (the staged name, which for the sidecar
 # parity differs from the on-disc name); WANT is the hash the disc's SHA512SUMS
@@ -810,6 +934,43 @@ ingest_public_identity() {  # ingest_public_identity MOUNTPOINT
   step "staged the archive's published key as $dst — this set opens with nothing but the discs"
 }
 
+# refuse_escaping_sums MOUNTPOINT — every name in a disc's SHA512SUMS has to be
+# a path ON that disc, or the one command whose whole job is the integrity claim
+# is not making it.
+#
+# `sha512sum -c` hashes whatever each line names, resolved against the directory
+# it runs in, and never learns which files the caller meant. A disc whose
+# SHA512SUMS said "<digest of the empty file>  /dev/null" on every line would
+# therefore be reported "disc N verified" without a single byte of the disc
+# being read — and SHA512SUMS is a plain text file on media nobody here wrote.
+# The Go reader cannot be fooled that way: VerifyDir opens each name through an
+# os.Root rooted at the disc, which refuses an absolute path or one that climbs
+# out (go/internal/agecrypt/sums.go). This is that rule, applied before the
+# delegation rather than inside it.
+#
+# Lines that do not parse are left alone: --strict below is what answers those,
+# and a name is only judged when there is a name to judge.
+refuse_escaping_sums() {  # refuse_escaping_sums MOUNTPOINT
+  local bad
+  bad="$(LC_ALL=C awk '
+    { line = $0; sub(/\r$/, "", line) }
+    line == "" || substr(line, 1, 1) == "#" { next }
+    {
+      if (substr(line, 1, 1) == "\\") line = substr(line, 2)
+      if (length(line) < 130) next
+      if (tolower(substr(line, 1, 128)) !~ /^[0-9a-f]{128}$/) next
+      n = substr(line, 130)
+      c = substr(n, 1, 1)
+      if (c == " " || c == "*") n = substr(n, 2)
+      if (n == "") next
+      if (substr(n, 1, 1) == "/" || n == ".." || index(n, "../") == 1 \
+          || index(n, "/../") > 0 || n ~ /\/\.\.$/) { print n; exit }
+    }
+  ' "$1/SHA512SUMS")"
+  [[ -z "$bad" ]] \
+    || die "SHA512SUMS on this disc records a hash for $(esc_str "$bad"), which is not a file on the disc — 'sha512sum -c' would hash that instead and call the disc verified without reading it. This is not a checksum file brb wrote; treat the disc as untrusted."
+}
+
 cmd_verify_disc() {
   local n mp want actual marc
   # Validate before any printf '%02d': bash rejects "08" as bad octal and the
@@ -842,6 +1003,7 @@ cmd_verify_disc() {
       || warn "this disc belongs to archive '$(esc_str "$marc")', not '$ARCHIVE_NAME'"
   fi
 
+  refuse_escaping_sums "$mp"
   log "verifying disc $n at $mp"
   # --strict matters: without it a line inside SHA512SUMS that has itself rotted
   # is a WARNING, sha512sum still exits 0, and the file that line named is never
@@ -931,8 +1093,15 @@ cmd_ingest() {
   # marks regions of the DELETED file as already read, so the next attempt
   # would trust it (copy_file_robustly keeps an existing mapfile) and produce
   # a copy that can never complete.
-  rm -f -- "$ENC_DIR"/*.part "$ENC_DIR"/*.part.mapfile
-  trap 'rm -f -- "$ENC_DIR"/*.part "$ENC_DIR"/*.part.mapfile' EXIT
+  rm -f -- "$ENC_DIR"/*.part "$ENC_DIR"/*.part.mapfile "$STAGING/MANIFEST.txt.part"
+  # unmount_disc in the trap, not only on the paths that expect to fail: any die
+  # between mount_disc and the unmount at the foot of the loop — the foreign
+  # disc at the data/ check most of all — used to leave the drive mounted, and
+  # the kernel will not eject a mounted disc. The operator was then stuck with a
+  # tray that would not open and a second ingest that found the stale mount,
+  # took it for the disc to read, and failed the same way. unmount_disc only
+  # acts on a mount this script made, so it is a no-op on every other path.
+  trap 'rm -f -- "$ENC_DIR"/*.part "$ENC_DIR"/*.part.mapfile "$STAGING/MANIFEST.txt.part"; unmount_disc' EXIT
   local mp f base want prev_id="" this_id disc bad=0
   while :; do
     # Deliberately not prompt_enter/confirm: both auto-return under --yes, so
@@ -940,7 +1109,9 @@ cmd_ingest() {
     prompt_media "insert the next disc (any order), then press Enter — or type q to stop" || break
     [[ "$MEDIA_REPLY" == [qQ] ]] && break
     mount_disc "${1:-}"; mp="$MOUNT_POINT"
-    [[ -d "$mp/data" ]] || die "$mp has no data/ directory"
+    # udisks mounts a disc at a path named after its volume label, which is
+    # media-derived like every other name printed here.
+    [[ -d "$mp/data" ]] || die "$(esc_str "$mp") has no data/ directory — is this one of ours? (the trap above has unmounted it, so the tray will open)"
     # eject is silently a no-op on a disc the user cannot unmount, and findmnt
     # then keeps reporting the old mount point. Nothing else in the loop notices.
     this_id="$(disc_identity "$mp")"
@@ -977,8 +1148,21 @@ cmd_ingest() {
       if [[ -n "$want" && "$(sha512_of "$mp/MANIFEST.txt")" != "$want" ]]; then
         warn "MANIFEST.txt on this disc does not match the hash the disc records for it — not copying it"
         bad=$(( bad + 1 ))
+      # Through a .part and a rename, like every other file ingest stages, and
+      # counted rather than fatal. A bare `cp` over the staged copy truncated it
+      # first, so a read error part way through a scratched disc destroyed the
+      # good manifest AND — an untested simple command under set -e — ended the
+      # ingest on the spot, mid-set, with the remaining discs never offered.
+      # Nothing in a restore depends on this file (check_complete copes without
+      # one) and every disc carries the same copy, which is why the Go reader
+      # also treats a failure here as a warning: ingest.go:561-576.
+      elif cp -f -- "$mp/MANIFEST.txt" "$STAGING/MANIFEST.txt.part" \
+           && mv -f -- "$STAGING/MANIFEST.txt.part" "$STAGING/MANIFEST.txt"; then
+        :
       else
-        cp -f -- "$mp/MANIFEST.txt" "$STAGING/MANIFEST.txt"
+        rm -f -- "$STAGING/MANIFEST.txt.part"
+        warn "could not copy MANIFEST.txt off this disc — keeping whatever is already staged (every disc carries the same one)"
+        bad=$(( bad + 1 ))
       fi
     fi
     unmount_disc
@@ -1037,13 +1221,24 @@ resolve_identity() {
 # that into the "path".
 PREPARED_IMG=""
 prepare_image() {
-  local enc="$1" base plain intact
+  local enc="$1" base ebase plain intact
   base="$(basename "$enc" .age)"
+  # $ebase exists only to be printed, the same split ingest_one makes: the image
+  # name is whatever the disc's data/ directory called it, ingest stages it
+  # under exactly those bytes, and the restore glob matches any name of the
+  # disc*.squashfs.age shape whatever sits in the middle. Raw $base is what the
+  # paths and the comparisons use; every message below prints $ebase, so an ESC
+  # in a name retitles nobody's terminal on the way past.
+  ebase="$(esc_str "$base")"
   plain="$RESTORE_DIR/$base"
   # Cheap, and re-checked per image on purpose: every caller secures the
   # staging tree up front, but a long restore gives a co-tenant time, and this
   # is the last moment before a decrypted image is written under $RESTORE_DIR.
   secure_dir "$RESTORE_DIR"
+
+  # Which disc's sidecar parity to point at when a small file turns out to be
+  # the corrupt party. 0 (a name this format did not produce) means any set.
+  local disc; disc="$(disc_number_of "$base.age")"
 
   # The cache below is only worth having if what it hands back is known good.
   # A previous run that died on the hash check left its corrupt plaintext right
@@ -1053,15 +1248,24 @@ prepare_image() {
   # two files are read from: the image and the sidecar it is checked against
   # both live in staging, so anyone who can write there can plant a matching
   # pair and have it extracted with no age authentication at all. secure_dir
-  # above is what makes this check mean anything.
+  # above is what makes this check mean anything — that, and hashing the image
+  # OURSELVES against the digest recorded for it, rather than handing the
+  # sidecar to `sha512sum -c` and letting it choose the file (see recorded_sum).
+  local want rc
   if [[ -f "$plain" ]]; then
-    if [[ -f "$ENC_DIR/$base.sha512" ]]; then
-      cp -f -- "$ENC_DIR/$base.sha512" "$RESTORE_DIR/"
-      if ( cd "$RESTORE_DIR" && sha512sum -c --status "$base.sha512" ); then
-        step "reusing verified $base"; PREPARED_IMG="$plain"; return 0
-      fi
-      warn "cached $base is corrupt — discarding and decrypting again"
-      rm -f -- "$plain"
+    rc=0; want="$(recorded_sum "$ENC_DIR/$base.sha512" "$base")" || rc=$?
+    if (( rc == 0 )) && [[ "$(sha512_of "$plain")" == "$want" ]]; then
+      step "reusing verified $ebase"; PREPARED_IMG="$plain"; return 0
+    fi
+    if (( rc == 0 )); then
+      warn "cached $ebase is corrupt — discarding and decrypting again"
+    elif (( rc == 2 )); then
+      # A sidecar too damaged to parse cannot condemn the image either; the
+      # plaintext is simply unvouched-for, and decrypting again costs exactly
+      # what reusing it was saving. reuseDecrypted in
+      # go/internal/restore/restore.go treats missing and unreadable alike.
+      warn "$ebase.sha512 cannot be read, so the existing $ebase in $RESTORE_DIR cannot be checked against it — discarding it and decrypting again"
+      warn "  ($(sidecar_repair_hint "$disc"))"
     else
       # No recorded plaintext hash, so nothing here can vouch for what is at
       # this path — and it need not be ours: $RESTORE_DIR is shared by every
@@ -1070,22 +1274,30 @@ prepare_image() {
       # set's disc 2 and extracted over the destination unchecked. Discarding
       # costs one decryption, which is what reusing it was saving.
       # reuseDecrypted in go/internal/restore/restore.go discards here too.
-      warn "no recorded plaintext hash to check the existing $base in $RESTORE_DIR against — discarding it and decrypting again"
-      rm -f -- "$plain"
+      warn "no recorded plaintext hash to check the existing $ebase in $RESTORE_DIR against — discarding it and decrypting again"
     fi
+    rm -f -- "$plain"
   fi
 
-  # Which disc's sidecar parity to point at when a small file turns out to be
-  # the corrupt party. 0 (a name this format did not produce) means any set.
-  local disc; disc="$(disc_number_of "$base.age")"
-
+  local cwant=""
   intact=unknown
-  if [[ -f "$ENC_DIR/$base.age.sha512" ]]; then
-    if ( cd "$ENC_DIR" && sha512sum -c --status "$base.age.sha512" ); then
+  rc=0; cwant="$(recorded_sum "$ENC_DIR/$base.age.sha512" "$base.age")" || rc=$?
+  if (( rc == 0 )); then
+    if [[ "$(sha512_of "$enc")" == "$cwant" ]]; then
       intact=yes
     else
-      intact=no; warn "$base.age does not match its recorded hash" >&2
+      intact=no; warn "$ebase.age does not match its recorded hash" >&2
     fi
+  elif (( rc == 2 )); then
+    # The likeliest shape of a rotted sidecar: the flipped byte landed in the
+    # digest and the line no longer parses, so it says nothing about the image
+    # rather than disagreeing with it. Refusing over that would throw away a
+    # multi-gigabyte ciphertext on the word of 150 bytes that have their own
+    # parity, so fall through as if no hash had been recorded — par2 becomes
+    # the authority, and the decrypted image is still checked below.
+    # recordedCipherSum in go/internal/restore/restore.go does the same.
+    warn "$ebase.age.sha512 cannot be read, so it is the sidecar that is corrupt, not $ebase.age" >&2
+    warn "  ($(sidecar_repair_hint "$disc"))" >&2
   fi
 
   if [[ "$intact" == "unknown" ]]; then
@@ -1096,40 +1308,40 @@ prepare_image() {
     # rather than quietly, and the decrypted image is still checked against its
     # own .sha512 below. Same three answers as checkCiphertextNoSum in
     # go/internal/restore/restore.go.
-    warn "no recorded hash for $base.age" >&2
+    warn "no recorded hash for $ebase.age" >&2
     if [[ ! -f "$enc.par2" ]]; then
       warn "no par2 data either; relying on age's authentication to detect damage" >&2
     elif ! command -v par2 >/dev/null 2>&1; then
       warn "par2 is not installed to check it either; relying on age's authentication to detect damage" >&2
     else
-      step "checking $base.age with par2 instead"
+      step "checking $ebase.age with par2 instead"
       par2_repair_image "$base" \
-        || die "par2 could not repair $base.age. If you burned a second copy of the set, ingest that disc into $ENC_DIR too and retry."
+        || die "par2 could not repair $ebase.age. If you burned a second copy of the set, ingest that disc into $ENC_DIR too and retry."
     fi
   elif [[ "$intact" == "no" ]]; then
-    [[ -f "$enc.par2" ]] || die "$base.age is damaged and has no par2 data. Ingest another copy of that disc and retry."
+    [[ -f "$enc.par2" ]] || die "$ebase.age is damaged and has no par2 data. Ingest another copy of that disc and retry."
     # mount and list do not insist on par2 up front, because a clean image never
     # needs it. This one does: the honest failure is the missing tool, not
     # "unrepairable" data that par2 has not been allowed to look at.
-    need par2 "$base.age is damaged and cannot be repaired without it"
-    warn "attempting par2 repair of $base.age" >&2
+    need par2 "$ebase.age is damaged and cannot be repaired without it"
+    warn "attempting par2 repair of $ebase.age" >&2
     par2_repair_image "$base" \
-      || die "par2 could not repair $base.age. If you burned a second copy of the set, ingest that disc into $ENC_DIR too and retry."
+      || die "par2 could not repair $ebase.age. If you burned a second copy of the set, ingest that disc into $ENC_DIR too and retry."
     # par2 covers the ciphertext only. When par2 says the image is whole and the
     # 170-byte .sha512 sidecar disagrees, the sidecar is what rotted — dying
     # here would throw away a 22 GB image that is provably byte-for-byte
     # correct. The decrypted image is still checked against .sha512 below, so
     # nothing is decrypted on trust.
-    if ( cd "$ENC_DIR" && sha512sum -c --status "$base.age.sha512" ); then
-      ok "repaired $base.age" >&2
+    if [[ "$(sha512_of "$enc")" == "$cwant" ]]; then
+      ok "repaired $ebase.age" >&2
     else
-      warn "$base.age passes par2 but not its .sha512 sidecar — the sidecar is what is corrupt, not the image" >&2
+      warn "$ebase.age passes par2 but not its .sha512 sidecar — the sidecar is what is corrupt, not the image" >&2
       warn "  ($(sidecar_repair_hint "$disc"))" >&2
     fi
   fi
 
   age_d -o "$plain.part" "$enc" \
-    || { rm -f -- "$plain.part"; die "decryption failed for $base"; }
+    || { rm -f -- "$plain.part"; die "decryption failed for $ebase"; }
   mv -- "$plain.part" "$plain"
 
   # Delete on failure: a rejected image left behind is what the cache above
@@ -1137,12 +1349,21 @@ prepare_image() {
   # decrypts, so the ciphertext is intact and the two candidates are the image
   # that was encrypted and the 150-byte sidecar recording its hash — and the
   # sidecar is the one with its own parity, so say how to put it back.
-  if [[ -f "$ENC_DIR/$base.sha512" ]]; then
-    cp -f -- "$ENC_DIR/$base.sha512" "$RESTORE_DIR/"
-    ( cd "$RESTORE_DIR" && sha512sum -c --status "$base.sha512" ) \
-      || { rm -f -- "$plain"; die "decrypted image $base does not match the hash in $base.sha512; the ciphertext decrypted cleanly, so either the image is not what was backed up or that sidecar has rotted — $(sidecar_repair_hint "$disc"), then retry"; }
-  else
-    warn "no recorded hash for the decrypted $base; age's own authentication is the only check performed" >&2
+  rc=0; want="$(recorded_sum "$ENC_DIR/$base.sha512" "$base")" || rc=$?
+  if (( rc == 2 )); then
+    # Unlike the ciphertext, there is nothing else to appeal to here: par2
+    # covers the .age file, not the image inside it, so an unreadable sidecar
+    # means the decrypted image cannot be checked at all. Leaving it on disk
+    # would let the cache above hand it over unchecked on the very next run —
+    # the run made straight after repairing this sidecar. PrepareImage in
+    # go/internal/restore/restore.go removes it here for the same reason.
+    rm -f -- "$plain"
+    die "$ebase.sha512 is damaged and cannot be read, so nothing can check the image decrypted from $ebase.age — $(sidecar_repair_hint "$disc"), then retry"
+  elif (( rc != 0 )); then
+    warn "no recorded hash for the decrypted $ebase; age's own authentication is the only check performed" >&2
+  elif [[ "$(sha512_of "$plain")" != "$want" ]]; then
+    rm -f -- "$plain"
+    die "decrypted image $ebase does not match the hash in $ebase.sha512; the ciphertext decrypted cleanly, so either the image is not what was backed up or that sidecar has rotted — $(sidecar_repair_hint "$disc"), then retry"
   fi
   PREPARED_IMG="$plain"
 }
@@ -1179,9 +1400,12 @@ par2_repair_image() {
 # is a hard refusal rather than a question, and --yes does not answer it.
 #
 # A symlink to a FILE is safe (unsquashfs unlinks and replaces it as an entry)
-# and is left alone. -P and the stripped trailing slash keep $dest itself from
+# and is left alone. -P and dir_path's normalisation keep $dest itself from
 # being followed: a destination that IS a symlink to a directory is the same
-# escape, and lands the whole archive in the target.
+# escape, and lands the whole archive in the target. cmd_restore has already
+# normalised what it passes here — this call is the belt to that brace, and
+# both must use the same spelling as the -d handed to unsquashfs, or the guard
+# and the extraction end up talking about two different directories.
 #
 # Within one run this needs checking only before the first image: the skeleton
 # on every disc makes a path either a directory or a leaf across the whole set,
@@ -1192,7 +1416,7 @@ par2_repair_image() {
 # silenced here) and carries on with the rest of the tree. A destination the
 # restore cannot even read is one unsquashfs is about to fail on anyway.
 refuse_symlinked_dirs() {
-  local d="${1%/}"; [[ -n "$d" ]] || d="/"
+  local d; d="$(dir_path "$1")"; [[ -n "$d" ]] || d="/"
   local -a bad=()
   local p
   while IFS= read -r -d '' p; do
@@ -1228,8 +1452,19 @@ refuse_symlinked_dirs() {
 # that already has some of the archive's own links in it, and the skeleton on
 # every disc makes a path either a directory or a leaf across the whole set, so
 # what an earlier disc extracted can never trip this for a later one. The
-# destination itself counts as the root directory. The Go reader makes the
-# same check, and both refuse with the same words.
+# destination itself counts as the root directory.
+#
+# With --only, only the directories the extraction will actually touch are
+# checked, so a live $HOME's unrelated symlinks do not block fetching one file
+# back into it — which is the whole use --only exists for. "Touches" is
+# extractionTouches in go/internal/restore/extract.go, and it is deliberately
+# wider than "is the requested path": unsquashfs sets the archive's attributes
+# on every directory it descends THROUGH, so an ancestor of the requested path
+# is as much a hazard as the path itself. This function ignored --only
+# altogether until now, which made brb.sh refuse restores the Go reader carried
+# on the same disc performed — with the comment here claiming the two agreed.
+# The refusal below is the Go reader's sentence, word for word, for the same
+# reason.
 #
 # unsquashfs -ll prints one entry per line, so a directory whose name carries a
 # newline is listed as two half-lines and neither is checked — the same limit
@@ -1250,8 +1485,9 @@ refuse_symlinked_dirs() {
 # The listing is read whole rather than streamed for one reason: its exit
 # status has to be taken before a single line of it is believed, and at the
 # head of a pipeline that status is the easiest thing in shell to drop.
-refuse_symlinks_at_dirs() {  # refuse_symlinks_at_dirs IMAGE DEST
-  local img="$1" d="${2%/}"; [[ -n "$d" ]] || d="/"
+refuse_symlinks_at_dirs() {  # refuse_symlinks_at_dirs IMAGE DEST [ONLY]
+  local img="$1" d only="${3:-}"
+  d="$(dir_path "$2")"; [[ -n "$d" ]] || d="/"
   local -a bad=()
   local p
   # A destination that is itself a link is caught above; the belt to that
@@ -1262,7 +1498,7 @@ refuse_symlinks_at_dirs() {  # refuse_symlinks_at_dirs IMAGE DEST
   # reason it gives should be readable next to what the tool itself said.
   local listing="" rc=0
   listing="$(unsquashfs -ll "$img")" || rc=$?
-  (( rc == 0 )) || die "could not list the directories of ${img##*/}: 'unsquashfs -ll' exited $rc. That listing is the only thing that says which paths this image holds as directories, and without it a symlink planted in $d cannot be told from one the backup itself carries — so the restore stops here rather than extract past a check that compared nothing. Fix or re-ingest that image and retry, or restore it with the Go reader on the disc (brb-linux-amd64)."
+  (( rc == 0 )) || die "could not list the directories of $(esc_str "${img##*/}"): 'unsquashfs -ll' exited $rc. That listing is the only thing that says which paths this image holds as directories, and without it a symlink planted in $d cannot be told from one the backup itself carries — so the restore stops here rather than extract past a check that compared nothing. Fix or re-ingest that image and retry, or restore it with the Go reader on the disc (brb-linux-amd64)."
 
   # One pass over the listing, printing the count of entries it recognised
   # first and the archive-relative directory paths after it.
@@ -1299,24 +1535,43 @@ refuse_symlinks_at_dirs() {  # refuse_symlinks_at_dirs IMAGE DEST
   # zero means the listing was not in the shape this parses — not that the
   # image is empty.
   [[ "${parsed[0]:-}" =~ ^[1-9][0-9]*$ ]] \
-    || die "could not read the directory listing of ${img##*/}: 'unsquashfs -ll' succeeded, but not one line of it was in the '<mode> <user>/<group> <size> <date> <time> squashfs-root/<path>' form this reads. This guard has nothing to compare and will not pass by default, so the restore stops here. Please report the unsquashfs version; meanwhile restore with the Go reader carried on every disc (brb-linux-amd64 / brb-linux-aarch64)."
+    || die "could not read the directory listing of $(esc_str "${img##*/}"): 'unsquashfs -ll' succeeded, but not one line of it was in the '<mode> <user>/<group> <size> <date> <time> squashfs-root/<path>' form this reads. This guard has nothing to compare and will not pass by default, so the restore stops here. Please report the unsquashfs version; meanwhile restore with the Go reader carried on every disc (brb-linux-amd64 / brb-linux-aarch64)."
 
   local i
   for (( i = 1; i < ${#parsed[@]}; i++ )); do
     p="${parsed[i]}"
+    if [[ -n "$only" ]] && ! extraction_touches "$only" "$p"; then continue; fi
     [[ -L "$d/$p" ]] || continue
     bad+=( "$(esc_str "$d/$p -> $(readlink -- "$d/$p" 2>/dev/null || true)")" )
     (( ${#bad[@]} < 5 )) || break
   done
   if (( ${#bad[@]} == 0 )); then return 0; fi
   local list; list="$(printf '%s, ' "${bad[@]}")"; list="${list%, }"
-  die "$d contains symlink(s) where ${img##*/} holds directories ($list); unsquashfs -f would set the archive's directory mode, owner and times on whatever they point at — remove them, or restore into an empty directory and merge by hand"
+  die "$d holds symlink(s) where $(esc_str "${img##*/}") has directories ($list); unsquashfs -f would apply the backup's directory mode, owner and times THROUGH them to whatever they point at — remove them, or restore into an empty directory and merge by hand"
+}
+
+# extraction_touches ONLY DIR — will unsquashfs, asked for ONLY, create or
+# re-attribute the archive directory DIR? It does when DIR is the requested
+# path, is under it, or is an ancestor extraction has to descend through:
+# unsquashfs sets the archive's mode, owner and times on every directory it
+# passes, not only on the ones named. extractionTouches in
+# go/internal/restore/extract.go, with the same three arms; an empty ONLY
+# extracts everything and never reaches here.
+extraction_touches() {  # extraction_touches ONLY DIR
+  [[ "$1" == "" || "$1" == "." || "$2" == "$1" || "$2" == "$1"/* || "$1" == "$2"/* ]]
 }
 
 cmd_restore() {
   need age; need par2; need unsquashfs; need sha512sum
   local dest="${1:-}"
   [[ -n "$dest" ]] || die "usage: $PROG restore <destination> [--only <path-in-archive>] [--disc N]"
+  # Normalised ONCE, here, and used everywhere below — both symlink guards and
+  # the -d handed to unsquashfs. A destination spelled "dest//" or "dest/." is
+  # the same directory to unsquashfs but not to lstat, so a guard given the raw
+  # string and an extraction given the raw string were checking one path and
+  # writing another (see dir_path). The Go reader does the same, with
+  # filepath.Clean at the head of Extract.
+  dest="$(dir_path "$dest")"
   shift || true
   local only="" onedisc=""
   while (( $# )); do
@@ -1400,9 +1655,12 @@ cmd_restore() {
       if [[ -f "$e" ]]; then sel+=( "$e" )
       else warn "'$only' is partly on disc $d, whose image is not in $ENC_DIR"; fi
     done
-    (( ${#sel[@]} )) || die "'$only' is on disc(s) ${hits[*]}, none of which have been ingested"
+    # ${hits[*]} is field 1 of the decrypted index, which came off a disc: the
+    # loop above drops anything that is not a plain number before using it as a
+    # disc, but these two lines PRINT it, so they escape it (see esc_controls).
+    (( ${#sel[@]} )) || die "'$only' is on disc(s) $(esc_str "${hits[*]}"), none of which have been ingested"
     encs=( "${sel[@]}" )
-    step "'$only' is on disc(s) ${hits[*]}"
+    step "'$only' is on disc(s) $(esc_str "${hits[*]}")"
   fi
 
   # The images to be decrypted are sitting right there, so measure them rather
@@ -1434,11 +1692,11 @@ cmd_restore() {
   log "restoring ${#encs[@]} image(s) to $dest"
   local enc img found=0
   for enc in "${encs[@]}"; do
-    step "preparing $(basename "$enc")"
+    # The name is a staged file name, and ingest stages whatever the disc's
+    # data/ directory holds under the on-disc name — Rock Ridge and all. So it
+    # is escaped, exactly as ingest escapes it on the way in.
+    step "preparing $(esc_str "$(basename "$enc")")"
     prepare_image "$enc"; img="$PREPARED_IMG"
-    # The second symlink guard, per image: it needs the image's own list of
-    # directories, which exists only now that it is decrypted.
-    refuse_symlinks_at_dirs "$img" "$dest"
     # unsquashfs exits 0 having created nothing when the requested path is not
     # in the image, so without this the run reports "extracted" for every disc
     # and gives no signal at all about the one file the user asked for. The
@@ -1453,15 +1711,24 @@ cmd_restore() {
     # same short-circuit pathsPresent makes in go/internal/restore/extract.go.
     # An if, not `&&`: a false test would become the loop body's status and
     # errexit would end the restore here.
+    #
+    # Ahead of the symlink guard, as pathsPresent is in the Go reader
+    # (go/internal/restore/extract.go): an image this path is not on extracts
+    # nothing at all, so there is nothing for the guard to protect and no
+    # reason for an unrelated link in the destination to stop the run.
     local precheck="$only"
     if [[ "$only" == *$'\n'* || "$only" == *$'\r'* ]]; then precheck=""; fi
     if [[ -n "$precheck" ]] && ! unsquashfs -l "$img" 2>/dev/null \
         | P="squashfs-root/$only" awk \
             '$0 == ENVIRON["P"] || index($0, ENVIRON["P"] "/") == 1 { f=1; exit } END { exit !f }'; then
-      step "$only is not on $(basename "$img")"
-      if (( ! KEEP_IMAGES )); then rm -f -- "$img" "$RESTORE_DIR/$(basename "$img").sha512"; fi
+      step "$only is not on $(esc_str "$(basename "$img")")"
+      if (( ! KEEP_IMAGES )); then rm -f -- "$img"; fi
       continue
     fi
+    # The second symlink guard, per image: it needs the image's own list of
+    # directories, which exists only now that it is decrypted, and the --only
+    # path, which decides which of those directories extraction can reach.
+    refuse_symlinks_at_dirs "$img" "$dest" "$only"
     # unsquashfs syntax: unsquashfs [options] FILESYSTEM [paths to extract]
     # The path filter must follow the image, not precede it.
     # -no-wildcards is not optional (and matches the Go build): by default
@@ -1488,16 +1755,20 @@ cmd_restore() {
     local ulog urc=0
     ulog="$RESTORE_DIR/unsquashfs.$(basename "$img").log"
     unsquashfs "${ua[@]}" >"$ulog" 2>&1 || urc=$?
+    # unsquashfs names the entries it could not write, and those names come out
+    # of the image — chosen by whoever could plant one file in the backed-up
+    # tree. Its output goes through esc_controls for the same reason ingest's
+    # names do, rather than straight to the terminal.
     if (( urc == 2 )); then
-      warn "unsquashfs reported non-fatal errors on $(basename "$img") — see $ulog"
-      grep -v '^$' "$ulog" | head -3 | sed 's/^/    /' >&2
+      warn "unsquashfs reported non-fatal errors on $(esc_str "$(basename "$img")") — see $ulog"
+      grep -v '^$' "$ulog" | head -3 | esc_controls | sed 's/^/    /' >&2
     elif (( urc != 0 )); then
-      warn "unsquashfs output:"; sed 's/^/    /' "$ulog" >&2
-      die "unsquashfs failed on $(basename "$img") (exit $urc)"
+      warn "unsquashfs output:"; esc_controls < "$ulog" | sed 's/^/    /' >&2
+      die "unsquashfs failed on $(esc_str "$(basename "$img")") (exit $urc)"
     else
       rm -f -- "$ulog"
     fi
-    ok "$(basename "$img") extracted"
+    ok "$(esc_str "$(basename "$img")") extracted"
     # The listing said the path was here, but the destination is the proof:
     # only count --only as found when the path actually materialised. -L covers
     # a dangling symlink, which -e alone reports as absent.
@@ -1505,7 +1776,7 @@ cmd_restore() {
     # Keeping every decrypted image alive means a restore needs roughly twice
     # the archive size. Free each one as soon as its contents are on disk.
     if (( ! KEEP_IMAGES )); then
-      rm -f -- "$img" "$RESTORE_DIR/$(basename "$img").sha512"
+      rm -f -- "$img"
       step "removed the decrypted image (KEEP_IMAGES=1 keeps them for re-runs)"
     fi
   done
@@ -1603,6 +1874,14 @@ esc_str() { local s="${1//$'\n'/\\n}"; printf '%s\n' "$s" | esc_controls; }
 
 cmd_index() {
   need age
+  # Before resolve_identity, for the reason cmd_restore gives: the identity a
+  # public set is read with comes out of $ENC_DIR, and so does the ciphertext
+  # this decrypts, so that directory has to be one of ours before either is
+  # read from it. index was the one staging-reading command that skipped this —
+  # against a $STAGING another local account created first (/var/tmp is 1777),
+  # it decrypted a planted index with a planted key and printed the result as
+  # this archive's disc map, where every sibling command refuses on ownership.
+  secure_staging "$ENC_DIR"
   resolve_identity
   local idx="$ENC_DIR/index.tsv.gz.age"
   [[ -f "$idx" ]] || die "no index at $idx — run '$PROG ingest' first"

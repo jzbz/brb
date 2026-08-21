@@ -1,21 +1,25 @@
 // Package agecrypt wraps age encryption and SHA-512 hashing for brb.
 //
-// It replaces the age(1), sha512sum(1) and find(1) subprocesses used by the
-// bash reference implementation. Two properties matter above all others:
+// It does in-process what brb.sh, the reader shipped on every disc, shells out
+// to age(1) and sha512sum(1) for. Two properties matter above all others:
 //
 //   - Every stream is written to a "<name>.part" file that is fsynced and
 //     renamed into place only after the whole operation succeeded. A partial
 //     file is removed on any error, including context cancellation, so a
 //     truncated ciphertext can never be mistaken for a complete one.
 //   - Encrypt computes the plaintext and the ciphertext SHA-512 in a single
-//     pass over the data. The bash version reads a multi-gigabyte image three
-//     times to obtain the same two hashes.
+//     pass over the data. Hashing the plaintext, encrypting and hashing the
+//     ciphertext as three separate steps would read a multi-gigabyte image
+//     three times to learn the same two numbers.
 //
-// The checksum files written here are byte-compatible with GNU sha512sum, so a
-// disc produced by either implementation verifies with the other.
+// The checksum files written here are byte-compatible with GNU sha512sum,
+// which is the program brb.sh verifies a disc with (`sha512sum -c --quiet
+// --strict SHA512SUMS`, brb.sh:852). Only the Go build writes a disc;
+// xcompat-test.sh pins that both readers accept what it wrote.
 package agecrypt
 
 import (
+	"bufio"
 	"context"
 	"crypto/sha512"
 	"encoding/hex"
@@ -23,13 +27,14 @@ import (
 	"fmt"
 	"hash"
 	"io"
-	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
 	"time"
 
 	"filippo.io/age"
+
+	"github.com/jzbz/brb/internal/fsx"
 )
 
 // copyBufSize is the chunk size of the streaming copies. Large enough that the
@@ -71,6 +76,17 @@ func ParseRecipientsFile(path string) ([]age.Recipient, error) {
 // ParseIdentityFile reads an age identity file: one secret key per line,
 // ignoring blank lines and lines starting with "#". It is an error for the file
 // to contain no keys.
+//
+// A parse failure is reported in this package's own words and never in age's.
+// age quotes the line it could not place straight back at the caller
+// ("unknown identity type: %q"), and in an identity file that line is the
+// secret key: a paste that carried one leading space, or a key round-tripped
+// through something that lowercased it, is still a perfectly good key, and
+// every caller prints the error it gets — onto the terminal, into the
+// scrollback, into a CI log, into the bug report the operator then attaches
+// the whole thing to. Nothing here may put key material in an error string.
+// ParseRecipientsFile above deliberately keeps age's message: its lines are
+// public keys, and the exact text is the fastest way to fix a typo in one.
 func ParseIdentityFile(path string) ([]age.Identity, error) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -79,9 +95,44 @@ func ParseIdentityFile(path string) ([]age.Identity, error) {
 	defer f.Close()
 	ids, err := age.ParseIdentities(f)
 	if err != nil {
-		return nil, fmt.Errorf("agecrypt: parse identity file %s: %w", path, err)
+		return nil, redactedIdentityError(path, f)
 	}
 	return ids, nil
+}
+
+// maxIdentityLine bounds one line of an identity file while [ParseIdentityFile]
+// is locating the line that failed. An age secret key is 74 characters; a
+// megabyte is a line no identity file has, and stops a rescan of a file that
+// turned out to be a disc image from buffering it.
+const maxIdentityLine = 1 << 20
+
+// redactedIdentityError says which line of an identity file age refused,
+// without reproducing any of it.
+//
+// The line number comes from re-scanning the file and offering each key line
+// to age on its own, so the verdict is age's rather than a second copy of its
+// dispatch here that would drift from it — and so the message age returns can
+// be thrown away unread. A rescan that cannot single out one line (an empty
+// file, a file of nothing but comments, a seek that failed) still yields an
+// error naming the file, because returning nil here would turn an unparseable
+// identity into a silent success.
+func redactedIdentityError(path string, f *os.File) error {
+	const advice = "its content is not quoted here because it is secret key material — " +
+		"check that the key line is one unmodified AGE-SECRET-KEY-1... with no leading space and no change of case"
+	if _, err := f.Seek(0, io.SeekStart); err == nil {
+		sc := bufio.NewScanner(f)
+		sc.Buffer(make([]byte, 0, 4<<10), maxIdentityLine)
+		for n := 1; sc.Scan(); n++ {
+			line := sc.Text()
+			if line == "" || strings.HasPrefix(line, "#") {
+				continue
+			}
+			if _, err := age.ParseIdentities(strings.NewReader(line)); err != nil {
+				return fmt.Errorf("agecrypt: identity file %s: line %d is not an age identity — %s", path, n, advice)
+			}
+		}
+	}
+	return fmt.Errorf("agecrypt: identity file %s holds no age identity — %s", path, advice)
 }
 
 // ReadX25519IdentityFile reads an identity file that must hold exactly one
@@ -170,11 +221,13 @@ func writeIdentityFile(path string, id *age.X25519Identity, mode os.FileMode) (e
 // produces and what [age.NewScryptIdentity] unlocks on the restore side.
 //
 // The plaintext identity never becomes a file. It is rendered into the age
-// writer and nowhere else, which is the whole point of the rescue key:
-// brb.sh's construction pipes age-keygen's stdout straight into `age -p`
-// precisely so there is nothing to shred afterwards, and shred can promise
-// nothing on a copy-on-write, compressed or flash-translated filesystem
-// anyway. This function is that pipe.
+// writer and nowhere else, which is the whole point of the rescue key: the
+// construction it stands in for is `age-keygen | age -p`, a pipe with nothing
+// to shred afterwards, and shred can promise nothing on a copy-on-write,
+// compressed or flash-translated filesystem anyway. This function is that
+// pipe. What brb.sh does with the result is read it: find_identity (brb.sh:206)
+// tries rescue-identity.txt.age beside the recipients file, which is why
+// init-key writes it under that name and in that directory.
 //
 // The file is created with O_EXCL and mode 0400, and removed again if anything
 // after the create fails, so a half-written container that nobody's passphrase
@@ -281,6 +334,63 @@ func AppendRecipient(path, pubkey string) (err error) {
 	}
 	if err := f.Sync(); err != nil {
 		return fmt.Errorf("agecrypt: sync recipients file %s: %w", path, err)
+	}
+	return nil
+}
+
+// ProbeRecipients encrypts a few bytes to recs, in memory and to nowhere, and
+// returns whatever age refuses with.
+//
+// It exists because parsing a recipients file proves each key well-formed and
+// nothing at all about the set: age (1.3 on) refuses to encrypt to a set that
+// mixes post-quantum (age1pq1...) and classic (age1...) recipients, while
+// [ParseRecipientsFile] and [AppendRecipient] both accept such a file happily.
+// The probe is the same call [Encrypt] makes, so anything age will object to
+// about the set is objected to here instead, at the cost of one header.
+func ProbeRecipients(recs []age.Recipient) error {
+	if len(recs) == 0 {
+		return ErrNoRecipients
+	}
+	w, err := age.Encrypt(io.Discard, recs...)
+	if err != nil {
+		return err
+	}
+	if _, err := w.Write([]byte("brb")); err != nil {
+		return err
+	}
+	return w.Close()
+}
+
+// CheckRecipientAddition reports whether appending pubkey to the recipients
+// file at path would leave a set age is still willing to encrypt to.
+//
+// Call it before minting anything. init-key's failure without it is not a
+// failed command but a broken archive: --rescue-key wrote the encrypted
+// container, appended a classic key beside a post-quantum one, printed "discs
+// built from now on are encrypted to both keys", and every later backup then
+// died in preflight on a set age will not mix. The operator's only way out was
+// to edit the recipients file by hand, and init-key refuses to re-mint a
+// rescue key while the container exists — so the promised second way in was a
+// file nothing was ever encrypted to.
+//
+// A recipients file that does not exist yet, or that this package cannot parse
+// at all, is not this function's refusal to make: the first is the ordinary
+// first run, and the second already fails loudly in backup preflight with a
+// message about the file rather than about the key being added. Only a set age
+// itself rejects is reported here.
+func CheckRecipientAddition(path, pubkey string) error {
+	existing, err := ParseRecipientsFile(path)
+	if err != nil {
+		return nil
+	}
+	added, err := age.ParseRecipients(strings.NewReader(strings.TrimSpace(pubkey)))
+	if err != nil {
+		return fmt.Errorf("agecrypt: invalid recipient %q: %w", pubkey, err)
+	}
+	if err := ProbeRecipients(append(existing, added...)); err != nil {
+		return fmt.Errorf("agecrypt: adding %s to %s would make a set age refuses to encrypt to: %w — "+
+			"a set may not mix post-quantum (age1pq1...) and classic (age1...) recipients; edit %s so it "+
+			"holds one kind only, and re-run", pubkey, path, err, path)
 	}
 	return nil
 }
@@ -468,7 +578,8 @@ func copyCtx(ctx context.Context, dst io.Writer, src io.Reader) (int64, error) {
 // onto the discs, where the settled format is 0644; plaintext is written into
 // staging, where the default STAGING under /var/tmp is world-executable and
 // every local account could otherwise read the whole decrypted archive for as
-// long as a restore runs. brb.sh writes 0600 there for exactly that reason.
+// long as a restore runs. brb.sh gets 0600 there the other way, with a
+// `umask 077` around its staging writes (brb.sh:266).
 const (
 	partModePublic  os.FileMode = 0o644
 	partModePrivate os.FileMode = 0o600
@@ -481,30 +592,19 @@ const (
 // returns the original error. The returned error of finish is the error to
 // report.
 //
-// The partial file is created with O_EXCL and never O_TRUNC. O_TRUNC follows
-// whatever is already at the path, and in a staging directory the default of
-// which lives under /var/tmp, "whatever is already there" can be a symlink
-// another local user planted: opening through it would stream a decrypted
-// image — or a ciphertext, or a checksum file — into a file of that user's
-// choosing, with this process's privileges. O_EXCL refuses to open through a
-// symlink at all, dangling or not; the kernel guarantees that, with no window
-// between a check and the open.
-//
-// The stale-.part case O_TRUNC used to cover silently — a run killed
-// mid-write, then repeated: a backup that is --resumed re-encrypts the disc it
-// was on, and the writer reaps nothing beforehand — is handled by removing
-// the leftover first. Removing a path removes the link itself and never what
-// it points to, so that step is safe on a symlink too, and anything planted
-// between the Remove and the open still meets O_EXCL. Doing it here rather
-// than in every caller keeps the writer's callers working unchanged.
+// The .part is opened by [fsx.CreateFresh]: remove whatever is there, then
+// O_EXCL, never O_TRUNC — because a symlink another local user planted in
+// staging would otherwise be opened straight through, streaming a decrypted
+// image into a file of their choosing. That rule and the reason for it live in
+// one place on purpose (fsx/fsx.go: "each rewrite lost a piece of them"), so
+// it is not restated here. The stale-.part case it covers is reached in this
+// package by a backup that is --resumed and re-encrypts the disc it was killed
+// on, the writer having reaped nothing beforehand.
 func createPart(dst string, mode os.FileMode) (*os.File, func(error) error, error) {
 	part := dst + ".part"
-	if err := os.Remove(part); err != nil && !errors.Is(err, fs.ErrNotExist) {
-		return nil, nil, fmt.Errorf("agecrypt: removing the stale %s: %w", part, err)
-	}
-	f, err := os.OpenFile(part, os.O_WRONLY|os.O_CREATE|os.O_EXCL, mode)
+	f, err := fsx.CreateFresh(part, mode)
 	if err != nil {
-		return nil, nil, fmt.Errorf("agecrypt: create %s: %w", part, err)
+		return nil, nil, fmt.Errorf("agecrypt: %w", err)
 	}
 	finish := func(opErr error) error {
 		if opErr != nil {

@@ -524,3 +524,135 @@ func TestCreatePartDoesNotFollowAPlantedSymlink(t *testing.T) {
 		t.Fatalf("dst holds %q, want the fresh data", got)
 	}
 }
+
+// TestParseIdentityFileNeverEchoesTheKey: age reports a line it cannot place
+// by quoting it back ("unknown identity type: %q"), and in an identity file
+// that line is the secret key. Every caller prints the error it gets — brb
+// doctor, restore, backup preflight — so a key that failed the exact-prefix
+// test only because a paste carried a leading space, or because something
+// lowercased it, used to be reproduced in full on stderr and from there into
+// scrollback, CI logs and the bug report the operator attaches them to. The
+// key still works once either mutation is undone, so no error out of this
+// function may contain it.
+func TestParseIdentityFileNeverEchoesTheKey(t *testing.T) {
+	dir := t.TempDir()
+	id := mustIdentity(t)
+	secret := id.String()
+
+	mutations := []struct {
+		name string
+		body string
+	}{
+		{"leading space", " " + secret + "\n"},
+		{"leading tab", "\t" + secret + "\n"},
+		{"lowercased", strings.ToLower(secret) + "\n"},
+		{"stray leading byte", "x" + secret + "\n"},
+		{"after a comment and a good key", "# created: whenever\n" + secret + "\n " + secret + "\n"},
+	}
+	for _, m := range mutations {
+		t.Run(m.name, func(t *testing.T) {
+			p := filepath.Join(dir, "identity.txt")
+			writeFile(t, p, []byte(m.body))
+			t.Cleanup(func() { os.Remove(p) })
+
+			_, err := ParseIdentityFile(p)
+			if err == nil {
+				t.Fatalf("ParseIdentityFile accepted %q", m.body)
+			}
+			msg := err.Error()
+			if strings.Contains(msg, secret) || strings.Contains(strings.ToUpper(msg), secret[:20]) {
+				t.Fatalf("the error reproduced the secret key:\n%s", msg)
+			}
+			if !strings.Contains(msg, p) {
+				t.Errorf("the error does not name the file, so the operator cannot find it:\n%s", msg)
+			}
+		})
+	}
+
+	// The redaction must not have been bought by refusing everything: a
+	// well-formed file still parses, and the line number is still reported for
+	// the one bad line in a file that has several.
+	good := filepath.Join(dir, "good.txt")
+	writeFile(t, good, []byte("# created: whenever\n# public key: "+id.Recipient().String()+"\n"+secret+"\n"))
+	if _, err := ParseIdentityFile(good); err != nil {
+		t.Fatalf("ParseIdentityFile on a well-formed file: %v", err)
+	}
+	multi := filepath.Join(dir, "multi.txt")
+	writeFile(t, multi, []byte("# comment\n"+secret+"\n"+mustIdentity(t).String()+"\nnot-a-key\n"))
+	_, err := ParseIdentityFile(multi)
+	if err == nil {
+		t.Fatal("ParseIdentityFile accepted a file with a junk line")
+	}
+	if !strings.Contains(err.Error(), "line 4") {
+		t.Errorf("the error does not point at line 4, the bad one:\n%v", err)
+	}
+
+	// An empty file has no line to blame, and must still be an error rather
+	// than an identity list of length zero.
+	empty := filepath.Join(dir, "empty.txt")
+	writeFile(t, empty, nil)
+	if ids, err := ParseIdentityFile(empty); err == nil {
+		t.Fatalf("ParseIdentityFile accepted an empty file, returning %d identities", len(ids))
+	}
+}
+
+// TestCheckRecipientAdditionRefusesAMixedSet: age refuses to encrypt to a set
+// that mixes post-quantum and classic recipients, and both AppendRecipient and
+// ParseRecipientsFile accept such a file happily. init-key only ever mints
+// classic keys, so appending one to a post-quantum recipients file used to
+// succeed, print "discs built from now on are encrypted to both keys", and
+// leave every later backup dying in preflight — beside a rescue container
+// init-key then refuses to re-mint. The refusal has to come before anything is
+// written.
+func TestCheckRecipientAdditionRefusesAMixedSet(t *testing.T) {
+	dir := t.TempDir()
+	classic := mustIdentity(t)
+	pq, err := age.GenerateHybridIdentity()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// A recipients file that does not exist yet is the ordinary first run.
+	missing := filepath.Join(dir, "nothing-here.txt")
+	if err := CheckRecipientAddition(missing, classic.Recipient().String()); err != nil {
+		t.Errorf("CheckRecipientAddition refused a file that does not exist yet: %v", err)
+	}
+
+	ok := filepath.Join(dir, "classic.txt")
+	writeFile(t, ok, []byte(classic.Recipient().String()+"\n"))
+	if err := CheckRecipientAddition(ok, mustIdentity(t).Recipient().String()); err != nil {
+		t.Errorf("CheckRecipientAddition refused an all-classic set: %v", err)
+	}
+
+	mixed := filepath.Join(dir, "pq.txt")
+	writeFile(t, mixed, []byte(pq.Recipient().String()+"\n"))
+	err = CheckRecipientAddition(mixed, classic.Recipient().String())
+	if err == nil {
+		t.Fatal("CheckRecipientAddition accepted adding a classic key to a post-quantum file; age's Encrypt will not")
+	}
+	if !strings.Contains(err.Error(), mixed) || !strings.Contains(err.Error(), "post-quantum") {
+		t.Errorf("the refusal does not say which file or why:\n%v", err)
+	}
+
+	// A recipients file nobody can parse is backup preflight's complaint to
+	// make, in its own words, about the file rather than about the key.
+	junk := filepath.Join(dir, "junk.txt")
+	writeFile(t, junk, []byte("this is not a key\n"))
+	if err := CheckRecipientAddition(junk, classic.Recipient().String()); err != nil {
+		t.Errorf("CheckRecipientAddition turned an unparseable file into its own refusal: %v", err)
+	}
+
+	// And the probe itself, over the sets age judges.
+	if err := ProbeRecipients([]age.Recipient{classic.Recipient()}); err != nil {
+		t.Errorf("ProbeRecipients over one classic key: %v", err)
+	}
+	if err := ProbeRecipients([]age.Recipient{pq.Recipient()}); err != nil {
+		t.Errorf("ProbeRecipients over one post-quantum key: %v", err)
+	}
+	if err := ProbeRecipients([]age.Recipient{classic.Recipient(), pq.Recipient()}); err == nil {
+		t.Error("ProbeRecipients accepted a mixed set")
+	}
+	if err := ProbeRecipients(nil); !errors.Is(err, ErrNoRecipients) {
+		t.Errorf("ProbeRecipients over no keys = %v, want ErrNoRecipients", err)
+	}
+}

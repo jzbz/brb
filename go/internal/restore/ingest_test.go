@@ -360,6 +360,55 @@ func TestDiscSumsKeysByBaseName(t *testing.T) {
 	}
 }
 
+// Two entries whose base names collide used to be resolved by whichever the
+// map iterator reached last, so the same disc could be checked against digest
+// A on one run and digest B on the next — a copy that verifies clean once and
+// is reported damaged the next time, which reads like failing hardware. The
+// ambiguous name is dropped instead, deterministically, and every other name
+// on the disc is still checked. Run enough times to catch the old behaviour:
+// Go randomises map iteration, so one run of the unfixed code would have
+// picked the "right" answer most of the time.
+func TestDiscSumsDropsANameRecordedTwiceWithDifferentHashes(t *testing.T) {
+	for i := 0; i < 50; i++ {
+		e := newEnv(t)
+		mp := t.TempDir()
+		lines := "" +
+			strings.Repeat("a", 128) + "  ./data/disc01.squashfs.age\n" +
+			strings.Repeat("b", 128) + "  disc01.squashfs.age\n" +
+			strings.Repeat("c", 128) + "  ./README.md\n"
+		if err := os.WriteFile(filepath.Join(mp, agecrypt.SumsName), []byte(lines), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		sums := e.opts().discSums(mp)
+		if got, ok := sums["disc01.squashfs.age"]; ok {
+			t.Fatalf("run %d: the contradicted name answered %q; it must answer nothing", i, got)
+		}
+		if got := sums["README.md"]; got != strings.Repeat("c", 128) {
+			t.Fatalf("run %d: an unaffected name lost its hash: %q", i, got)
+		}
+		if !strings.Contains(e.log(), "two different hashes for disc01.squashfs.age") {
+			t.Fatalf("run %d: the operator was not told which name is ambiguous:\n%s", i, e.log())
+		}
+	}
+}
+
+// The same name twice with the SAME digest is not a contradiction — one entry
+// written "./x" and one written "x" say the same thing — and must not cost the
+// disc its check.
+func TestDiscSumsKeepsANameRecordedTwiceWithOneHash(t *testing.T) {
+	e := newEnv(t)
+	mp := t.TempDir()
+	lines := "" +
+		strings.Repeat("a", 128) + "  ./data/disc01.squashfs.age\n" +
+		strings.Repeat("A", 128) + "  disc01.squashfs.age\n"
+	if err := os.WriteFile(filepath.Join(mp, agecrypt.SumsName), []byte(lines), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if got := e.opts().discSums(mp)["disc01.squashfs.age"]; !strings.EqualFold(got, strings.Repeat("a", 128)) {
+		t.Fatalf("disc01.squashfs.age = %q, want the hash both entries agree on", got)
+	}
+}
+
 func TestDiscSumsWithoutASumsFile(t *testing.T) {
 	e := newEnv(t)
 	if sums := e.opts().discSums(t.TempDir()); sums != nil {

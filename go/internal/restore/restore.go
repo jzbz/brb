@@ -1012,6 +1012,18 @@ var errSidecarUnreadable = errors.New("sidecar unreadable")
 // usually lands in the 128-character digest and leaves a file that no longer
 // parses at all, rather than one that parses and disagrees — so the way out
 // belongs here as much as in the mismatch paths, and hint carries it.
+//
+// The whole file is scanned rather than stopped at the first base name that
+// matches. Names are compared by base name so that a digest recorded as
+// "./disc01.squashfs.age" answers for the staged copy, and two entries can
+// therefore collapse onto one name — "disc01.squashfs.age" and
+// "./disc01.squashfs.age" — which ReadSumFile's duplicate guard does not see
+// because it compares whole names. Returning the first match would return
+// whichever the map iterator visited first: the same intact image would verify
+// on one run and be deleted as damaged on the next, sending the operator to
+// repair a sidecar that is not rotted. A sidecar that contradicts itself is
+// unreadable, which the callers already know how to answer — with par2 over
+// the ciphertext.
 func recordedSum(sumPath, name, hint string) (hex string, ok bool, err error) {
 	sums, err := agecrypt.ReadSumFile(sumPath)
 	if err != nil {
@@ -1025,11 +1037,20 @@ func recordedSum(sumPath, name, hint string) (hex string, ok bool, err error) {
 			sumPath, hint, errSidecarUnreadable, err)
 	}
 	for k, v := range sums {
-		if filepath.Base(k) == name {
-			return v, true, nil
+		if filepath.Base(k) != name {
+			continue
 		}
+		if ok && !strings.EqualFold(hex, v) {
+			if hint == "" {
+				hint = "repair it from parity: par2 repair -- " + sidecarsPar2
+			}
+			return "", false, fmt.Errorf("restore: reading %s: that sidecar records two different hashes for %s, "+
+				"so it cannot say which is right — %s, then retry: %w",
+				sumPath, name, hint, errSidecarUnreadable)
+		}
+		hex, ok = v, true
 	}
-	return "", false, nil
+	return hex, ok, nil
 }
 
 // logWriter returns a writer that turns a subprocess's output into dim step

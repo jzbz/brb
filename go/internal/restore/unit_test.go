@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -205,6 +206,143 @@ func TestFilterIndexEscapesForATerminal(t *testing.T) {
 		if !strings.Contains(got, want) {
 			t.Errorf("output %q does not contain %q", got, want)
 		}
+	}
+}
+
+// synthIndex builds an index of n records, the shape `brb index` reads.
+func synthIndex(n int) string {
+	var b strings.Builder
+	for i := 0; i < n; i++ {
+		fmt.Fprintf(&b, "%d\tsome/dir/%d/file%d.txt\n", i%25+1, i%97, i)
+	}
+	return b.String()
+}
+
+// The index has one record per file in the whole set — 10^6 of them for a
+// $HOME-sized archive — and the loop used to copy every record twice: once out
+// of the scanner with sc.Text(), and once more to append a newline before
+// handing it to a bufio.Writer that can take the two pieces separately. Both
+// copies happened for records about to be discarded by the pattern, too. What
+// is pinned here is the shape, not a number: per-record allocation must not
+// come back, so the count has to stay flat as the index grows.
+func TestFilterIndexDoesNotAllocatePerRecord(t *testing.T) {
+	const rows = 4000
+	index := synthIndex(rows)
+	allocs := testing.AllocsPerRun(3, func() {
+		n, err := filterIndex(context.Background(), strings.NewReader(index), "", io.Discard, false)
+		if err != nil || n != rows {
+			t.Fatalf("filterIndex = (%d, %v)", n, err)
+		}
+	})
+	// The scanner, its buffer and the bufio.Writer are a handful of
+	// allocations for the whole call; anything near the record count is one
+	// per record again.
+	if allocs > 64 {
+		t.Fatalf("filterIndex allocated %.0f times for %d records; the loop is allocating per record again", allocs, rows)
+	}
+}
+
+func BenchmarkFilterIndex(b *testing.B) {
+	index := synthIndex(100000)
+	for _, tc := range []struct {
+		name    string
+		pattern string
+		escape  bool
+	}{
+		{"piped, no pattern", "", false},
+		{"piped, pattern", "file999", false},
+		{"terminal, no pattern", "", true},
+	} {
+		b.Run(tc.name, func(b *testing.B) {
+			b.SetBytes(int64(len(index)))
+			b.ReportAllocs()
+			for i := 0; i < b.N; i++ {
+				if _, err := filterIndex(context.Background(), strings.NewReader(index), tc.pattern, io.Discard, tc.escape); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+}
+
+// countingWriter records how many times it was written to, which is what the
+// syscall count is when the destination is an unbuffered os.Stdout.
+type countingWriter struct {
+	writes int
+	buf    bytes.Buffer
+}
+
+func (c *countingWriter) Write(b []byte) (int, error) {
+	c.writes++
+	return c.buf.Write(b)
+}
+
+// escapingWriter is the terminal path of `brb list`, and its destination is
+// os.Stdout — unbuffered, so it used to cost one write(2) per listed entry,
+// up to a million of them for a disc packed with small files. Buffering must
+// not change a byte of what is printed, including the trailing line that never
+// got its newline, and Close is what makes that true.
+func TestEscapingWriterBatchesWithoutChangingTheBytes(t *testing.T) {
+	var lines strings.Builder
+	const n = 2000
+	for i := 0; i < n; i++ {
+		fmt.Fprintf(&lines, "-rw-r--r-- root/root %d 2024-01-01 00:00 squashfs-root/file\x1b%d.txt\n", i, i)
+	}
+	body := lines.String() + "squashfs-root/no-trailing-newline.txt"
+
+	var want bytes.Buffer
+	for _, line := range strings.Split(body, "\n") {
+		want.WriteString(escapeControls(line))
+		want.WriteByte('\n')
+	}
+	wantBytes := strings.TrimSuffix(want.String(), "\n")
+
+	// Chunked the way os/exec hands a child's stdout over, and again in sizes
+	// that split lines, since a chunk boundary inside a line is the case the
+	// partial-line buffer exists for.
+	for _, chunk := range []int{7, 512, 32 << 10} {
+		c := &countingWriter{}
+		w := newEscapingWriter(c)
+		for i := 0; i < len(body); i += chunk {
+			end := min(i+chunk, len(body))
+			if _, err := w.Write([]byte(body[i:end])); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := w.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if got := c.buf.String(); got != wantBytes {
+			t.Fatalf("chunk %d: output changed:\n got %q\nwant %q", chunk, got, wantBytes)
+		}
+		if strings.ContainsAny(c.buf.String(), "\x1b") {
+			t.Fatalf("chunk %d: raw control bytes reached the terminal", chunk)
+		}
+		if c.writes > n/8 {
+			t.Fatalf("chunk %d: %d writes for %d lines; the output is not being batched", chunk, c.writes, n)
+		}
+	}
+}
+
+// Close is load-bearing for completeness now that the stream is buffered: a
+// listing that is never closed loses its tail. List closes it on the failure
+// path too, so that a run that died half way through still shows what it read.
+func TestEscapingWriterKeepsEverythingUntilClose(t *testing.T) {
+	c := &countingWriter{}
+	w := newEscapingWriter(c)
+	if _, err := w.Write([]byte("first\nsecond\n")); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if got := c.buf.String(); got != "first\nsecond\n" {
+		t.Fatalf("Close = %q", got)
+	}
+	// Safe to call twice: List closes it once on the error path and the
+	// deferred cleanup of a future caller must not have to know that.
+	if err := w.Close(); err != nil {
+		t.Fatalf("second Close: %v", err)
 	}
 }
 
@@ -581,6 +719,46 @@ func TestRecordedSum(t *testing.T) {
 	// authority to appeal to — par2 over the ciphertext — can go and ask it.
 	if !errors.Is(err, errSidecarUnreadable) {
 		t.Fatalf("error = %v, want it to wrap errSidecarUnreadable", err)
+	}
+}
+
+// A sidecar that records two digests for one base name — "disc01.squashfs.age"
+// and "./disc01.squashfs.age", which ReadSumFile's duplicate guard does not
+// see because it compares whole names — used to be answered by whichever entry
+// the map iterator reached first. The same intact image then verified on one
+// run and was deleted as damaged on the next, and reuseDecrypted threw away a
+// good multi-gigabyte plaintext about as often. The answer is now the same
+// every time and says what is wrong: the sidecar cannot say which is right, so
+// it is unreadable, and the callers go and ask par2 instead.
+func TestRecordedSumRefusesTwoDigestsForOneName(t *testing.T) {
+	dir := t.TempDir()
+	a, b := strings.Repeat("ab", 64), strings.Repeat("cd", 64)
+	path := filepath.Join(dir, "disc01.squashfs.age.sha512")
+	body := a + "  disc01.squashfs.age\n" + b + "  ./disc01.squashfs.age\n"
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// Map iteration order is randomised per range, so one call is not enough
+	// to distinguish "always refuses" from "usually returned the first entry".
+	for i := 0; i < 200; i++ {
+		got, ok, err := recordedSum(path, "disc01.squashfs.age", "")
+		if err == nil {
+			t.Fatalf("call %d: recordedSum = (%q, %v, nil), want a refusal", i, got, ok)
+		}
+		if !errors.Is(err, errSidecarUnreadable) {
+			t.Fatalf("call %d: error = %v, want it to wrap errSidecarUnreadable", i, err)
+		}
+		if !strings.Contains(err.Error(), "two different hashes") || !strings.Contains(err.Error(), "par2 repair") {
+			t.Fatalf("call %d: the refusal does not say what happened or what to do: %v", i, err)
+		}
+	}
+	// The same digest under two spellings is not a contradiction.
+	same := filepath.Join(dir, "same.sha512")
+	if err := os.WriteFile(same, []byte(a+"  disc01.squashfs.age\n"+a+"  ./disc01.squashfs.age\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if got, ok, err := recordedSum(same, "disc01.squashfs.age", ""); err != nil || !ok || got != a {
+		t.Fatalf("recordedSum over two agreeing entries = (%q, %v, %v)", got, ok, err)
 	}
 }
 

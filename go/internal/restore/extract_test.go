@@ -193,10 +193,14 @@ func TestRestoreAcrossDiscsToleratesTheArchivesOwnSymlinks(t *testing.T) {
 	}
 }
 
-// With --only, only the directories the extraction touches are checked, so a
-// planted or honest symlink somewhere else in a live tree does not block
-// fetching one file back into it — but the same link is refused when the
-// extraction would pass through it.
+// With --only, refuseSymlinksAtImageDirs checks only the directories the
+// extraction touches, so a symlink to a FILE somewhere else in a live tree
+// does not block fetching one file back into it — but the same link is refused
+// when the extraction would pass through it.
+//
+// Only that guard is narrowed. A symlink to a DIRECTORY is still refused
+// wherever it sits, --only or not; TestRestoreOnlyDoesNotExemptADirectorySymlink
+// is the other half of this pair.
 func TestRestoreOnlyChecksOnlyTheDirectoriesItTouches(t *testing.T) {
 	e := symlinkSet(t)
 	victim := filepath.Join(e.dir, "victim")
@@ -221,6 +225,39 @@ func TestRestoreOnlyChecksOnlyTheDirectoriesItTouches(t *testing.T) {
 	err := Restore(context.Background(), e.opts(), RestoreOptions{Dest: dest, Only: []string{"unrelated"}})
 	if err == nil || !strings.Contains(err.Error(), "THROUGH them") {
 		t.Fatalf("Restore --only through the symlink = %v, want a refusal\n%s", err, e.log())
+	}
+}
+
+// The traversal guard is NOT narrowed by --only, and the comment on
+// refuseSymlinksAtImageDirs used to read as though it were. A symlink that
+// resolves to a DIRECTORY is refused wherever it sits under the destination,
+// even when the extraction would never go near it: refuseSymlinkedDirs runs
+// once, before the first image, over the whole tree. That is what README.md's
+// Limitations promise — "refused outright, --yes or not" — and it is the
+// reason `brb restore ~ --only one/file` fails on a live $HOME that happens to
+// contain a ~/tmp -> /var/tmp. An engineer who narrows that walk to the --only
+// paths has to mirror it in brb.sh and in xcompat-test.sh's destination
+// symlink assertions, which hold both readers to this refusal.
+func TestRestoreOnlyDoesNotExemptADirectorySymlink(t *testing.T) {
+	e := symlinkSet(t)
+	elsewhere := filepath.Join(e.dir, "elsewhere")
+	if err := os.MkdirAll(elsewhere, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	dest := filepath.Join(e.dir, "dest")
+	if err := os.MkdirAll(dest, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// Nothing in the archive is named "attic", so extraction never touches it.
+	if err := os.Symlink(elsewhere, filepath.Join(dest, "attic")); err != nil {
+		t.Fatal(err)
+	}
+	err := Restore(context.Background(), e.opts(), RestoreOptions{Dest: dest, Only: []string{"sub/f.txt"}})
+	if err == nil || !strings.Contains(err.Error(), "symlink(s) to directories") {
+		t.Fatalf("Restore --only with an untouched directory symlink = %v, want the whole-tree refusal\n%s", err, e.log())
+	}
+	if _, err := os.Stat(filepath.Join(dest, "sub", "f.txt")); err == nil {
+		t.Fatal("the run was refused, but it had already extracted")
 	}
 }
 

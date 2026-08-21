@@ -1,8 +1,10 @@
 package agecrypt
 
 import (
+	"bufio"
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -157,6 +159,62 @@ func TestReadSumFile(t *testing.T) {
 				t.Errorf("got %v, want %v", got, tc.want)
 			}
 		})
+	}
+}
+
+// TestReadSumFileRefusesAnEnormousChecksumFile: SHA512SUMS comes off a disc
+// somebody else supplied — restore mounts it and hands the path to VerifyDir
+// with nothing in between looking at its size — and every parsed line is kept
+// in the returned map. The per-line buffer was capped and the line count was
+// not, so a checksum file of distinct valid lines turned file bytes into heap
+// until the process was killed. A real disc lists about ten files.
+//
+// The oversized file here is made of comment lines, which store nothing: that
+// is the point of counting lines read rather than entries kept. Without the
+// cap this file parses to an empty map and no error at all, which is exactly
+// the unbounded scan a hostile file wants.
+func TestReadSumFileRefusesAnEnormousChecksumFile(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, SumsName)
+	f, err := os.Create(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	w := bufio.NewWriter(f)
+	for i := 0; i <= maxSumLines; i++ {
+		if _, err := w.WriteString("#\n"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := w.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := ReadSumFile(p)
+	if err == nil {
+		t.Fatalf("ReadSumFile read a file of %d lines, returning %d entries", maxSumLines+1, len(got))
+	}
+	if !strings.Contains(err.Error(), "refusing to read it") || !strings.Contains(err.Error(), p) {
+		t.Errorf("the refusal does not name the file and say it was refused:\n%v", err)
+	}
+
+	// The cap must be unreachable by anything brb writes: a disc-sized file
+	// still parses, entry for entry.
+	small := filepath.Join(dir, "small")
+	var b strings.Builder
+	for i := 0; i < 64; i++ {
+		fmt.Fprintf(&b, "%s  ./data/disc%02d.squashfs.age\n", sumEmpty, i)
+	}
+	writeFile(t, small, []byte(b.String()))
+	sums, err := ReadSumFile(small)
+	if err != nil {
+		t.Fatalf("ReadSumFile on an ordinary checksum file: %v", err)
+	}
+	if len(sums) != 64 {
+		t.Errorf("got %d entries, want 64", len(sums))
 	}
 }
 

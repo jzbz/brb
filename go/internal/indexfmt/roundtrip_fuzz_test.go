@@ -36,6 +36,44 @@ func FuzzRoundTrip(f *testing.F) {
 	})
 }
 
+// escapeBySubstitution is the format's definition, transcribed: three
+// sequential substitutions, backslash first. It is what brb.sh's reader does
+// to a --only pattern in bash parameter expansion before matching it against
+// an index field, and what any future reader written from the package doc
+// would do. EscapePath is a single pass for speed; this is the thing it has to
+// agree with.
+func escapeBySubstitution(p string) string {
+	p = strings.ReplaceAll(p, `\`, `\\`)
+	p = strings.ReplaceAll(p, "\t", `\t`)
+	p = strings.ReplaceAll(p, "\n", `\n`)
+	return p
+}
+
+// TestEscapePathMatchesTheThreeSubstitutions pins the package doc's central
+// claim to code rather than to prose. The doc used to cite a Python expression
+// that exists nowhere in this repository, so an engineer checking the contract
+// before touching EscapePath had nothing to check it against. This is the
+// reference, and it fails if the single-pass loop or the substitution order
+// ever drifts from it.
+func TestEscapePathMatchesTheThreeSubstitutions(t *testing.T) {
+	t.Parallel()
+	rng := rand.New(rand.NewSource(2))
+	alphabet := []byte{'\\', '\t', '\n', 't', 'n', 'r', 'a', '/', '\r', 0xff, 0x00}
+	cases := []string{"", `\`, "\t", "\n", `\t`, `\\t`, "\\\t", "a\rb", "ünïcøde"}
+	for i := 0; i < 20000; i++ {
+		b := make([]byte, rng.Intn(10))
+		for j := range b {
+			b[j] = alphabet[rng.Intn(len(alphabet))]
+		}
+		cases = append(cases, string(b))
+	}
+	for _, p := range cases {
+		if got, want := EscapePath(p), escapeBySubstitution(p); got != want {
+			t.Fatalf("EscapePath(%q) = %q; the three substitutions give %q", p, got, want)
+		}
+	}
+}
+
 // TestRoundTripRandomBytes hammers the same property with random byte strings,
 // including sequences that are not valid UTF-8 at all.
 func TestRoundTripRandomBytes(t *testing.T) {

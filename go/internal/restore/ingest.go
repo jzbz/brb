@@ -25,6 +25,15 @@ import (
 	"github.com/jzbz/brb/internal/ui"
 )
 
+// maxPublicIdentityBytes bounds the one file brb reads off a disc whole rather
+// than streaming it past a hash. The identity file the writer renders is a
+// header comment, one AGE-SECRET-KEY- line and a "# created:" line — under
+// 300 bytes. 64 KiB leaves room for a key someone has annotated by hand, or
+// re-wrapped, or given a paragraph of provenance, and is still small enough
+// that reading it costs nothing on the smallest machine that can run a
+// restore. Anything past it is not a key, whatever the disc calls it.
+const maxPublicIdentityBytes = 64 << 10
+
 // Ingest copies burned discs back into the staging area so that they can be
 // repaired, decrypted and extracted. Discs may be presented in any order, and a
 // disc that has already been ingested is recognised and not copied again.
@@ -270,6 +279,17 @@ func (ig *ingester) ingestDisc(ctx context.Context) (staged bool, err error) {
 // discSums reads the disc's own SHA512SUMS so that every copy can be checked
 // against it as it is made, keyed by base name. A disc without one is usable
 // but unverifiable, and says so.
+//
+// Keying by base name collapses "./data/disc01.squashfs.age" onto
+// "disc01.squashfs.age", which is what lets a staged copy be checked against a
+// path recorded relative to the disc root. No disc either implementation
+// masters can collide under that collapse — the disc root and data/ share no
+// file name — so two entries with the same base name mean a hand-mastered,
+// merged or damaged sums file. Letting the last one the map iterator happened
+// to visit win would make the check answer differently on two runs over the
+// same disc, which reads like failing hardware; the ambiguous name is dropped
+// instead, so that copy is reported as unverifiable and every other name on
+// the disc is still checked.
 func (o Options) discSums(mp string) map[string]string {
 	path := filepath.Join(mp, agecrypt.SumsName)
 	sums, err := agecrypt.ReadSumFile(path)
@@ -282,8 +302,20 @@ func (o Options) discSums(mp string) map[string]string {
 		return nil
 	}
 	out := make(map[string]string, len(sums))
+	ambiguous := map[string]bool{}
 	for name, hex := range sums {
-		out[filepath.Base(name)] = hex
+		base := filepath.Base(name)
+		if prev, seen := out[base]; seen && !strings.EqualFold(prev, hex) {
+			ambiguous[base] = true
+			continue
+		}
+		out[base] = hex
+	}
+	for base := range ambiguous {
+		delete(out, base)
+		o.UI.Warn("%s records two different hashes for %s; that copy cannot be checked as it is made — "+
+			"run 'brb verify-disc' against this disc, and re-master it from a good copy of the set if the sums file is damaged",
+			agecrypt.SumsName, base)
 	}
 	return out
 }
@@ -596,7 +628,10 @@ func (o Options) copyManifest(ctx context.Context, mp string) error {
 // hand and the same key printed in MANIFEST.txt and README.md, than at restore.
 // A mismatch is reported the way a damaged data file is, as an incomplete
 // copy, and nothing is staged: a wrong key beside the images would only send
-// the restore down the wrong path.
+// the restore down the wrong path. This is the one file read into memory
+// whole rather than streamed past its hash — it has to be parsed as a key, not
+// copied — so its size is judged first, against [maxPublicIdentityBytes], and
+// an implausible one is refused the same way.
 //
 // A staged key that already exists is compared, not overwritten. Identical
 // contents are the ordinary case — every disc of a public set carries the same
@@ -610,14 +645,41 @@ func (o Options) copyManifest(ctx context.Context, mp string) error {
 // disc carries no sums.
 func (o Options) ingestPublicIdentity(mp, want string) (staged bool, err error) {
 	src := filepath.Join(mp, doc.PublicIdentityName)
-	body, err := os.ReadFile(src)
+	name := doc.PublicIdentityName
+	f, err := os.Open(src)
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
 			return false, nil
 		}
 		return false, fmt.Errorf("restore: reading %s: %w", src, err)
 	}
-	name := doc.PublicIdentityName
+	defer f.Close()
+
+	// The size is judged before a byte is read, and from the open file rather
+	// than a second stat, because this is the one file taken off a disc that
+	// is read whole into memory instead of streamed past a hash in 1 MiB
+	// chunks. Everything that would reveal an absurd file — the disc's
+	// SHA512SUMS entry, the age parse — happens after the read, so without
+	// this an inserted disc naming a 40 GB file identity.txt takes the process
+	// out through the allocator before any check runs, and the operator's
+	// diagnosis is an out-of-memory kill rather than "that file is not a key".
+	// A public set cannot be ingested at all until they work out which file
+	// did it.
+	if fi, err := f.Stat(); err != nil {
+		return false, fmt.Errorf("restore: reading %s: %w", src, err)
+	} else if fi.Size() > maxPublicIdentityBytes {
+		return false, &CopyProblem{
+			Name:    name,
+			Missing: -1,
+			Reason: fmt.Sprintf("is %d bytes on this disc; a public archive's key is a few hundred, so this file is not one "+
+				"and it was not read or staged — the key is printed in the disc's MANIFEST.txt and README.md, "+
+				"and AGE_IDENTITY can be pointed at a copy typed out from there", fi.Size()),
+		}
+	}
+	body, err := io.ReadAll(f)
+	if err != nil {
+		return false, fmt.Errorf("restore: reading %s: %w", src, err)
+	}
 	if want != "" {
 		sum := sha512.Sum512(body)
 		if got := hex.EncodeToString(sum[:]); !strings.EqualFold(got, want) {
