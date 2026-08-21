@@ -73,7 +73,11 @@ func sampleManifest() ManifestData {
 // to a disc must contain no unsubstituted template markers of any kind.
 func assertNoPlaceholders(t *testing.T, name, out string) {
 	t.Helper()
-	for _, bad := range []string{"@@", "<no value>", "{{", "}}", "internal error"} {
+	// "./ " is here for the one placeholder text/template does NOT announce: an
+	// empty field renders as the empty string, so a worked example whose program
+	// name is missing reads "./ ingest" and looks like ordinary prose. Nothing
+	// legitimate in either document writes "./" followed by a space.
+	for _, bad := range []string{"@@", "<no value>", "{{", "}}", "internal error", "./ "} {
 		if strings.Contains(out, bad) {
 			t.Errorf("%s contains %q:\n%s", name, bad, out)
 		}
@@ -339,6 +343,33 @@ func TestRenderDiscREADMEListsOnlyWhatIsOnTheDisc(t *testing.T) {
 			tools:  []string{"brb.sh", "brb-src.tar.gz"},
 			want:   []string{"./brb.sh ingest", "tar xzf /mnt/brb-src.tar.gz"},
 			unwant: []string{"brb-linux", "uname -m", "chmod +x /tmp/brb"},
+		},
+		{
+			// A writer built for a target the payload has no note for —
+			// GOARCH=riscv64, a linux/386 package, anything outside the two
+			// architectures build-dist.sh ships — copies itself onto every disc
+			// under that name and nothing else. There is then no artifact the
+			// document knows how to invoke, so the worked examples must be
+			// omitted entirely rather than rendered with an empty program name.
+			// assertNoPlaceholders catches "./ "; these pin that the recipe is
+			// gone rather than merely mangled, and that the file listing still
+			// names what the disc really carries.
+			name:  "only an artifact the document cannot invoke",
+			tools: []string{"brb-linux-riscv64"},
+			want:  []string{"\nbrb-linux-riscv64\n"},
+			unwant: []string{
+				"ingest ", "index thesis", "restore /path/to/destination",
+				"mount 3 /mnt/browse", "uname -m",
+			},
+		},
+		{
+			// The tarball alone is the other route to an empty Run, and it must
+			// keep the one instruction that IS true of it: rebuild, then use
+			// what you built.
+			name:   "only the source tarball",
+			tools:  []string{"brb-src.tar.gz"},
+			want:   []string{"tar xzf /mnt/brb-src.tar.gz", "go build -mod=vendor ./cmd/brb"},
+			unwant: []string{"ingest ", "index thesis", "mount 3 /mnt/browse"},
 		},
 	}
 
@@ -807,4 +838,97 @@ func firstLines(s string, n int) string {
 		lines = lines[:n]
 	}
 	return strings.Join(lines, "\n")
+}
+
+// discDataFileRE matches the names of the files that live in a disc's data/
+// subdirectory, with whatever suffix or glob a recipe hangs off them.
+var discDataFileRE = regexp.MustCompile(`(disc\d\d\.squashfs\.age|index\.tsv\.gz\.age)[A-Za-z0-9.*+]*`)
+
+// TestRenderDiscREADMERecipesNameFilesWhereTheyActuallyAre holds every shell
+// recipe in the rendered README to the disc's real layout.
+//
+// The image, its sidecars and the encrypted index are written to <disc>/data/,
+// not to the disc root, and a recipe that leaves the directory off does not run:
+// `age -d -i key index.tsv.gz.age` from a mounted disc exits with "no such file
+// or directory". That is how the "if a disc is gone entirely" section shipped —
+// the one section reached only when a disc has already been lost, whose single
+// command is the only way to find out what went with it.
+//
+// So this is a layout check rather than a string match: in every ```sh block,
+// a data/ file must either be named under /mnt/data/, or have been brought into
+// the working directory earlier in the same block by a cp or a ddrescue. Adding
+// a recipe that reads off the disc by bare name fails here.
+func TestRenderDiscREADMERecipesNameFilesWhereTheyActuallyAre(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		data DiscData
+	}{
+		{"an ordinary set", sampleDisc()},
+		{"a public archive", func() DiscData {
+			d := sampleDisc()
+			d.PublicIdentity = sampleKey
+			return d
+		}()},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			out := RenderDiscREADME(tc.data)
+
+			inBlock := false
+			blocks, operands := 0, 0
+			// local holds the name prefixes a preceding cp or ddrescue has put
+			// in the working directory, e.g. "disc03.squashfs.age" after
+			// `cp /mnt/data/disc03.squashfs.age* .`. It is per block: each
+			// fenced recipe stands on its own.
+			var local []string
+			isLocal := func(name string) bool {
+				for _, p := range local {
+					if strings.HasPrefix(name, p) {
+						return true
+					}
+				}
+				return false
+			}
+
+			for _, line := range strings.Split(out, "\n") {
+				if strings.HasPrefix(line, "```") {
+					if !inBlock && strings.TrimSpace(line) == "```sh" {
+						inBlock, local, blocks = true, nil, blocks+1
+					} else {
+						inBlock = false
+					}
+					continue
+				}
+				if !inBlock {
+					continue
+				}
+				brings := strings.HasPrefix(line, "cp ") || strings.HasPrefix(line, "ddrescue ")
+				for _, loc := range discDataFileRE.FindAllStringIndex(line, -1) {
+					operands++
+					name, pre := line[loc[0]:loc[1]], line[:loc[0]]
+					switch {
+					case strings.HasSuffix(pre, "/mnt/data/"):
+						if brings {
+							local = append(local, strings.TrimSuffix(name, "*"))
+						}
+					case strings.HasSuffix(pre, "./"):
+						local = append(local, name) // an explicit destination
+					case strings.HasSuffix(pre, "/"):
+						t.Errorf("recipe reads %s%s, but that file is in data/:\n  %s", pre, name, line)
+					case !isLocal(name):
+						t.Errorf("recipe names %q with no path and nothing copied it "+
+							"into the working directory first; it is at /mnt/data/%s:\n  %s",
+							name, name, line)
+					}
+				}
+			}
+			// Without these the whole check would pass on a document whose
+			// fences had been renamed, having examined nothing.
+			if blocks < 4 {
+				t.Errorf("found only %d ```sh block(s); the fence scan is broken", blocks)
+			}
+			if operands < 8 {
+				t.Errorf("found only %d data/ operand(s) across the recipes", operands)
+			}
+		})
+	}
 }

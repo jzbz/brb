@@ -1,6 +1,6 @@
 # Backup disc 01 of 1 — `home-2026-08-07`
 
-Created 2026-08-19T01:52:15-04:00 from `/home/you`.
+Created 2026-08-21T03:54:13-04:00 from `/home/you`.
 Written by brb (Blu-ray Backup) 1.0.0.
 
 **This disc is self-contained.** It holds a complete, independent SquashFS
@@ -201,7 +201,7 @@ missing one. To find out exactly what those were, decrypt the index from any
 surviving disc:
 
 ```sh
-age -d -i /path/to/identity.txt index.tsv.gz.age | gunzip -c | awk -F'\t' '$1==1'
+age -d -i /path/to/identity.txt /mnt/data/index.tsv.gz.age | gunzip -c | awk -F'\t' '$1==1'
 ```
 
 The index is a two-column list: disc number, then path. Exactly one row per

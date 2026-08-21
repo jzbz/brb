@@ -20,10 +20,15 @@
 #     (( imgs_before >= 1 )); ck "  ... with $imgs_before image(s)" $?
 #
 # which is what SC2319 and SC2181 exist to question, because a $? read too late
-# reports something other than the thing being tested. Here the condition and
-# the ck call are always one line with a single ; between them, so nothing can
-# get in between to overwrite the status. Disabled for the file rather than at
-# seventeen separate sites; keep the two halves on one line and it stays true.
+# reports something other than the thing being tested. What makes that safe here
+# is NOT that the two halves share a line: about fifty of the sixty-five sites
+# are written on two lines and always have been, whatever this header used to
+# say. It is that the ck call is the very next STATEMENT after its condition —
+# same line or the one below, with nothing but comments between. That is a
+# convention rather than something a linter can hold you to, which is why the
+# disable is file-wide and why the rule is written down here. If you ever need
+# something between a condition and its ck, capture the status into a variable
+# first, the way the symlink-destination check further down does with symrc.
 # shellcheck disable=SC2319,SC2181
 set -uo pipefail
 
@@ -89,32 +94,52 @@ EOF
 export BRB_CONFIG="$W/cfg/config"
 STATE="$W/stage/state.json"
 
-discs_done() { # read discs_done out of state.json without needing jq
-  [[ -f "$STATE" ]] || return 1
-  sed -n 's/.*"discs_done"[[:space:]]*:[[:space:]]*\([0-9]\+\).*/\1/p' "$STATE" | head -1
+# kill_after_first_disc CFG STATE LOG — run a backup until state.json records a
+# completed disc, kill the whole run, and report in KILLED_AT the disc count it
+# reached (empty if the kill never landed).
+#
+# One harness, two callers. The public-archive section further down needs the
+# same interruption and used to carry its own character-for-character copy of
+# it: the same sed, the same 4000-iteration poll at 0.05s, the same kill of the
+# process group. This is the least deterministic code in the suite and the part
+# most likely to need retuning when a runner gets slower, and a tuning applied
+# to one copy would silently not apply to the other. What the callers keep is
+# their own not-killed branch, which is the one place they deliberately differ:
+# the resume section cannot prove anything without the kill and gives up, while
+# the public section records a failure and carries on.
+#
+# The count comes back in a global rather than on stdout: a command substitution
+# would put the backgrounded backup in a subshell whose pipe the caller then
+# holds open, and this is not the place to be clever with job control.
+KILLED_AT=""
+kill_after_first_disc() {
+  local cfg=$1 state=$2 log=$3 pid n=""
+  KILLED_AT=""
+  # Own process group: a single kill has to take the whole tree down, or a
+  # surviving child still writing into staging would make the resume prove
+  # nothing.
+  set -m
+  "$BRB" --yes -c "$cfg" backup </dev/null > "$log" 2>&1 &
+  pid=$!
+  set +m
+  for _ in $(seq 1 4000); do
+    # discs_done out of state.json, without needing jq. A state file that does
+    # not exist yet reads as empty, which is the same as "no disc finished".
+    n="$(sed -n 's/.*"discs_done"[[:space:]]*:[[:space:]]*\([0-9]\+\).*/\1/p' "$state" 2>/dev/null | head -1)"
+    if [[ -n "$n" ]] && (( n >= 1 )); then
+      KILLED_AT="$n"
+      kill -9 -- "-$pid" 2>/dev/null
+      break
+    fi
+    kill -0 "$pid" 2>/dev/null || break
+    sleep 0.05
+  done
+  wait "$pid" 2>/dev/null
 }
 
 sect "kill a multi-disc backup mid-set"
-# Own process group: a single kill has to take the whole tree down, or a
-# surviving child still writing into staging would make the resume prove nothing.
-set -m
-"$BRB" --yes backup </dev/null > "$W/run1.log" 2>&1 &
-bpid=$!
-set +m
-
-killed_at=""
-for _ in $(seq 1 4000); do
-  n="$(discs_done 2>/dev/null || true)"
-  if [[ -n "$n" ]] && (( n >= 1 )); then
-    killed_at="$n"
-    kill -9 -- "-$bpid" 2>/dev/null
-    break
-  fi
-  kill -0 "$bpid" 2>/dev/null || break
-  sleep 0.05
-done
-wait "$bpid" 2>/dev/null
-
+kill_after_first_disc "$W/cfg/config" "$STATE" "$W/run1.log"
+killed_at=$KILLED_AT
 [[ -n "$killed_at" ]] && (( killed_at >= 1 ))
 ck "backup was killed after disc ${killed_at:-?} completed" $?
 
@@ -151,12 +176,16 @@ grep -qiE 'resum' "$W/run2.log"; ck "  ... and says it resumed" $?
 # when the tree's measured size has changed. The property that must hold either
 # way is that the resume re-seeds from what was already written rather than
 # starting over, which the byte-identical check below proves.
-# No '|resum' alternative here: with it this pattern was a strict superset of
-# line 117's, so it could only fail when that one had already failed and it
-# certified nothing of its own. resumeFilter prints "resume: N file(s) already
-# on disc, M still to write" unconditionally, so the tightened pattern passes
-# today and can genuinely fail tomorrow.
-grep -qiE 'already (on disc|written)' "$W/run2.log"
+# Matched against resumeFilter's own sentence and nothing else. Two alternatives
+# have been struck off this pattern for the same reason: '|resum' was a strict
+# superset of the "says it resumed" check above, and '|already written' was
+# satisfied by prepareState's resume banner ("resuming after N completed
+# disc(s), M file(s) already written", preflight.go), which prints on every
+# ordinary --resume before resumeFilter is ever reached. Either one could only
+# fail once some other check had already failed, so it certified nothing of its
+# own. resumeFilter prints "resume: N file(s) already on disc, M still to write"
+# and it is the only thing that does.
+grep -qF 'file(s) already on disc' "$W/run2.log"
 ck "  ... re-seeding from the discs already written" $?
 [[ ! -f "$STATE" ]]; ck "  ... and removed the state file on success" $?
 
@@ -430,26 +459,8 @@ ARCHIVE_NAME="go-e2e-public"
 PUBLIC_ARCHIVE=1
 EOF
 pub_state=$PUBW/state.json
-pub_discs_done() {
-  [[ -f "$pub_state" ]] || return 1
-  sed -n 's/.*"discs_done"[[:space:]]*:[[:space:]]*\([0-9]\+\).*/\1/p' "$pub_state" | head -1
-}
-set -m
-"$BRB" --yes -c "$W/cfg/public" backup </dev/null > "$W/pub-run1.log" 2>&1 &
-pubpid=$!
-set +m
-pub_killed_at=""
-for _ in $(seq 1 4000); do
-  n="$(pub_discs_done 2>/dev/null || true)"
-  if [[ -n "$n" ]] && (( n >= 1 )); then
-    pub_killed_at="$n"
-    kill -9 -- "-$pubpid" 2>/dev/null
-    break
-  fi
-  kill -0 "$pubpid" 2>/dev/null || break
-  sleep 0.05
-done
-wait "$pubpid" 2>/dev/null
+kill_after_first_disc "$W/cfg/public" "$pub_state" "$W/pub-run1.log"
+pub_killed_at=$KILLED_AT
 [[ -n "$pub_killed_at" ]] && (( pub_killed_at >= 1 ))
 ck "public backup was killed after disc ${pub_killed_at:-?} completed" $?
 if [[ -z "$pub_killed_at" ]]; then

@@ -146,7 +146,12 @@ nothing else here runs on your machine:
 tar xzf /mnt/{{.Src}} && cd brb-*/go
 go build -mod=vendor ./cmd/brb
 ```
-{{end}}
+{{end}}{{/* The worked examples are gated on Run, not on Tools: Run is empty
+whenever the disc carries nothing this document knows how to invoke — only the
+source tarball, say, or a binary for an architecture toolNotes has no entry for
+— and with an empty Run every line below would read "./ ingest". A recipe whose
+program name is missing is worse than no recipe, and it is burned onto a disc
+that cannot be corrected. */}}{{if .Run}}
 ```sh
 export STAGING=/var/tmp/restore
 {{if .PublicIdentity}}# no key to configure: ingest copies {{.PublicIdentityFile}} off the disc into
@@ -159,7 +164,7 @@ export STAGING=/var/tmp/restore
 ./{{.Run}} restore /dest --disc {{.Disc}}                  # just this one
 ./{{.Run}} mount {{.Disc}} /mnt/browse                     # decrypt and mount
 ```
-{{end}}
+{{end}}{{end}}
 ---
 
 ## If a disc will not read
@@ -210,7 +215,7 @@ missing one. To find out exactly what those were, decrypt the index from any
 surviving disc:
 
 ```sh
-age -d -i /path/to/identity.txt index.tsv.gz.age | gunzip -c | awk -F'\t' '$1=={{.Disc}}'
+age -d -i /path/to/identity.txt /mnt/data/index.tsv.gz.age | gunzip -c | awk -F'\t' '$1=={{.Disc}}'
 ```
 
 The index is a two-column list: disc number, then path. Exactly one row per

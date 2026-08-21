@@ -134,6 +134,11 @@ fi
 # round-trip. Both were computed and never read for a while — the residue of an
 # earlier suite — and each now gates the checks named after it.
 HAVE_SCRIPT=0; have script && HAVE_SCRIPT=1
+# flock(1) stands in for a run in progress in the staging-lock checks. Optional
+# for the same reason python3 was struck off the required list: a bare
+# restore-shaped machine without util-linux must still get every other check in
+# this file, not a whole-suite skip.
+HAVE_FLOCK=0; have flock && HAVE_FLOCK=1
 HAVE_UTF8_LOCALE=0
 # Keep the spelling the system actually has (glibc reports "en_US.utf8", other
 # systems "en_US.UTF-8") rather than guessing one back.
@@ -446,21 +451,36 @@ named_the_sidecar() { grep -qi 'sidecar' "$LOG/rot-$1.log"; }
 assert0 "  ... and brb.sh names the sidecar as the corrupt party" named_the_sidecar sh
 assert0 "  ... and go brb names the sidecar as the corrupt party" named_the_sidecar go
 
-# A genuinely destroyed image must still be refused rather than decrypted.
+# A genuinely destroyed image must still be refused RATHER THAN DECRYPTED, and
+# both halves of that sentence are asserted here. An assertN over the restore's
+# exit status alone is satisfied by a reader that decrypts the image, starts
+# unsquashfs, discovers the damage part-way through and exits non-zero — leaving
+# a half-extracted tree over a destination that may be a live directory and a
+# plaintext image in staging. Same three-part shape as only_prefix_refused and
+# escape_refused: refused, and nothing written, either side of the guard. The
+# fixture proves its own sabotage first, the way rotted_sidecar_restore does:
+# a dd that silently wrote nothing would send this down the happy path.
 corrupt_image_refused() { # corrupt_image_refused sh|go
-  local who=$1
+  local who=$1 rc=0 n
   local st=$T/bad-$who dest=$T/out-bad-$who cfg=$T/cfg/bad-$who
   rm -rf "$st" "$dest"; mkdir -p "$dest"
   cp -a "$T/stage-go" "$st"; rm -rf "$st/restore"
   mkcfg "$cfg" "$st" "$SRC"
   dd if=/dev/urandom of="$st/enc/disc01.squashfs.age" bs=1 seek=2000 count=900000 conv=notrunc 2>/dev/null
+  cmp -s "$T/stage-go/enc/disc01.squashfs.age" "$st/enc/disc01.squashfs.age" \
+    && { echo "sabotage was a no-op: the image is byte-identical to the pristine one" >&2; return 1; }
   case $who in
-    sh) run_sh "$LOG/bad-sh.log" "$cfg" restore "$dest" ;;
-    go) run_go "$LOG/bad-go.log" "$cfg" restore "$dest" ;;
+    sh) run_sh "$LOG/bad-sh.log" "$cfg" restore "$dest" || rc=$? ;;
+    go) run_go "$LOG/bad-go.log" "$cfg" restore "$dest" || rc=$? ;;
   esac
+  (( rc != 0 )) || { echo "exited 0 over an image par2 cannot repair" >&2; return 1; }
+  n=$(find "$dest" -type f | wc -l)
+  (( n == 0 )) || { echo "extracted $n file(s) from an image it could not verify" >&2; return 1; }
+  n=$(find "$st/restore" -maxdepth 1 -name '*.squashfs' 2>/dev/null | wc -l)
+  (( n == 0 )) || { echo "left $n decrypted image(s) behind in staging" >&2; return 1; }
 }
-assertN "brb.sh refuses an image par2 cannot repair" corrupt_image_refused sh
-assertN "go brb refuses an image par2 cannot repair" corrupt_image_refused go
+assert0 "brb.sh refuses an image par2 cannot repair, and writes nothing" corrupt_image_refused sh
+assert0 "go brb refuses an image par2 cannot repair, and writes nothing"  corrupt_image_refused go
 
 # ---------------------------------------------------------------------------
 head_s "5. age interchange and the manual restore recipe"
@@ -575,7 +595,17 @@ only_dir_extracts() { # only_dir_extracts sh|go SPELLING
 }
 assert0 "brb.sh --only project/core extracts the directory"      only_dir_extracts sh 'project/core'
 assert0 "go brb --only project/core extracts the directory"      only_dir_extracts go 'project/core'
+# Both readers, both spellings: three quarters of that grid was asserted, and
+# the missing cell was the Go one — in the file whose whole premise is that the
+# two agree. A trailing slash has produced a Go-only divergence in this suite
+# before (the destination-symlink case in section 12), and the two implementations
+# reach unsquashfs by different routes: brb.sh strips the slash at parse time,
+# while the Go build's covers() strips it only for the index pre-check and hands
+# the operand on unchanged. If that ever stopped matching, the result would be a
+# run that selects the disc, extracts nothing and reports success — the exact
+# silent-empty-restore this section exists for.
 assert0 "brb.sh --only project/core/ (trailing slash) works too" only_dir_extracts sh 'project/core/'
+assert0 "go brb --only project/core/ (trailing slash) works too" only_dir_extracts go 'project/core/'
 
 keep_images() { # keep_images sh|go WANT   (WANT=1 keep, 0 remove)
   local who=$1 want=$2
@@ -625,8 +655,81 @@ assert0 "brb.sh and go brb list a disc's contents identically" list_agrees
 
 assert0 "brb.sh doctor exits 0 with every restore tool present" run_sh "$LOG/doctor-sh.log" "$T/cfg/go" doctor
 assert0 "go brb doctor exits 0"                                 run_go "$LOG/doctor-go.log" "$T/cfg/go" doctor
-doctor_is_reader_only() { ! grep -qi 'mksquashfs\|xorriso' "$LOG/doctor-sh.log"; }
-assert0 "brb.sh doctor no longer checks writer-only tools" doctor_is_reader_only
+# The positive control the index and list checks above both carry, for the same
+# reason: a bare negative grep is satisfied by an empty log, so a doctor that
+# printed nothing at all — or printed somewhere run_sh does not capture — would
+# report "no longer checks writer-only tools" having reported nothing whatever.
+# Anchored on par2 and unsquashfs because doctor really does name both, and
+# because 'unsquashfs' does not collide with the 'mksquashfs' being excluded.
+doctor_is_reader_only() {
+  # Written as an if rather than A && B || C: with the && chain, a failure of
+  # the SECOND grep runs the || arm too, which happens to be right here but is
+  # the shape SC2015 exists to catch, and the next person to add a third
+  # positive control would inherit the trap.
+  if ! grep -qi 'unsquashfs' "$LOG/doctor-sh.log" || ! grep -qi 'par2' "$LOG/doctor-sh.log"; then
+    echo "doctor printed no tool report to grep" >&2
+    return 1
+  fi
+  ! grep -qi 'mksquashfs\|xorriso' "$LOG/doctor-sh.log"
+}
+assert0 "brb.sh doctor reports the reader tools and no writer-only ones" doctor_is_reader_only
+
+# The staging lock, which is a reader-parity property like any other. Both
+# implementations take an exclusive flock on <staging>/.brb.lock — fsx.LockStaging
+# on the Go side, lock_staging in brb.sh — and both must refuse while another run
+# holds it. The harm they prevent is the quiet kind: two runs writing one image
+# path produce a body that still looks like a readable squashfs, and the
+# encrypt-and-hash pass, par2 and SHA512SUMS then all agree with each other about
+# the mix; the disc says so for the first time at restore, years later. Neither
+# shell suite exercised the lock at all until this, so a reader that stopped
+# taking it would have gone unnoticed.
+#
+# Held from flock(1) rather than from a second brb: a real run would have to be
+# caught in a window, and the lock is the thing under test either way. The fd is
+# held open by a background subshell and released by deleting a file, so nothing
+# has to be killed — a killed flock(1) can leave its child holding the fd, and a
+# staging tree left locked would fail every check after this one.
+if (( HAVE_FLOCK )); then
+  hold_staging_lock() { # hold_staging_lock STAGING
+    printf 'held\n' > "$T/lock-held"
+    # stdout closed too: assert0 reads its command's output through a pipe, and
+    # a background child holding that pipe open would hang the whole suite.
+    ( flock -x 9 || exit 1
+      while [[ -e "$T/lock-held" ]]; do sleep 0.05; done ) 9>"$1/.brb.lock" >/dev/null 2>&1 &
+    LOCK_HOLDER=$!
+    for _ in $(seq 1 200); do
+      flock -n -x "$1/.brb.lock" -c true 2>/dev/null || return 0   # refused: it is held
+      sleep 0.05
+    done
+    echo "the stand-in never took the lock; the check would prove nothing" >&2
+    return 1
+  }
+  drop_staging_lock() { rm -f "$T/lock-held"; wait "$LOCK_HOLDER" 2>/dev/null; return 0; }
+
+  busy_staging_refused() { # busy_staging_refused sh|go
+    local who=$1 rc=0 n
+    local dest=$T/out-busy-$who lf=$LOG/busy-$who.log
+    rm -rf "$dest"; mkdir -p "$dest"
+    hold_staging_lock "$T/stage-go" || { drop_staging_lock; return 1; }
+    case $who in
+      sh) bash "$BRB_SH" --yes -c "$T/cfg/go" restore "$dest" > "$lf" 2>&1 || rc=$? ;;
+      go) "$BRB_GO" --yes --no-color -c "$T/cfg/go" restore "$dest" > "$lf" 2>&1 || rc=$? ;;
+    esac
+    drop_staging_lock
+    (( rc != 0 )) || { echo "restored from a staging directory another brb holds" >&2; return 1; }
+    grep -qi 'another brb is using' "$lf" \
+      || { echo "refused, but not for the lock: $(_tail "$(cat "$lf")")" >&2; return 1; }
+    n=$(find "$dest" -type f | wc -l)
+    (( n == 0 )) || { echo "wrote $n file(s) despite refusing" >&2; return 1; }
+  }
+  assert0 "brb.sh refuses a staging directory another brb is using" busy_staging_refused sh
+  assert0 "go brb refuses a staging directory another brb is using" busy_staging_refused go
+else
+  # brb.sh's lock is opportunistic for the same reason this check is gated:
+  # flock(1) is util-linux, and a machine without it still has to be able to
+  # restore. Both readers then run unguarded, so there is nothing to assert.
+  skip "the staging lock (both readers)" "no flock(1) to stand in for a run in progress"
+fi
 
 # ---------------------------------------------------------------------------
 head_s "8. multi-disc sets and partial restores"
@@ -1011,9 +1114,14 @@ plant() {
     filelink) mkdir -p "$d";     ln -s "$VICTIM/canary.txt" "$d/big.bin"
               [[ -L "$d/big.bin" && -f "$d/big.bin" && ! -d "$d/big.bin" ]] \
                 || { echo "the plant is not a symlink to a file" >&2; return 1; } ;;
-    # ...and a dangling link, which resolves to nothing at all.
-    dangling) mkdir -p "$d";     ln -s "$T/no-such-thing" "$d/dangle"
-              [[ -L "$d/dangle" && ! -e "$d/dangle" ]] \
+    # ...and a dangling link, which resolves to nothing at all. Named after
+    # big.bin — a file the archive really holds — for the reason at the top of
+    # this function: it was called "dangle", a name no archive entry matches,
+    # so unsquashfs never had occasion to touch it and "did not create what it
+    # pointed at" was true before the restore started and could not be made
+    # false by deleting either guard from either reader.
+    dangling) mkdir -p "$d";     ln -s "$T/no-such-thing" "$d/big.bin"
+              [[ -L "$d/big.bin" && ! -e "$d/big.bin" ]] \
                 || { echo "the plant is not a dangling symlink" >&2; return 1; } ;;
     *) echo "unknown plant kind: $kind" >&2; return 1 ;;
   esac
@@ -1083,8 +1191,9 @@ for who in sh go; do
   assert0 "  ... replacing the link with the archive's real file"                    cmp -s "$SRC/big.bin" "$D/big.bin"
   assert0 "  ... without writing through it"                                         test "$(cat "$VICTIM/canary.txt")" = canary
 
-  assert0 "fixture: the destination holds a DANGLING symlink"                        plant dangling "$D"
+  assert0 "fixture: the destination holds a DANGLING symlink, at an archive path"    plant dangling "$D"
   assert0 "$name still restores over a dangling symlink"                             escape_not_refused "$who" "dang-$who" "$D"
+  assert0 "  ... replacing it with the archive's real file"                          cmp -s "$SRC/big.bin" "$D/big.bin"
   assert0 "  ... and did not create what it pointed at"                              test ! -e "$T/no-such-thing"
 done
 unset name D

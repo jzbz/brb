@@ -2,7 +2,9 @@
 #
 # Three jobs, cheapest first:
 #
-#   check   gofmt, vet, build. No external tools, no disc format, ~1 minute.
+#   check   gofmt, vet, build, and shellcheck over every *.sh — pinned and
+#           checksummed, so this job does install one binary. No disc format,
+#           none of the tools brb shells out to, ~1 minute.
 #   test    the Go tests and both shell suites, against real mksquashfs/age/par2.
 #   dist    the disc payload, and the offline rebuild the on-disc README promises.
 #
@@ -151,23 +153,39 @@ jobs:
           if sudo apt-get install -y --no-install-recommends age; then
             echo "age: from apt"
           else
-            echo "age: apt has no package, building v1.3.1 from the pinned module"
-            go install filippo.io/age/cmd/age@v1.3.1
-            go install filippo.io/age/cmd/age-keygen@v1.3.1
+            # Read the version out of go.mod rather than pinning it twice, the
+            # same rule the toolchain follows above. A literal here would go
+            # stale silently on the next dependency bump, and it would go stale
+            # in the branch that only runs when the runner image changes — so
+            # the CLI producing the on-disc format could drift away from the
+            # library that writes it without any commit looking wrong.
+            AGE_VER="$(go -C go list -m -f '{{.Version}}' filippo.io/age)"
+            [ -n "$AGE_VER" ] || { echo "::error::could not read the age version out of go/go.mod"; exit 1; }
+            echo "age: apt has no package, building $AGE_VER from the pinned module"
+            go install "filippo.io/age/cmd/age@$AGE_VER"
+            go install "filippo.io/age/cmd/age-keygen@$AGE_VER"
             echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
           fi
 
-      # THIS STEP IS LOAD-BEARING, NOT CEREMONY. Every tool-dependent Go test calls
-      # t.Skipf when detection fails, and the shell suites exit 77. Both are
-      # correct behaviour for a person's laptop and both are silent here: a
-      # runner missing par2 would report a green `go test ./...` in which the
-      # integration tests never ran at all. Failing loudly on a missing tool is
-      # what stops CI from certifying a run that tested nothing.
+      # THIS STEP IS LOAD-BEARING, NOT CEREMONY, and two different failures hide
+      # behind it. The QUIET ones are what it is really for: a tool-dependent Go
+      # test calls t.Skipf when detection fails, so a runner missing par2 reports
+      # a green `go test ./...` in which the integration tests never ran at all;
+      # and xcompat treats script(1), flock(1) and en_US.UTF-8 as OPTIONAL (its
+      # HAVE_SCRIPT / HAVE_FLOCK / HAVE_UTF8_LOCALE gates), so without them the
+      # pty sections, the staging-lock checks and the locale round-trip skip
+      # themselves and the suite still exits 0. Those are why this list is
+      # longer than the suites' own required list, and why script and flock are
+      # on it at all.
+      # A tool on that required list is already loud — xcompat exits 77 and
+      # go-e2e exits 2, and a plain `run:` step fails on either — so for those
+      # this step only buys a named tool now instead of a dead suite in forty
+      # minutes. Neither reason is ceremony; do not trim the list to the suites'.
       - name: Every required tool must actually be present
         run: |
           missing=()
           for t in sha512sum mksquashfs unsquashfs par2 age age-keygen \
-                   xorriso gzip diff find awk sed cmp sort script; do
+                   xorriso gzip diff find awk sed cmp sort script flock; do
             command -v "$t" >/dev/null 2>&1 || missing+=("$t")
           done
           if [ ${#missing[@]} -ne 0 ]; then

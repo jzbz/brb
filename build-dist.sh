@@ -4,10 +4,13 @@
 #
 # Produces, in the output directory:
 #
+#   brb.sh              the tool as a bash script, copied in rather than built
 #   brb-linux-amd64     static Go binary  (uname -m: x86_64)
 #   brb-linux-aarch64   static Go binary  (uname -m: aarch64)
 #   brb-src.tar.gz      complete Go source, dependencies vendored
-#   SHA512SUMS          hashes of the three above
+#   SHA512SUMS          hashes of the four above
+#
+# That list is $PAYLOAD below, and it is the list every step here works from.
 #
 # The binaries are static (CGO_ENABLED=0), so they run on any Linux of the right
 # architecture with no libc, no Go toolchain and no shared libraries. The source
@@ -60,9 +63,16 @@ check_version_agrees() { # check_version_agrees DIR-HOLDING-THE-BINARIES
   # Reading the const proves what the source says; running the binary proves
   # what was actually linked. Only the native architecture can be executed here,
   # and both binaries come out of the same tree, so one run settles both.
-  case "$(uname -m)" in
-    x86_64)        native=amd64 ;;
-    aarch64|arm64) native=aarch64 ;;
+  # Matched on the OS too, because only a Linux host can exec what was just
+  # cross-compiled. Linux spells 64-bit ARM "aarch64" and never "arm64", so the
+  # arm64 spelling only ever reaches here from macOS or FreeBSD — where running
+  # the binary fails with a wrong-format error, the `2>/dev/null` below swallows
+  # it, and the empty output was reported as "version skew ... reports
+  # 'nothing'": a version diagnosis for a platform problem. Such a host now
+  # takes the source-only path below, which is what its message already says.
+  case "$(uname -s)/$(uname -m)" in
+    Linux/x86_64)  native=amd64 ;;
+    Linux/aarch64) native=aarch64 ;;
   esac
   [[ -n "$native" && -x "$dir/brb-linux-$native" ]] || {
     say "no native binary to run ($(uname -m)); version checked against the source only"
@@ -79,14 +89,21 @@ check_version_agrees() { # check_version_agrees DIR-HOLDING-THE-BINARIES
 #   GOARCH  ->  on-disc filename suffix
 ARCHES=( "amd64:amd64" "arm64:aarch64" )
 
+# The published set, in the order SHA512SUMS lists it. Written once: the header
+# above said "hashes of the three above" from the first commit onward while the
+# script hashed four, because that copy of the list was the one with no
+# consequence for being wrong. The Go writer keeps its own copy in
+# internal/backup/payload.go, which names this file as the source of truth.
+PAYLOAD=( brb.sh brb-linux-amd64 brb-linux-aarch64 brb-src.tar.gz )
+
 say() { printf '==> %s\n' "$*" >&2; }
 
 command -v go >/dev/null 2>&1 || { echo "go toolchain not found" >&2; exit 1; }
 say "go $(go version | awk '{print $3}')  building brb $VERSION"
 
-# Everything is built into a sibling temp directory and moved into $OUT only
-# once every artifact exists. set -Eeuo pipefail aborts on the first failure but
-# nothing here was atomic, so a toolchain error, an OOM or a Ctrl-C part-way
+# Everything is built into a temp directory and moved into place only once every
+# artifact exists. set -Eeuo pipefail aborts on the first failure but nothing
+# here was atomic, so a toolchain error, an OOM or a Ctrl-C part-way
 # through left $OUT holding a NEW binary for one architecture beside the STALE
 # one for the other, under a stale SHA512SUMS that described neither. Nothing
 # downstream would have caught it: the Go writer's writePayload only stats each
@@ -94,17 +111,43 @@ say "go $(go version | awk '{print $3}')  building brb $VERSION"
 # of a set, and each disc's own SHA512SUMS — generated over the mixed files —
 # would certify the result as sound.
 #
-# A sibling of $OUT keeps the final moves on one filesystem, where each is a
-# rename(2) that cannot half-happen.
-OUT_PARENT="$(dirname -- "$OUT")"
-mkdir -p "$OUT_PARENT"
-STAGE_OUT="$(mktemp -d "$OUT_PARENT/.brb-dist.XXXXXX")"
+# The staging directory is a CHILD of $OUT, not a sibling, and that is what
+# makes each final move a rename(2) that cannot half-happen. A sibling is only
+# on the same filesystem when $OUT is an ordinary directory: `dirname` is
+# textual, so pointing BRB_DIST_OUT at a symlink or a bind mount — the
+# arrangement the publish comment below says survives — puts the sibling on the
+# filesystem holding the NAME while the files land on another one. Every mv then
+# crosses a device boundary, degrades to copy-then-unlink, and an interruption
+# leaves a truncated ten-megabyte binary under the final name, which the Go
+# writer would copy onto every disc of a set without a word. A child of $OUT is
+# on $OUT's own filesystem by construction, whatever $OUT turns out to be.
+mkdir -p "$OUT"
+STAGE_OUT="$(mktemp -d "$OUT/.brb-dist.XXXXXX")"
 stage=""                      # the source-tarball staging dir, made further down
 trap 'rm -rf -- "$STAGE_OUT" ${stage:+"$stage"}' EXIT
 
 # --- vendor, so the source tarball builds with no network ------------------
+# `go mod tidy` here is not housekeeping, it is an alarm, and it needs someone
+# listening: if tidy changes anything, the committed go.mod and go.sum no longer
+# describe the module the binaries below get built from, and the discs would
+# carry a payload whose provenance the repository does not record — while the
+# operator's working tree is quietly left modified by a build. CI has checked
+# this from the start ("go.mod and go.sum must already be tidy"), but a release
+# is cut by running THIS script on somebody's machine, so the gate has to travel
+# with the script. Fingerprinted rather than diffed against git: it then works
+# from an unpacked source tarball too, and it faults only what tidy itself
+# rewrote rather than any uncommitted edit that was already there.
+mod_fingerprint() { sha512sum -- "$REPO/go/go.mod" "$REPO/go/go.sum" | awk '{print $1}'; }
 say "vendoring dependencies"
+before_tidy="$(mod_fingerprint)"
 ( cd "$REPO/go" && go mod tidy && go mod vendor )
+[[ "$(mod_fingerprint)" == "$before_tidy" ]] || {
+  echo "go mod tidy rewrote go.mod or go.sum: the module that would ship on these discs" >&2
+  echo "  is not the one the repository records — and your working tree has just been" >&2
+  echo "  changed by a build. Review it, commit the tidy result or revert it and fix the" >&2
+  echo "  imports, then re-run:" >&2
+  echo "    git -C $REPO diff -- go/go.mod go/go.sum" >&2
+  exit 1; }
 
 # --- binaries --------------------------------------------------------------
 for spec in "${ARCHES[@]}"; do
@@ -128,8 +171,19 @@ stage="$(mktemp -d)"
 top="brb-$VERSION"
 mkdir -p "$stage/$top"
 
+# The two suites travel with the source because the README that travels with it
+# tells the reader to run them by name — "./xcompat-test.sh", "./go-e2e-test.sh"
+# — and a tarball whose own instructions name files it does not contain is the
+# same class of promise the on-disc README is forbidden from making. They add
+# 37 KB compressed to a 550 KB tarball, and each names its missing tools and
+# exits without pretending to have run, so they degrade the way a rescue system
+# needs. Deliberately NOT here, and this is the list to update if that changes:
+# .github/, repository infrastructure rather than source (the README links it;
+# a dead relative link is not an instruction that fails), and
+# README-brb-sample.md, which is a rendering of a document brb writes itself.
 cp -a "$REPO/go" "$stage/$top/go"
-cp -a "$REPO/brb.sh" "$REPO/LICENSE" "$REPO/README.md" "$REPO/build-dist.sh" "$stage/$top/"
+cp -a "$REPO/brb.sh" "$REPO/LICENSE" "$REPO/README.md" "$REPO/build-dist.sh" \
+      "$REPO/xcompat-test.sh" "$REPO/go-e2e-test.sh" "$stage/$top/"
 find "$stage/$top" -name '.DS_Store' -delete 2>/dev/null || true
 
 # -z (gzip), not zstd: this tarball is unpacked by a person, years from now,
@@ -147,7 +201,7 @@ chmod 644 "$STAGE_OUT/brb-src.tar.gz"
 install -m 755 "$REPO/brb.sh" "$STAGE_OUT/brb.sh"
 
 # --- checksums -------------------------------------------------------------
-( cd "$STAGE_OUT" && sha512sum brb.sh brb-linux-amd64 brb-linux-aarch64 brb-src.tar.gz > SHA512SUMS )
+( cd "$STAGE_OUT" && sha512sum -- "${PAYLOAD[@]}" > SHA512SUMS )
 
 # --- publish ---------------------------------------------------------------
 # Every build step is behind us, so from here only rename(2) remains. SHA512SUMS
@@ -157,14 +211,13 @@ install -m 755 "$REPO/brb.sh" "$STAGE_OUT/brb.sh"
 # rather than plausibly complete. $OUT itself is never removed, so a symlink or
 # a bind mount someone pointed BRB_DIST_DIR at survives.
 say "publishing to $OUT"
-mkdir -p "$OUT"
 rm -f -- "$OUT/SHA512SUMS"
-for f in brb.sh brb-linux-amd64 brb-linux-aarch64 brb-src.tar.gz; do
+for f in "${PAYLOAD[@]}"; do
   mv -f -- "$STAGE_OUT/$f" "$OUT/$f"
 done
 mv -f -- "$STAGE_OUT/SHA512SUMS" "$OUT/SHA512SUMS"
 
 say "done"
-( cd "$OUT" && ls -l brb.sh brb-linux-amd64 brb-linux-aarch64 brb-src.tar.gz SHA512SUMS ) >&2
+( cd "$OUT" && ls -l -- "${PAYLOAD[@]}" SHA512SUMS ) >&2
 printf '\n  Point brb at it:  export BRB_DIST_DIR=%s\n  or:               ln -sfn %s %s/dist\n\n' \
   "$OUT" "$OUT" "$REPO" >&2

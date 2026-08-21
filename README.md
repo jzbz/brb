@@ -457,9 +457,11 @@ the file, an unknown key is simply a variable nobody reads. The Go build
 *validates*, and rejects an unknown key by refusing to run at all. `KEEP_IMAGES`
 is the case that bites today: it is a real bash setting, and putting it in a
 shared config stops the Go build dead. Use its `--keep-images` flag instead, or
-keep the readers on separate config files. Where the setting is read, both
-readers accept the same spellings — `1`/`0`, `true`/`false`, `yes`/`no`,
-`on`/`off` — so a value written for one is not misread by the other.
+keep the readers on separate config files. Booleans, by contrast, really do
+travel: both readers take `1`/`0`, `true`/`false`, `yes`/`no` and `on`/`off`, in
+any case, so a value written for one is not misread by the other. A spelling
+neither of them can read as a boolean stops the Go build at load, naming the key
+and the line, rather than being quietly taken as false.
 
 ```bash
 SOURCE_DIR=/home/you
@@ -997,11 +999,13 @@ Also covers ISO modes and that a finished run leaves no resume state behind.
 
 The format contract. Builds a set with the Go build and reads it with **both**
 implementations, asserting they agree — the restored trees, the encrypted index,
-the disc inventory, `list`, `--only`, `KEEP_IMAGES`. It also runs the recipe
-printed on the disc itself, with neither implementation involved, and damages a
-set on purpose: a rotted `.sha512` sidecar must not condemn an image par2 proves
-is whole, while an image par2 *cannot* repair must still be refused rather than
-decrypted.
+the disc inventory, `list`, `--only`, `KEEP_IMAGES`, and the staging lock that
+stops a second run writing into a tree a backup has not finished. It also runs
+the recipe printed on the disc itself, with neither implementation involved, and
+damages a set on purpose: a rotted `.sha512` sidecar must not condemn an image
+par2 proves is whole, while an image par2 *cannot* repair must still be refused
+rather than decrypted — refused *and* leaving the destination empty, since a
+reader that decrypted first and failed later would satisfy the exit code alone.
 
 It also plants symlinks in the *destination* — the direction a restore is
 attacked from — and holds both readers to the same two refusals: a link that
@@ -1051,11 +1055,17 @@ check are disabled at the site, with the reason written next to them, rather
 than switched off across the repo.
 
 One step in it is load-bearing and worth knowing about: CI verifies every
-external tool is present *before* running anything. The tool-dependent Go tests
-call `t.Skip` when detection fails and the shell suites exit 77, which is right
-on a laptop and dangerously quiet on a build runner — a runner missing `par2`
-would otherwise report a green `go test ./...` in which the integration tests
-never ran at all. A missing tool fails the run instead.
+external tool is present *before* running anything, and it checks for more than
+the suites themselves require. The quiet failures are the reason. A
+tool-dependent Go test calls `t.Skip` when detection fails, so a runner missing
+`par2` would report a green `go test ./...` in which the integration tests never
+ran at all; and `xcompat-test.sh` treats `script(1)`, `flock(1)` and an
+`en_US.UTF-8` locale as *optional*, skipping the pty, staging-lock and locale
+checks and still exiting 0 without them — so CI checks for those three by name.
+Both are right on a laptop and dangerously quiet on a build runner. A tool
+the suites do require is loud already — `xcompat-test.sh` exits 77 and
+`go-e2e-test.sh` exits 2, either of which fails the step — so for those the
+check only buys a named tool up front instead of a dead suite forty minutes in.
 
 The release job rebuilds `brb-src.tar.gz` with `GOPROXY=off`, so the offline
 rebuild the on-disc README promises is re-proven on every run rather than resting
