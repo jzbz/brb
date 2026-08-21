@@ -282,6 +282,27 @@ jobs:
           GOPROXY=off go build -mod=vendor -o "$RUNNER_TEMP/brb-offline" ./cmd/brb
           "$RUNNER_TEMP/brb-offline" version
 
+      # The release assets exist so that nobody renames four files by hand at
+      # tag time. That only helps if the step is exercised: an untested
+      # generator drifts exactly like the hand-renaming it replaced, and the
+      # place it would be noticed is a published release page.
+      - name: The release assets must be versioned, verified, and the same bytes
+        working-directory: ${{ runner.temp }}/home/brb-dist/release
+        run: |
+          sha512sum -c SHA512SUMS
+          v="$(sed -n 's/^VERSION="\([^"]*\)".*/\1/p' "$GITHUB_WORKSPACE/brb.sh" | head -1)"
+          test -n "$v" || { echo "could not read VERSION out of brb.sh" >&2; exit 1; }
+          for f in "brb-v$v-linux-amd64" "brb-v$v-linux-aarch64" \
+                   "brb-v$v.sh" "brb-v$v-src.tar.gz"; do
+            test -f "$f" || { echo "missing release asset: $f" >&2; exit 1; }
+          done
+          # An asset that is not the payload byte for byte would put something
+          # on a release page that no disc has ever carried.
+          cmp "brb-v$v-linux-amd64"   ../brb-linux-amd64
+          cmp "brb-v$v-linux-aarch64" ../brb-linux-aarch64
+          cmp "brb-v$v.sh"            ../brb.sh
+          cmp "brb-v$v-src.tar.gz"    ../brb-src.tar.gz
+
       # build-dist.sh runs `go mod tidy && go mod vendor` before it builds. That
       # is deliberate, and it makes this the cheapest possible dependency-drift
       # alarm: if tidy wants to change anything, the committed go.mod and go.sum

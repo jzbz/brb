@@ -9,6 +9,8 @@
 #   brb-linux-aarch64   static Go binary  (uname -m: aarch64)
 #   brb-src.tar.gz      complete Go source, dependencies vendored
 #   SHA512SUMS          hashes of the four above
+#   release/            those same four under the names a release wears,
+#                       brb-vX.Y.Z-*, with their own SHA512SUMS beside them
 #
 # That list is $PAYLOAD below, and it is the list every step here works from.
 #
@@ -217,7 +219,53 @@ for f in "${PAYLOAD[@]}"; do
 done
 mv -f -- "$STAGE_OUT/SHA512SUMS" "$OUT/SHA512SUMS"
 
+# --- release assets --------------------------------------------------------
+# The same bytes a second time, under the names a GitHub release wears.
+#
+# They cannot simply BE the payload names. Those four are frozen: the disc
+# format pins them (backup.payloadNames) and every on-disc README names them in
+# its worked examples, so a disc has to carry "brb-linux-amd64" and never
+# "brb-v0.1.0-linux-amd64". A release page has the opposite problem — an
+# unversioned brb-linux-amd64 downloaded from two different releases gives two
+# files nothing can tell apart, and the version is only recoverable by running
+# one of them.
+#
+# So both names exist, and neither is produced by hand. Renaming at tag time is
+# exactly how a release ends up disagreeing with itself, and this script already
+# exists to notice that class of drift rather than allow it. The copies are made
+# from the bytes just published, not from the staging directory, so what the
+# release carries is what a disc would carry. SHA512SUMS is written last: a run
+# killed part way leaves a directory that is visibly unfinished rather than
+# plausibly complete.
+release_name() { # release_name PAYLOAD-NAME
+  case "$1" in
+    brb.sh)         printf 'brb-v%s.sh' "$VERSION" ;;
+    brb-src.tar.gz) printf 'brb-v%s-src.tar.gz' "$VERSION" ;;
+    brb-linux-*)    printf 'brb-v%s-linux-%s' "$VERSION" "${1#brb-linux-}" ;;
+    *)              echo "build-dist.sh: no release name defined for $1" >&2; return 1 ;;
+  esac
+}
+
+REL="$OUT/release"
+say "release assets in $REL"
+rm -rf -- "$REL"
+mkdir -p -- "$REL"
+rel_names=()
+for f in "${PAYLOAD[@]}"; do
+  rel="$(release_name "$f")"
+  cp -p -- "$OUT/$f" "$REL/$rel"
+  cmp -s -- "$OUT/$f" "$REL/$rel" \
+    || { echo "release copy $rel does not match $f" >&2; exit 1; }
+  rel_names+=( "$rel" )
+done
+( cd "$REL" && sha512sum -- "${rel_names[@]}" > SHA512SUMS )
+( cd "$REL" && sha512sum -c --quiet SHA512SUMS ) \
+  || { echo "release checksums in $REL do not verify" >&2; exit 1; }
+
 say "done"
 ( cd "$OUT" && ls -l -- "${PAYLOAD[@]}" SHA512SUMS ) >&2
-printf '\n  Point brb at it:  export BRB_DIST_DIR=%s\n  or:               ln -sfn %s %s/dist\n\n' \
+( cd "$REL" && ls -l -- "${rel_names[@]}" SHA512SUMS ) >&2
+printf '\n  Point brb at it:  export BRB_DIST_DIR=%s\n  or:               ln -sfn %s %s/dist\n' \
   "$OUT" "$OUT" "$REPO" >&2
+printf '\n  Publish v%s:      gh release upload v%s %s/*\n\n' \
+  "$VERSION" "$VERSION" "$REL" >&2
