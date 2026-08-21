@@ -37,9 +37,9 @@ SHA512SUMS                 hashes of every file here
   disc{{.Disc02}}.squashfs.age.vol*.par2  {{.Redundancy}}% recovery data
   index.tsv.gz.age                 encrypted map of which disc holds which file
   index.tsv.gz.age.sha512          hash of that map
-  sidecars.par2                    par2 index for the small files above
+{{if .SidecarParity}}  sidecars.par2                    par2 index for the small files above
   sidecars.vol*.par2               {{.SidecarRedundancy}}% recovery data for them
-```
+{{end}}```
 
 The pipeline was:
 
@@ -58,11 +58,18 @@ multi-gigabyte images fit at all.
 Parity is computed over the **encrypted** bytes, so it protects exactly what is
 physically on the disc. Undo in reverse: repair, decrypt, mount.
 
-The small files — the `.sha512` sidecars and the index — carry their own parity
+{{if .SidecarParity}}The small files — the `.sha512` sidecars and the index — carry their own parity
 in `sidecars.par2`, because one rotted byte in a 170-byte hash file is otherwise
 enough to make a perfectly good image look damaged, and one flipped bit in the
 index destroys the whole map of which disc holds what.
-
+{{else}}**The small files on this disc have no parity of their own.** Writing
+`sidecars.par2` failed when this disc was built, so the `.sha512` sidecars and
+the encrypted index are present but unprotected — one rotted byte in a 170-byte
+hash file is enough to make a perfectly good image look damaged, and the image's
+own parity does not cover them. This costs less than it sounds: every other disc
+in the set carries the same index, so a rotted copy here is replaceable from any
+of them.
+{{end}}
 ---
 
 ## What you need
@@ -101,16 +108,25 @@ sha512sum -c disc{{.Disc02}}.squashfs.age.sha512 \
 age -d -i /path/to/identity.txt \
     -o disc{{.Disc02}}.squashfs disc{{.Disc02}}.squashfs.age
 
-# 4a. mount it and browse — needs nothing but the kernel
-sudo mount -o loop,ro disc{{.Disc02}}.squashfs /mnt
+# 4a. mount it and browse — needs nothing but the kernel. Deliberately not
+#     /mnt: this disc is mounted there, and mounting over it hides the data/
+#     directory that step 1 reads from for every remaining disc.
+mkdir -p image
+sudo mount -o loop,ro disc{{.Disc02}}.squashfs image
 
 # 4b. or extract it
 unsquashfs -d /path/to/destination disc{{.Disc02}}.squashfs
 ```
 
-Run `unsquashfs` as root if you want original ownership restored. Repeat for
-every disc, extracting all of them into the same destination directory — the
-discs hold disjoint sets of files, so they merge cleanly. Add `-f` to
+Run `unsquashfs` as root if you want original ownership restored. If you are
+**not** root, add `-user-xattrs`: these images carry extended attributes, and an
+unprivileged `unsquashfs` fails on the `security.*` and `system.*` namespaces
+and exits non-zero — after extracting every file correctly, which makes it look
+like a failed restore when it was not.
+
+Repeat for every disc, extracting all of them into the same destination
+directory — the discs hold disjoint sets of files, so they merge cleanly. Add
+`-f` to
 `unsquashfs` when extracting the second and later discs into a directory that
 already exists.
 {{if .Tools}}
@@ -132,7 +148,10 @@ the one that matches your machine off the disc, `chmod +x` it, and run it.
 cp /mnt/{{(index .Binaries 0).Name}} /tmp/brb && chmod +x /tmp/brb && /tmp/brb help
 ```
 {{end}}{{if .Script}}
-`{{.Script}}` is the same tool as a bash script. It does the same job but needs
+`{{.Script}}` is the reader half of the same tool, as a bash script: it can
+ingest, restore, mount, list, index and verify a set — everything a restore
+needs — but it deliberately cannot create or burn one, and says so if you ask.
+Use a binary or the source for that. It needs
 `age`, `par2` and `squashfs-tools` installed, where a static binary needs only
 `unsquashfs` and `par2` for a full restore and nothing at all to decrypt and
 mount. It is also the readable one: if you would rather know exactly what
@@ -153,16 +172,20 @@ source tarball, say, or a binary for an architecture toolNotes has no entry for
 program name is missing is worse than no recipe, and it is burned onto a disc
 that cannot be corrected. */}}{{if .Run}}
 ```sh
+# copy the tool off the disc first, so this works from any directory —
+# including brb-*/go, where the tarball recipe above leaves you
+cp /mnt/{{.Run}} /tmp/{{.Run}} && chmod +x /tmp/{{.Run}}
+
 export STAGING=/var/tmp/restore
 {{if .PublicIdentity}}# no key to configure: ingest copies {{.PublicIdentityFile}} off the disc into
 # "$STAGING"/enc/ and every command below picks it up from there on its own
 {{else}}export AGE_IDENTITY=/path/to/identity.txt
 {{end}}
-./{{.Run}} ingest                             # prompts for each disc, any order
-./{{.Run}} index thesis                       # which disc holds a given path?
-./{{.Run}} restore /path/to/destination
-./{{.Run}} restore /dest --disc {{.Disc}}                  # just this one
-./{{.Run}} mount {{.Disc}} /mnt/browse                     # decrypt and mount
+/tmp/{{.Run}} ingest                          # prompts for each disc, any order
+/tmp/{{.Run}} index thesis                    # which disc holds a given path?
+/tmp/{{.Run}} restore /path/to/destination
+/tmp/{{.Run}} restore /dest --disc {{.Disc}}               # just this one
+/tmp/{{.Run}} mount {{.Disc}} /mnt/browse                  # decrypt and mount
 ```
 {{end}}{{end}}
 ---
@@ -198,14 +221,20 @@ blocks it is short. If you burned a second copy of the set, copy the same image
 from the other copy into the same directory — par2 can combine two partially
 good copies into one good file.
 
-If the image checks out but a `.sha512` sidecar or the index is what rotted,
+{{if .SidecarParity}}If the image checks out but a `.sha512` sidecar or the index is what rotted,
 repair those from the disc's own parity instead — copy the small files and
 `sidecars.par2*` into one directory and run:
 
 ```sh
 par2 repair -- sidecars.par2
 ```
-
+{{else}}If the image checks out but the index is what rotted, this disc has no
+parity for it — take the index from another disc instead. Every disc in the set
+carries the same `index.tsv.gz.age`, and each one's `SHA512SUMS` says whether
+its copy is still good. A rotted `.sha512` sidecar is not itself a problem: it
+is only a hash of a file whose own parity is intact, so check the image with
+`par2 verify` and ignore the sidecar.
+{{end}}
 ---
 
 ## If a disc is gone entirely
@@ -220,7 +249,11 @@ age -d -i /path/to/identity.txt /mnt/data/index.tsv.gz.age | gunzip -c | awk -F'
 
 The index is a two-column list: disc number, then path. Exactly one row per
 file, one line each. A backslash, tab or newline inside a path is written as
-`\\`, `\t` and `\n` respectively, so a path can never span two rows.
+`\\`, `\t` and `\n` respectively, so a path can never span two rows. Paths are
+slash-separated and relative to the `source` directory named in `MANIFEST.txt`,
+never absolute. Only regular files are listed: directories, symbolic links and
+device nodes are replicated onto every disc as the skeleton and never appear
+here, so a path absent from the index is not necessarily absent from the backup.
 Replace `{{.Disc}}` above with the number of the disc you lost.
 
 ---
@@ -265,9 +298,10 @@ silently produce rubbish. Save it to a file and use `age -d -i thatfile`.
 sha512sum -c SHA512SUMS                        # is this disc still good?
 par2 verify -- FILE.age.par2                   # is this image recoverable?
 par2 repair -- FILE.age.par2                   # fix it
-par2 repair -- sidecars.par2                   # fix a rotted .sha512 or index
-age -d -i identity.txt -o OUT.squashfs IN.age  # decrypt
+{{if .SidecarParity}}par2 repair -- sidecars.par2                   # fix a rotted .sha512 or index
+{{end}}age -d -i identity.txt -o OUT.squashfs IN.age  # decrypt
 mount -o loop,ro OUT.squashfs /mnt             # browse
-unsquashfs -d /dest OUT.squashfs               # extract
+unsquashfs -d /dest OUT.squashfs               # extract (add -user-xattrs
+                                               #   if you are not root)
 unsquashfs -ll OUT.squashfs                    # list contents
 ```

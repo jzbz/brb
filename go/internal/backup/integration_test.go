@@ -376,6 +376,28 @@ func TestSidecarParityFailureIsOnlyAWarning(t *testing.T) {
 		if len(left) != 0 {
 			t.Errorf("disc %d kept %v after a failed sidecar par2", n, left)
 		}
+		// And the disc's own README must stop promising what is not there.
+		// This is the end of the chain the operator's warning began: the
+		// warning reaches whoever ran the backup, but the README is what
+		// reaches the person holding the disc in fifteen years, and it is the
+		// only one of the two that cannot be corrected afterwards.
+		readme, err := os.ReadFile(filepath.Join(dd, "README.md"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		text := string(readme)
+		for _, bad := range []string{
+			"sidecars.par2                    par2 index",
+			"sidecars.vol*.par2",
+			"par2 repair -- sidecars.par2",
+		} {
+			if strings.Contains(text, bad) {
+				t.Errorf("disc %d README promises %q after its sidecar par2 failed", n, bad)
+			}
+		}
+		if !strings.Contains(text, "no parity of their own") {
+			t.Errorf("disc %d README does not say the small files are unprotected", n)
+		}
 		// The disc is otherwise complete and internally consistent.
 		for _, want := range []string{agecrypt.SumsName, "MANIFEST.txt", "README.md",
 			filepath.Join("data", imageName(n)+".age"),

@@ -752,6 +752,19 @@ func (r *runner) protectSidecars(ctx context.Context, n int, data string) {
 	}
 }
 
+// sidecarFailed reports whether disc n went without its sidecar parity. The
+// READMEs are rendered after every disc is built, so this answers for the whole
+// set by then; asking earlier would report a disc as protected because its par2
+// run had not been attempted yet.
+func (r *runner) sidecarFailed(n int) bool {
+	for _, f := range r.sidecarFailures {
+		if f == n {
+			return true
+		}
+	}
+	return false
+}
+
 // sidecarParity is protectSidecars' work, with the failures returned rather
 // than warned about, so there is one place that decides what a failure means.
 func (r *runner) sidecarParity(ctx context.Context, n int, data string) error {
@@ -826,6 +839,7 @@ func (r *runner) writeManifest(ctx context.Context, total int) error {
 		DiscType:       r.cfg.DiscType.String(),
 		Compression:    r.cfg.Compression,
 		Level:          r.cfg.CompressionLevel,
+		LevelApplies:   tools.LevelApplies(r.cfg.Compression),
 		BlockSize:      r.cfg.BlockSize,
 		Redundancy:     r.cfg.Par2Redundancy,
 		Version:        Version,
@@ -900,6 +914,7 @@ func (r *runner) writeReadmes(ctx context.Context, total int) error {
 			Source:            r.cfg.SourceDir,
 			Redundancy:        r.cfg.Par2Redundancy,
 			SidecarRedundancy: SidecarRedundancy,
+			SidecarParity:     !r.sidecarFailed(n),
 			Version:           Version,
 			Tools:             discToolArtifacts(dd),
 			PublicIdentity:    r.publicIdentityText(),

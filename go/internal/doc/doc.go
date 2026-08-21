@@ -44,6 +44,18 @@ type DiscData struct {
 	// covered by sidecars.par2 — the .sha512 sidecars and the encrypted index.
 	// It is a separate, much higher figure because those files are kilobytes.
 	SidecarRedundancy int
+	// SidecarParity says whether sidecars.par2 and its volumes are actually on
+	// this disc. Parity over the small files is best-effort: a par2 failure
+	// there is a warning and the disc is still written (see
+	// backup.protectSidecars), so the README cannot assert the file. It is a
+	// per-disc fact rather than a per-set one, because one disc's par2 run can
+	// fail while the rest of the set is fine.
+	//
+	// False removes every mention of sidecars.par2 from the rendered README,
+	// including the repair recipe. A restorer following a recipe for a file
+	// that is not there has been sent looking for something that was never
+	// burned, and this document cannot be corrected afterwards.
+	SidecarParity bool
 	// Version is the brb version that produced the set.
 	Version string
 	// Tools names the copies of brb that are actually in the root of this
@@ -97,8 +109,17 @@ type ManifestData struct {
 	DiscType string
 	// Compression is the squashfs compressor, e.g. "zstd" or "none".
 	Compression string
-	// Level is the configured compression level.
+	// Level is the configured compression level. Only meaningful when
+	// LevelApplies.
 	Level int
+	// LevelApplies says whether the compressor actually took Level. mksquashfs
+	// accepts -Xcompression-level for zstd, gzip and lzo and for nothing else
+	// (see tools.LevelApplies), so for xz, lz4 and none the configured number
+	// was never passed to it. Recording it anyway would put a permanent,
+	// false statement about how these images were built onto every disc:
+	// COMPRESSION_LEVEL defaults to 19, so an xz set would read "xz level 19"
+	// for a run at xz's own defaults.
+	LevelApplies bool
 	// BlockSize is the squashfs data block size, e.g. "1M".
 	BlockSize string
 	// Redundancy is the par2 recovery percentage.
@@ -135,6 +156,7 @@ type readmeView struct {
 	Source            string
 	Redundancy        int
 	SidecarRedundancy int
+	SidecarParity     bool
 	Version           string
 
 	// Tools are the copies of brb in the root of this disc, in listing order.
@@ -334,6 +356,7 @@ func RenderDiscREADME(d DiscData) string {
 	v.Source = d.Source
 	v.Redundancy = d.Redundancy
 	v.SidecarRedundancy = d.SidecarRedundancy
+	v.SidecarParity = d.SidecarParity
 	v.Version = d.Version
 	v.PublicIdentity = d.PublicIdentity
 	if d.PublicIdentity != "" {

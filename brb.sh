@@ -10,8 +10,10 @@
 # It exists as a separate, deliberately small, deliberately readable program
 # because of what a restore actually looks like. Someone is holding a disc,
 # possibly years from now, possibly on a rescue system, and wants to know what
-# will happen to their bytes before they run anything. Under two thousand lines
-# of shell can be read end to end in an afternoon. An 8 MB static binary cannot.
+# will happen to their bytes before they run anything. One file of shell can be
+# read end to end in an afternoon, and `wc -l` on the copy in front of you is the
+# only honest count of how much there is. An 8 MB static binary cannot be read at
+# all.
 #
 # It is frozen against the on-disc format, so it changes only when that format
 # changes. The two implementations are held to the same format by

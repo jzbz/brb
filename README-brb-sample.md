@@ -94,16 +94,25 @@ sha512sum -c disc01.squashfs.age.sha512 \
 age -d -i /path/to/identity.txt \
     -o disc01.squashfs disc01.squashfs.age
 
-# 4a. mount it and browse — needs nothing but the kernel
-sudo mount -o loop,ro disc01.squashfs /mnt
+# 4a. mount it and browse — needs nothing but the kernel. Deliberately not
+#     /mnt: this disc is mounted there, and mounting over it hides the data/
+#     directory that step 1 reads from for every remaining disc.
+mkdir -p image
+sudo mount -o loop,ro disc01.squashfs image
 
 # 4b. or extract it
 unsquashfs -d /path/to/destination disc01.squashfs
 ```
 
-Run `unsquashfs` as root if you want original ownership restored. Repeat for
-every disc, extracting all of them into the same destination directory — the
-discs hold disjoint sets of files, so they merge cleanly. Add `-f` to
+Run `unsquashfs` as root if you want original ownership restored. If you are
+**not** root, add `-user-xattrs`: these images carry extended attributes, and an
+unprivileged `unsquashfs` fails on the `security.*` and `system.*` namespaces
+and exits non-zero — after extracting every file correctly, which makes it look
+like a failed restore when it was not.
+
+Repeat for every disc, extracting all of them into the same destination
+directory — the discs hold disjoint sets of files, so they merge cleanly. Add
+`-f` to
 `unsquashfs` when extracting the second and later discs into a directory that
 already exists.
 
@@ -125,7 +134,10 @@ the one that matches your machine off the disc, `chmod +x` it, and run it.
 cp /mnt/brb-linux-amd64 /tmp/brb && chmod +x /tmp/brb && /tmp/brb help
 ```
 
-`brb.sh` is the same tool as a bash script. It does the same job but needs
+`brb.sh` is the reader half of the same tool, as a bash script: it can
+ingest, restore, mount, list, index and verify a set — everything a restore
+needs — but it deliberately cannot create or burn one, and says so if you ask.
+Use a binary or the source for that. It needs
 `age`, `par2` and `squashfs-tools` installed, where a static binary needs only
 `unsquashfs` and `par2` for a full restore and nothing at all to decrypt and
 mount. It is also the readable one: if you would rather know exactly what
@@ -141,14 +153,18 @@ go build -mod=vendor ./cmd/brb
 ```
 
 ```sh
+# copy the tool off the disc first, so this works from any directory —
+# including brb-*/go, where the tarball recipe above leaves you
+cp /mnt/brb.sh /tmp/brb.sh && chmod +x /tmp/brb.sh
+
 export STAGING=/var/tmp/restore
 export AGE_IDENTITY=/path/to/identity.txt
 
-./brb.sh ingest                             # prompts for each disc, any order
-./brb.sh index thesis                       # which disc holds a given path?
-./brb.sh restore /path/to/destination
-./brb.sh restore /dest --disc 1                  # just this one
-./brb.sh mount 1 /mnt/browse                     # decrypt and mount
+/tmp/brb.sh ingest                          # prompts for each disc, any order
+/tmp/brb.sh index thesis                    # which disc holds a given path?
+/tmp/brb.sh restore /path/to/destination
+/tmp/brb.sh restore /dest --disc 1               # just this one
+/tmp/brb.sh mount 1 /mnt/browse                  # decrypt and mount
 ```
 
 ---
@@ -206,7 +222,11 @@ age -d -i /path/to/identity.txt /mnt/data/index.tsv.gz.age | gunzip -c | awk -F'
 
 The index is a two-column list: disc number, then path. Exactly one row per
 file, one line each. A backslash, tab or newline inside a path is written as
-`\\`, `\t` and `\n` respectively, so a path can never span two rows.
+`\\`, `\t` and `\n` respectively, so a path can never span two rows. Paths are
+slash-separated and relative to the `source` directory named in `MANIFEST.txt`,
+never absolute. Only regular files are listed: directories, symbolic links and
+device nodes are replicated onto every disc as the skeleton and never appear
+here, so a path absent from the index is not necessarily absent from the backup.
 Replace `1` above with the number of the disc you lost.
 
 ---
@@ -239,6 +259,7 @@ par2 repair -- FILE.age.par2                   # fix it
 par2 repair -- sidecars.par2                   # fix a rotted .sha512 or index
 age -d -i identity.txt -o OUT.squashfs IN.age  # decrypt
 mount -o loop,ro OUT.squashfs /mnt             # browse
-unsquashfs -d /dest OUT.squashfs               # extract
+unsquashfs -d /dest OUT.squashfs               # extract (add -user-xattrs
+                                               #   if you are not root)
 unsquashfs -ll OUT.squashfs                    # list contents
 ```

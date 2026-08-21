@@ -41,11 +41,11 @@ archive format.
 
 The Go build is the tool you use day to day. The bash script exists for one
 reason: a restore fifteen years from now, by someone holding a disc and no
-particular reason to trust an 8 MB binary. It is one file of under two thousand
-lines, comments and all — `wc -l brb.sh` on the disc is the authority here,
-because a number written into prose drifts and this one already has — and
-it can be read end to end in an afternoon, so the answer to "what is this going
-to do to my bytes" is available without running anything.
+particular reason to trust an 8 MB binary. It is one file — `wc -l brb.sh` on
+the disc is the authority on how long, because a number written into prose
+drifts and this one did twice before the number came out — and it can be read
+end to end in an afternoon, so the answer to "what is this going to do to my
+bytes" is available without running anything.
 
 `brb.sh` refuses `backup`, `plan`, `burn`, `iso` and `init-key` by name, and says
 where they went, rather than failing as an unknown command.
@@ -172,6 +172,12 @@ The Go build is the one to install — it is the only one that can write a set:
 ```bash
 cd go && go build -o ~/.local/bin/brb ./cmd/brb
 ```
+
+`go install` does not work, and no spelling of it does: `go/go.mod` declares the
+module path as `github.com/jzbz/brb` while the module itself lives in the
+repository's `go/` subdirectory, so the proxy either resolves the module and
+finds no package there, or resolves `.../brb/go/cmd/brb` and rejects the
+contradictory declaration. Build from a checkout as above, or take a binary.
 
 Or take a prebuilt static binary from any disc (`brb-linux-amd64` /
 `brb-linux-aarch64`, matching `uname -m`) — they need no libc, no interpreter
@@ -712,11 +718,17 @@ age -d -i /path/to/identity.txt -o disc07.squashfs disc07.squashfs.age
 ```
 
 ```bash
-sudo mount -o loop,ro disc07.squashfs /mnt
+mkdir -p image && sudo mount -o loop,ro disc07.squashfs image
 ```
 
+Not `/mnt` — the disc is mounted there, and mounting the image over it hides the
+`data/` directory the first line reads from for every remaining disc.
+
 That is the whole restore path. `unsquashfs -d /dest disc07.squashfs` extracts
-instead of mounting; run it as root if you want original ownership back.
+instead of mounting; run it as root if you want original ownership back, and add
+`-user-xattrs` if you are not root — the images carry extended attributes, and an
+unprivileged `unsquashfs` exits non-zero on them after extracting every file
+correctly.
 
 If a disc will not read cleanly, pull it off with `ddrescue` first — it fills
 unreadable regions with zeros and keeps going, which is exactly what par2 needs:

@@ -9,7 +9,7 @@ discs           : {{.Total}}
 disc type       : {{.DiscType}}
 image format    : SquashFS 4.0 (mountable by the Linux kernel)
 disc format     : ISO 9660 level 3 (multi-extent; no UDF), Rock Ridge + Joliet
-compression     : {{.Compression}} level {{.Level}}, block {{.BlockSize}}
+compression     : {{.Compression}}{{if .LevelApplies}} level {{.Level}}{{end}}, block {{.BlockSize}}
 encryption      : age, X25519 recipients
 parity          : par2 {{.Redundancy}}% over ciphertext
 brb version     : {{.Version}}

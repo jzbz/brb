@@ -22,6 +22,7 @@ func sampleDisc() DiscData {
 		// The parity over the small files is a separate, much higher figure;
 		// it is what backup.SidecarRedundancy writes.
 		SidecarRedundancy: 50,
+		SidecarParity:     true,
 		Version:           "1.0.0",
 		Tools: []string{
 			"brb.sh", "brb-linux-amd64", "brb-linux-aarch64", "brb-src.tar.gz",
@@ -32,17 +33,18 @@ func sampleDisc() DiscData {
 // sampleManifest is a representative manifest input.
 func sampleManifest() ManifestData {
 	return ManifestData{
-		Archive:     "home-2026-08-06",
-		Created:     "2026-08-06T05:21:00-04:00",
-		Host:        "workstation",
-		Source:      "/home/jz",
-		Total:       2,
-		DiscType:    "bd25",
-		Compression: "zstd",
-		Level:       19,
-		BlockSize:   "1M",
-		Redundancy:  10,
-		Version:     "1.0.0",
+		Archive:      "home-2026-08-06",
+		Created:      "2026-08-06T05:21:00-04:00",
+		Host:         "workstation",
+		Source:       "/home/jz",
+		Total:        2,
+		DiscType:     "bd25",
+		Compression:  "zstd",
+		Level:        19,
+		LevelApplies: true,
+		BlockSize:    "1M",
+		Redundancy:   10,
+		Version:      "1.0.0",
 		ToolVersions: []string{
 			"mksquashfs version 4.6.1 (2023/03/25)",
 			"age v1.3.1",
@@ -111,7 +113,7 @@ func TestRenderDiscREADMESubstitutions(t *testing.T) {
 		{"the sidecar parity is explained", "carry their own parity\nin `sidecars.par2`"},
 		{"repairing a rotted sidecar is spelled out", "par2 repair -- sidecars.par2"},
 		{"restore recipe copies the image and its sidecars", "cp /mnt/data/disc03.squashfs.age* ."},
-		{"kernel mount recipe", "sudo mount -o loop,ro disc03.squashfs /mnt"},
+		{"kernel mount recipe", "sudo mount -o loop,ro disc03.squashfs image"},
 		{"ddrescue section", "ddrescue -d -r3 /mnt/data/disc03.squashfs.age"},
 		{"ddrescue section fetches the parity too", "cp /mnt/data/disc03.squashfs.age.* ."},
 		{"the static binary restores with unsquashfs, not mksquashfs",
@@ -124,8 +126,8 @@ func TestRenderDiscREADMESubstitutions(t *testing.T) {
 		{"one row per file", "Exactly one row per\nfile, one line each."},
 		{"the escaping contract", "A backslash, tab or newline inside a path is written as\n" +
 			"`\\\\`, `\\t` and `\\n` respectively, so a path can never span two rows."},
-		{"restore via brb, unpadded", "./brb.sh restore /dest --disc 3"},
-		{"mount via brb, unpadded", "./brb.sh mount 3 /mnt/browse"},
+		{"restore via brb, unpadded", "/tmp/brb.sh restore /dest --disc 3"},
+		{"mount via brb, unpadded", "/tmp/brb.sh mount 3 /mnt/browse"},
 		{"quick reference survives", "unsquashfs -ll OUT.squashfs                    # list contents"},
 		{"notes for the future survive", "## Notes for whoever finds these later"},
 	}
@@ -159,7 +161,7 @@ func TestRenderDiscREADMEFactualCorrections(t *testing.T) {
 		{
 			name:    "the on-disc program is not called squashfs-backup.sh",
 			absent:  "squashfs-backup.sh",
-			present: "./brb.sh ingest",
+			present: "/tmp/brb.sh ingest",
 		},
 		{
 			// A plain "brb" would be a 113 KB shell script on a disc brb.sh
@@ -305,7 +307,7 @@ func TestRenderDiscREADMEListsOnlyWhatIsOnTheDisc(t *testing.T) {
 				"## Restoring with the tool on this disc",
 				"uname -m          # x86_64 -> brb-linux-amd64,  aarch64 -> brb-linux-aarch64",
 				"go build -mod=vendor ./cmd/brb",
-				"./brb.sh ingest",
+				"/tmp/brb.sh ingest",
 			},
 		},
 		{
@@ -314,7 +316,7 @@ func TestRenderDiscREADMEListsOnlyWhatIsOnTheDisc(t *testing.T) {
 			want: []string{
 				"brb-linux-amd64            the tool as a static binary, 64-bit Intel/AMD",
 				"uname -m          # x86_64 -> brb-linux-amd64",
-				"./brb-linux-amd64 ingest",
+				"/tmp/brb-linux-amd64 ingest",
 			},
 			// Neither the other architecture nor the source may be promised,
 			// and with no script there is nothing to say about bash.
@@ -334,15 +336,15 @@ func TestRenderDiscREADMEListsOnlyWhatIsOnTheDisc(t *testing.T) {
 			want: []string{
 				"uname -m          # aarch64 -> brb-linux-aarch64",
 				"cp /mnt/brb-linux-aarch64 /tmp/brb",
-				"./brb-linux-aarch64 restore /dest --disc 3",
+				"/tmp/brb-linux-aarch64 restore /dest --disc 3",
 			},
 			unwant: []string{"brb-linux-amd64", "brb-src.tar.gz"},
 		},
 		{
 			name:   "the payload built without its binaries",
 			tools:  []string{"brb.sh", "brb-src.tar.gz"},
-			want:   []string{"./brb.sh ingest", "tar xzf /mnt/brb-src.tar.gz"},
-			unwant: []string{"brb-linux", "uname -m", "chmod +x /tmp/brb"},
+			want:   []string{"/tmp/brb.sh ingest", "tar xzf /mnt/brb-src.tar.gz"},
+			unwant: []string{"brb-linux", "uname -m", "/tmp/brb help"},
 		},
 		{
 			// A writer built for a target the payload has no note for —
@@ -527,7 +529,7 @@ func TestRenderDiscREADMEPublicArchive(t *testing.T) {
 		// addition to any configured identity, for every later command.
 		"# no key to configure: ingest copies identity.txt off the disc into\n" +
 			"# \"$STAGING\"/enc/ and every command below picks it up from there on its own\n" +
-			"\n./brb.sh ingest",
+			"\n/tmp/brb.sh ingest",
 	}
 	unwantPublic := []string{
 		// The old worked example told the restorer to copy the key by hand
@@ -553,7 +555,7 @@ func TestRenderDiscREADMEPublicArchive(t *testing.T) {
 	wantOrdinary := []string{
 		"**You do need the age secret key.**",
 		"It is not on this disc and never will be.",
-		"export AGE_IDENTITY=/path/to/identity.txt\n\n./brb.sh ingest",
+		"export AGE_IDENTITY=/path/to/identity.txt\n\n/tmp/brb.sh ingest",
 	}
 	unwantOrdinary := []string{
 		"identity.txt               ",
@@ -725,6 +727,87 @@ func TestRenderManifest(t *testing.T) {
 				t.Errorf("manifest missing %q\n---\n%s", tt.want, out)
 			}
 		})
+	}
+}
+
+// mksquashfs takes -Xcompression-level for zstd, gzip and lzo and for nothing
+// else, so recording a level beside xz, lz4 or none states something about how
+// these images were built that is not true. COMPRESSION_LEVEL defaults to 19
+// and README recommends xz, so the wrong branch is the likely one, and the
+// manifest it lands in is burned onto every disc in the set.
+func TestRenderManifestRecordsALevelOnlyWhenTheCompressorTookOne(t *testing.T) {
+	for _, tt := range []struct {
+		compression string
+		applies     bool
+		want        string
+		unwant      string
+	}{
+		{"zstd", true, "compression     : zstd level 19, block 1M", ""},
+		{"gzip", true, "compression     : gzip level 19, block 1M", ""},
+		{"xz", false, "compression     : xz, block 1M", "level"},
+		{"lz4", false, "compression     : lz4, block 1M", "level"},
+		{"none", false, "compression     : none, block 1M", "level"},
+	} {
+		t.Run(tt.compression, func(t *testing.T) {
+			d := sampleManifest()
+			d.Compression = tt.compression
+			d.LevelApplies = tt.applies
+			out := RenderManifest(d)
+			if !strings.Contains(out, tt.want) {
+				t.Errorf("manifest missing %q\n---\n%s", tt.want, out)
+			}
+			if tt.unwant == "" {
+				return
+			}
+			// Only the compression line may be checked for the word: other
+			// lines are free to use it.
+			for _, line := range strings.Split(out, "\n") {
+				if strings.HasPrefix(line, "compression ") && strings.Contains(line, tt.unwant) {
+					t.Errorf("manifest records a level %s never received: %q", tt.compression, line)
+				}
+			}
+		})
+	}
+}
+
+// Parity over the small files is best-effort: protectSidecars warns and the
+// disc is written anyway. A README that names sidecars.par2 on such a disc
+// sends a restorer after a file that was never burned, and unlike a code defect
+// it can never be corrected once the disc exists.
+func TestRenderDiscREADMEWithoutSidecarParity(t *testing.T) {
+	d := sampleDisc()
+	d.SidecarParity = false
+	out := RenderDiscREADME(d)
+	assertNoPlaceholders(t, "README", out)
+
+	// Naming the file to say it is missing is fine and is the point; what must
+	// not survive is the listing that implies it is present and the recipe that
+	// tells a restorer to run it.
+	for _, w := range []string{
+		"sidecars.par2                    par2 index",
+		"sidecars.vol*.par2",
+		"par2 repair -- sidecars.par2",
+	} {
+		if strings.Contains(out, w) {
+			t.Errorf("README names %q on a disc whose sidecar parity failed:\n%s", w, out)
+		}
+	}
+	// Silence would be its own trap: the restorer needs to know these files
+	// are unprotected, not merely be left without a recipe.
+	for _, w := range []string{
+		"no parity of their own",
+		"carries the same index",
+		"take the index from another disc instead",
+	} {
+		if !strings.Contains(out, w) {
+			t.Errorf("README missing %q — it must say the small files are unprotected", w)
+		}
+	}
+	// The files themselves are still on the disc; only their parity is gone.
+	for _, w := range []string{"index.tsv.gz.age", "disc03.squashfs.age.sha512"} {
+		if !strings.Contains(out, w) {
+			t.Errorf("README stopped listing %q, which is still on the disc", w)
+		}
 	}
 }
 
