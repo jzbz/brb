@@ -6,10 +6,11 @@ import (
 	"testing"
 )
 
-func TestCapacityMatchesBash(t *testing.T) {
-	// These numbers come straight out of brb.sh's disc_capacity(). If one of
-	// them changes, discs written by the two implementations stop agreeing on
-	// how much fits, so the test hard-codes them rather than deriving them.
+func TestCapacityConstantsAreFrozen(t *testing.T) {
+	// Hard-coded rather than derived, on purpose: these are the numbers every
+	// set ever planned was sliced against. If one of them changes, a disc added
+	// to an existing set is filled to a different mark than its siblings, and
+	// this test is the place that has to be argued with first.
 	tests := []struct {
 		typ  Type
 		want int64
@@ -160,6 +161,13 @@ func TestComputeErrors(t *testing.T) {
 		{"reserve exceeds usable", 1000000, 104857600, 10},
 		{"reserve exactly usable", 100, 98, 10},
 		{"overflow", math.MaxInt64, 0, 10},
+		// The negative side of the same multiplication. A reserve this large
+		// drives usable-reserve below -(MaxInt64/100), so (usable-reserve)*100
+		// wraps positive; before the reserve >= usable guard this returned
+		// Image=22094422090 and a nil error, i.e. a full-capacity image budget
+		// for a configuration that asked to reserve the entire disc.
+		{"reserve wraps the multiplication", capBD25, math.MaxInt64, 10},
+		{"reserve at the low edge of the wrap band", capBD25, 92233744893356279, 10},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -167,6 +175,11 @@ func TestComputeErrors(t *testing.T) {
 			if err == nil {
 				t.Fatalf("Compute(%d, %d, %d) = %+v, want error",
 					tc.capacity, tc.reserve, tc.redundancy, b)
+			}
+			if b.Image > 0 {
+				t.Errorf("Compute(%d, %d, %d) returned an error but Image = %d; "+
+					"a refused budget must never carry a usable-looking image size",
+					tc.capacity, tc.reserve, tc.redundancy, b.Image)
 			}
 		})
 	}

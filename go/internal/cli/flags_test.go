@@ -191,12 +191,20 @@ func TestCmdFlagsParse(t *testing.T) {
 		{
 			name:    "non-numeric value",
 			args:    []string{"/dest", "--disc", "seven"},
-			wantErr: `restore: --disc: "seven" is not a number`,
+			wantErr: `restore: --disc: "seven" is not a disc number`,
 		},
 		{
 			name:    "negative value",
 			args:    []string{"/dest", "--disc", "-2"},
-			wantErr: "restore: --disc: -2 is negative",
+			wantErr: `restore: --disc: "-2" is not a disc number`,
+		},
+		{
+			// 0 is RestoreOptions.Disc's sentinel for "every disc", so an
+			// accepted --disc 0 restores the whole set over the destination
+			// instead of the one disc the operator asked for.
+			name:    "zero is not a disc",
+			args:    []string{"/dest", "--disc", "0"},
+			wantErr: `restore: --disc: "0" is not a disc number`,
 		},
 		{
 			name:    "empty --only",
@@ -213,7 +221,7 @@ func TestCmdFlagsParse(t *testing.T) {
 			var keep bool
 			f := newFlags("restore")
 			f.StringList(&only, "--only")
-			f.Int(&discN, "--disc")
+			f.DiscNum(&discN, "--disc")
 			f.Bool(&keep, "--keep-images")
 
 			err := f.parse(tc.args)

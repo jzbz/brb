@@ -1,11 +1,16 @@
 // Package disc describes the optical media brb writes to and the byte budget
 // arithmetic that decides how large a single squashfs image may be.
 //
-// The capacities and the budget formula are a deliberate, exact port of
-// brb.sh's disc_capacity() and load_config(). The arithmetic is integer
-// arithmetic in the same order as the shell performs it: reordering the
-// multiplications and divisions changes the result, because every division
-// truncates.
+// The capacities and the budget formula are frozen: they decide how a tree is
+// sliced across discs, so a change to either re-plans every set built after it,
+// and an operator adding a disc to an existing set would get one filled to a
+// different mark. The arithmetic is integer arithmetic and the order of the
+// multiplications and divisions is part of the constant, because every division
+// truncates — see Compute and TestComputeOrderOfOperations.
+//
+// (These are writer-side numbers, so brb.sh has nothing to compare them
+// against: it reads finished discs and never plans one. Nothing in this file
+// has a counterpart in the shell script, in this revision or any earlier one.)
 package disc
 
 import (
@@ -38,8 +43,10 @@ const (
 	BDXL128 Type = "bdxl128"
 )
 
-// Byte capacities. These MUST match brb.sh exactly — a disc set produced by
-// one implementation has to be readable by the other.
+// Byte capacities, in bytes the media actually holds. Do not adjust one to
+// squeeze in a little more: every future set is planned against these, so a
+// disc added to an existing set would be filled to a different mark than its
+// siblings.
 const (
 	capBD25    int64 = 25025314816
 	capBD50    int64 = 50050629632
@@ -105,18 +112,19 @@ type Budget struct {
 	Image int64
 }
 
-// Compute mirrors brb.sh's load_config() exactly:
+// Compute applies the frozen budget formula:
 //
 //	usable = capacity * 98 / 100
 //	image  = (usable - reserve) * 100 / (100 + par2Redundancy + 1)
 //
 // All arithmetic is integer arithmetic, evaluated in that order; each division
-// truncates toward zero just as the shell's does. The extra "+1" in the
-// divisor is brb.sh's slack for the par2 index file.
+// truncates toward zero. The 98/100 is the 2% left for ISO 9660 overhead, and
+// the extra "+1" in the divisor is slack for the par2 index file.
 //
 // It returns an error when the arithmetic cannot yield a usable image: a
 // non-positive capacity, a negative redundancy, a divisor that is not
-// positive, or a reserve and parity overhead that consume the whole disc.
+// positive, a reserve at or above the usable size, or a reserve and parity
+// overhead that between them consume the whole disc.
 func Compute(capacity, reserve int64, par2Redundancy int) (Budget, error) {
 	if capacity <= 0 {
 		return Budget{}, fmt.Errorf("disc capacity must be positive, got %d", capacity)
@@ -135,6 +143,23 @@ func Compute(capacity, reserve int64, par2Redundancy int) (Budget, error) {
 		return Budget{}, fmt.Errorf("disc capacity %d is implausibly large", capacity)
 	}
 	usable := capacity * 98 / 100
+	// Both ends of (usable-reserve)*100 have to be guarded, not just the
+	// positive one. Nothing bounds RESERVE_BYTES from above — Config.Validate
+	// checks only that it is not negative — so a reserve at or above
+	// 92233744893356279 drives the subtraction below -(MaxInt64/100) and the
+	// multiplication wraps back to a positive number. With RESERVE_BYTES set to
+	// math.MaxInt64 on a BD25 that wrap yields Image=22094422090, which sails
+	// past the `image <= 0` test at the bottom: Compute would return no error
+	// and hand back a budget that ignores the reserve entirely, filling the disc
+	// to capacity with no room for the plaintext files the reserve exists for. A
+	// reserve at or above usable can never yield an image anyway, so refuse it
+	// before multiplying, with the same message the truncating path already
+	// gives for a reserve that merely eats the disc.
+	if reserve >= usable {
+		return Budget{Capacity: capacity, Usable: usable, Reserve: reserve},
+			fmt.Errorf("disc capacity too small for the configured reserve and parity: "+
+				"usable %d bytes, reserve %d bytes, par2 %d%%", usable, reserve, par2Redundancy)
+	}
 	if usable-reserve > math.MaxInt64/100 {
 		return Budget{}, fmt.Errorf("disc capacity %d is implausibly large", capacity)
 	}

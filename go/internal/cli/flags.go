@@ -80,15 +80,20 @@ func (f *cmdFlags) StringList(p *[]string, names ...string) {
 	}}, names...)
 }
 
-// Int registers a flag taking a non-negative decimal integer.
-func (f *cmdFlags) Int(p *int, names ...string) {
+// DiscNum registers a flag taking a 1-based disc number, parsed by exactly the
+// rule the positional disc numbers use.
+//
+// Zero is the point of the shared rule. RestoreOptions.Disc uses 0 as the
+// sentinel for "every disc", so a `restore /home/me --disc 0` accepted as a
+// number is indistinguishable from --disc having been left off: it decrypts and
+// extracts the whole set over the destination tree, and with --yes there is no
+// confirmation to catch it. `brb list 0` and brb.sh both refuse that spelling;
+// so does this.
+func (f *cmdFlags) DiscNum(p *int, names ...string) {
 	f.add(&opt{takesValue: true, apply: func(v string) error {
-		n, err := strconv.Atoi(v)
+		n, err := parseDiscNumber(v)
 		if err != nil {
-			return fmt.Errorf("%q is not a number", v)
-		}
-		if n < 0 {
-			return fmt.Errorf("%d is negative", n)
+			return err
 		}
 		*p = n
 		return nil
@@ -164,11 +169,22 @@ func (f *cmdFlags) need(min, max int, form string) error {
 	return nil
 }
 
-// discNumber parses a 1-based disc number from the command line.
-func discNumber(cmd, s string) (int, error) {
+// parseDiscNumber is the one rule for a disc number anywhere on the command
+// line: a decimal integer of at least 1. Discs are numbered from 1 on the
+// media, in MANIFEST.txt and in every message, so 0 is not a disc.
+func parseDiscNumber(s string) (int, error) {
 	n, err := strconv.Atoi(strings.TrimSpace(s))
 	if err != nil || n < 1 {
-		return 0, usagef("%s: %q is not a disc number", cmd, s)
+		return 0, fmt.Errorf("%q is not a disc number", s)
+	}
+	return n, nil
+}
+
+// discNumber parses a positional disc number, naming the command in the error.
+func discNumber(cmd, s string) (int, error) {
+	n, err := parseDiscNumber(s)
+	if err != nil {
+		return 0, usagef("%s: %v", cmd, err)
 	}
 	return n, nil
 }

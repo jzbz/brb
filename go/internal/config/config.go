@@ -1,16 +1,17 @@
 // Package config loads brb's configuration.
 //
 // Three layers are combined, each overriding the one before it: the built-in
-// defaults (byte-identical to brb.sh's), an optional configuration file in the
-// restricted shell subset both implementations understand, and the process
-// environment. The file is the same file brb.sh sources, so one config drives
-// both implementations; see ParseFile for exactly which shell syntax is
-// accepted, and note that anything outside that subset is an error rather than
-// something quietly ignored.
+// defaults, an optional configuration file in the restricted shell subset both
+// implementations understand, and the process environment. The file is the same
+// file brb.sh sources, so one config drives both implementations; see ParseFile
+// for exactly which shell syntax is accepted, and note that anything outside
+// that subset is an error rather than something quietly ignored. Only the
+// handful of settings a restore needs are read by both — brb.sh is a reader,
+// and everything about how a set is BUILT lives here alone.
 //
 // PRUNE_DIRS and EXCLUDE_MASKS set anywhere replace the defaults rather than
-// extending them, matching brb.sh, where the defaults are only applied if the
-// variable is unset.
+// extending them. A default list an operator cannot switch off is a trap: the
+// spelling that would extend it leaves no spelling that empties it.
 package config
 
 import (
@@ -29,8 +30,10 @@ import (
 )
 
 // Config is the complete set of knobs brb exposes. Every field corresponds to
-// one upper-case shell variable of the same meaning in brb.sh; Keys lists the
-// names.
+// one upper-case shell variable of the same name in a config file; Keys lists
+// the names. brb.sh reads four of them — STAGING, AGE_RECIPIENTS_FILE,
+// AGE_IDENTITY and BURNER — plus its own KEEP_IMAGES, which is not a key here;
+// the rest shape how a set is written and exist in this implementation only.
 type Config struct {
 	// SourceDir is the tree to back up (SOURCE_DIR).
 	SourceDir string
@@ -148,7 +151,7 @@ type Dirs struct {
 // through ParseISOMode is visible at a glance.
 type ISOMode string
 
-// The two ISO modes, spelled as brb.sh spells them in a config file.
+// The two ISO modes, spelled as a config file spells them.
 const (
 	// ISOOnDemand builds each ISO at the moment its disc goes into the drive
 	// and drops it again once the disc is written. It is the default: an ISO
@@ -164,9 +167,11 @@ const (
 // and the error message name them.
 func ISOModes() []ISOMode { return []ISOMode{ISOOnDemand, ISOEager} }
 
-// ParseISOMode reads an ISO_MODE value. A typo here is not cosmetic: brb.sh
-// tests for "eager" and treats everything else as ondemand, so an unrecognised
-// value would silently skip the ISO build the operator asked for.
+// ParseISOMode reads an ISO_MODE value. A typo here is not cosmetic: there are
+// only two behaviours, "build every ISO now" and "build each one as its disc is
+// burned", so an unrecognised value quietly treated as the default would skip
+// the ISO build the operator asked for and surface as missing files days into a
+// burn campaign.
 func ParseISOMode(s string) (ISOMode, error) {
 	m := ISOMode(strings.ToLower(strings.TrimSpace(s)))
 	for _, known := range ISOModes() {
@@ -183,7 +188,9 @@ func (m ISOMode) String() string { return string(m) }
 // Eager reports whether every ISO is built at the end of the backup.
 func (m ISOMode) Eager() bool { return m == ISOEager }
 
-// defaultPrune is brb.sh's DEFAULT_PRUNE array, in order.
+// defaultPrune is the built-in prune list, in the order doctor and `brb help`
+// print it: directories that are caches, re-downloadable, or another program's
+// copy of bytes that are already somewhere else.
 var defaultPrune = []string{
 	".cache",
 	".local/share/Trash",
@@ -202,34 +209,50 @@ var defaultPrune = []string{
 	".vagrant.d/boxes",
 }
 
-// defaultExclude is brb.sh's DEFAULT_EXCLUDE array, in order.
+// defaultExclude is the built-in exclude list, in the order doctor and
+// `brb help` print it.
 // The core-dump pattern is deliberately "core.[0-9]*" rather than a bare
 // "core": a mask named "core" would drop every file simply called core, which
 // in a Go, Drupal or kernel tree is ordinary source rather than a crash dump.
 var defaultExclude = []string{"*.pyc", "*.pyo", "core.[0-9]*", ".DS_Store"}
 
-// DefaultPruneDirs returns a copy of brb.sh's DEFAULT_PRUNE list.
+// DefaultPruneDirs returns a copy of the built-in prune list.
 func DefaultPruneDirs() []string { return append([]string(nil), defaultPrune...) }
 
-// DefaultExcludeMasks returns a copy of brb.sh's DEFAULT_EXCLUDE list.
+// DefaultExcludeMasks returns a copy of the built-in exclude list.
 func DefaultExcludeMasks() []string { return append([]string(nil), defaultExclude...) }
 
-// Compressions returns the squashfs compressors brb accepts, in the order
-// brb.sh documents them.
+// Compressions returns the squashfs compressors brb accepts, best default
+// first, in the order the help text and the error messages name them.
 func Compressions() []string {
 	return []string{"zstd", "xz", "gzip", "lz4", "lzo", "none"}
 }
 
-// Default returns the built-in configuration. Every value matches brb.sh's
-// defaults exactly. ArchiveName is left empty; Load, or ResolveDefaults,
-// derives it from SourceDir and today's date.
+// Default returns the built-in configuration. ArchiveName is left empty; Load,
+// or ResolveDefaults, derives it from SourceDir and today's date.
+//
+// The four settings brb.sh also reads — STAGING, AGE_RECIPIENTS_FILE,
+// AGE_IDENTITY and BURNER — match its defaults (brb.sh:89-92); the rest are
+// writer-only and have no counterpart there, since brb.sh no longer writes.
+//
+// The two home-derived values are left EMPTY when there is no home directory to
+// derive them from, rather than joined onto an empty string: filepath.Join
+// drops an empty element, so joining an absent home yields the RELATIVE
+// ".config/brb/recipients.txt", and brb would read its recipient list — and
+// `init-key` would mint the archive's only key — under whatever directory it
+// happened to be started in. Load turns the empty values into an error naming
+// HOME; see [Config.checkHomeDerived].
 func Default() *Config {
 	home := homeDir()
+	recipients := ""
+	if home != "" {
+		recipients = filepath.Join(home, ".config", "brb", "recipients.txt")
+	}
 	return &Config{
 		SourceDir:         home,
 		ArchiveName:       "",
 		Staging:           "/var/tmp/brb",
-		AgeRecipientsFile: filepath.Join(home, ".config", "brb", "recipients.txt"),
+		AgeRecipientsFile: recipients,
 		AgeIdentity:       "",
 		DiscType:          disc.BD25,
 		DiscCapacityBytes: 0,
@@ -258,11 +281,22 @@ func Default() *Config {
 
 // DefaultConfigPath returns $BRB_CONFIG if set, else $HOME/.config/brb/config,
 // matching brb.sh's CONFIG_FILE.
+//
+// It returns "" when neither is available, for the reason [Default] gives: a
+// join onto an absent home is a relative path, and brb would read its
+// configuration out of the current directory. brb.sh refuses the same
+// situation — under set -u its CONFIG_FILE="${BRB_CONFIG:-$HOME/.config/brb/
+// config}" (brb.sh:67) aborts with "HOME: unbound variable" — and Load turns
+// the empty result into an error saying the same thing in words.
 func DefaultConfigPath() string {
 	if p := os.Getenv("BRB_CONFIG"); p != "" {
 		return p
 	}
-	return filepath.Join(homeDir(), ".config", "brb", "config")
+	home := homeDir()
+	if home == "" {
+		return ""
+	}
+	return filepath.Join(home, ".config", "brb", "config")
 }
 
 // Dirs returns the working subdirectories of Staging.
@@ -296,8 +330,8 @@ func (c *Config) Budget() (disc.Budget, error) {
 	return b, nil
 }
 
-// ArchiveNameFor derives brb.sh's default archive name for a source directory
-// and a date: the directory's base name, a hyphen, and YYYY-MM-DD.
+// ArchiveNameFor derives the default archive name for a source directory and a
+// date: the directory's base name, a hyphen, and YYYY-MM-DD.
 func ArchiveNameFor(sourceDir string, t time.Time) string {
 	base := filepath.Base(strings.TrimRight(sourceDir, string(filepath.Separator)))
 	switch base {
@@ -322,6 +356,11 @@ func Load(path string) (*Config, error) {
 	c := Default()
 	if path == "" {
 		path = DefaultConfigPath()
+		if path == "" {
+			return nil, errors.New("cannot locate the configuration file: HOME is not set, " +
+				"so there is no $HOME/.config/brb/config to fall back to — set HOME, or name " +
+				"the file with -c or BRB_CONFIG")
+		}
 	}
 	fi, err := os.Stat(path)
 	switch {
@@ -344,7 +383,37 @@ func Load(path string) (*Config, error) {
 		return nil, err
 	}
 	c.ResolveDefaults()
+	if err := c.checkHomeDerived(); err != nil {
+		return nil, err
+	}
 	return c, nil
+}
+
+// checkHomeDerived refuses a configuration that would only have loaded because
+// a home-derived default quietly went missing.
+//
+// Every default path brb has is either absolute (/var/tmp/brb) or derived from
+// $HOME. With no home — a systemd unit with no User=, `env -i`, a bare
+// container — the derived ones are empty, and carrying on would mean encrypting
+// every disc to whatever recipients file turned up relative to the current
+// directory. /tmp and /var/tmp are 1777, so that file need not even be the
+// operator's: a set encrypted to somebody else's key is not recoverable, and
+// nothing later in the run would say so. Refuse here, once, naming the
+// variable, exactly as brb.sh refuses at its first ${VAR:-$HOME/...} under
+// set -u. Nothing is checked when HOME is set: a deliberately relative path in
+// a config file is the operator's business.
+func (c *Config) checkHomeDerived() error {
+	if homeDir() != "" {
+		return nil
+	}
+	// A public archive mints its own keypair and never reads this file, the
+	// same exemption Validate makes.
+	if c.AgeRecipientsFile == "" && !c.PublicArchive {
+		return errors.New("AGE_RECIPIENTS_FILE has no value and no default: HOME is not set, " +
+			"so brb cannot fall back to $HOME/.config/brb/recipients.txt — set HOME, or give " +
+			"AGE_RECIPIENTS_FILE (and AGE_IDENTITY, to restore) absolute paths")
+	}
+	return nil
 }
 
 // Keys returns every configuration key recognised in the file and the
@@ -400,11 +469,12 @@ func isKnownKey(key string) bool {
 
 // EnvName returns the environment variable that carries a configuration key.
 //
-// It is the key itself for everything but DIST_DIR, which brb.sh reads from
-// BRB_DIST_DIR — the name is generic enough that an exported DIST_DIR would as
-// likely belong to something else on the machine, and brb.sh's
-// DIST_DIR="${BRB_DIST_DIR:-}" ignores it. The file key stays DIST_DIR, so one
-// config file still drives both implementations.
+// It is the key itself for everything but DIST_DIR, which is read from
+// BRB_DIST_DIR: the bare name is generic enough that an exported DIST_DIR would
+// as likely belong to something else on the machine, and picking it up would
+// send brb's disc payload somewhere the operator never meant. The file key
+// stays DIST_DIR, so one config file still reads the same to both
+// implementations — brb.sh does not carry the payload and ignores the key.
 func EnvName(key string) string {
 	if key == "DIST_DIR" {
 		return "BRB_DIST_DIR"
@@ -438,7 +508,9 @@ func (c *Config) Apply(vals map[string]Value) error {
 // two conveniences are applied: a leading ~ and $HOME/${HOME} are expanded, and
 // a value for PRUNE_DIRS or EXCLUDE_MASKS that is written as an array literal —
 // "( a b )" — is parsed as one. Any other value of those two is a single
-// element, matching what brb.sh sees.
+// element, since a shell cannot export an array and a bare word in the
+// environment is one entry, never a list split on spaces: a directory called
+// "Old Stuff" would otherwise become two prune entries that match nothing.
 func (c *Config) ApplyEnv(getenv func(string) string) error {
 	if getenv == nil {
 		getenv = os.Getenv
@@ -566,8 +638,9 @@ func (c *Config) set(key string, v Value) error {
 		}
 		m, err := ParseISOMode(s)
 		if err != nil {
-			// Rejected here rather than in Validate: brb.sh dies in load_config,
-			// and a mode that only fails later would first let a whole backup run.
+			// Rejected as the file is read rather than in Validate: a mode that
+			// only failed later would first let a whole backup run, and the
+			// commands that never call Validate would never notice at all.
 			return fmt.Errorf("%s%w", v.where(), err)
 		}
 		c.ISOMode = m
@@ -607,8 +680,10 @@ func (v Value) scalar(key string) (string, error) {
 }
 
 // list returns the elements of an array setting. A scalar becomes a
-// single-element list, or an empty one when it is blank — which is what brb.sh
-// effectively does, since it skips empty prune and mask entries.
+// single-element list, or an empty one when it is blank: PRUNE_DIRS="" is the
+// one spelling left for "prune nothing" once an empty scalar means "leave the
+// default" everywhere else, and an empty element inside an array is dropped
+// rather than becoming a mask that matches everything.
 func (v Value) list() []string {
 	if v.IsArray {
 		out := make([]string, 0, len(v.Array))
@@ -647,24 +722,36 @@ func (v Value) int(key string, dst *int) error {
 	return nil
 }
 
-// boolInt applies a setting brb.sh writes as 0 or 1.
+// boolInt applies a setting written as 0 or 1.
 //
-// Numbers only, and anything else is an error: brb.sh tests these with
-// (( ! VAR )), which is shell arithmetic, where a word like "yes" is an unset
-// variable name and evaluates to 0 — the exact opposite of what it says. One
-// config file drives both implementations, so a value that would mean two
-// different things is refused rather than interpreted.
+// The accepted spellings are exactly brb.sh's bool_setting (brb.sh:391-398):
+// 1/true/yes/on and 0/false/no/off, in any case. One config file drives both
+// implementations, and the README promises a boolean written for one reader is
+// not misread by the other — so the grammar has to be the same grammar, not a
+// stricter one that stops every Go command dead on a KEEP_ISOS=true brb.sh
+// would have taken. Anything outside it is still an error rather than a
+// silent false: a typo read as "off" would quietly turn off the thing the
+// operator asked for. A number other than 0 or 1 is accepted as a number,
+// because shell arithmetic would too.
 func (v Value) boolInt(key string, dst *bool) error {
 	s, err := v.scalar(key)
 	if err != nil {
 		return err
 	}
-	n, err := strconv.Atoi(strings.TrimSpace(s))
-	if err != nil {
-		return fmt.Errorf("%s%s: expected 0 or 1, got %q", v.where(), key, s)
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "1", "true", "yes", "on":
+		*dst = true
+		return nil
+	case "0", "false", "no", "off":
+		*dst = false
+		return nil
 	}
-	*dst = n != 0
-	return nil
+	if n, err := strconv.Atoi(strings.TrimSpace(s)); err == nil {
+		*dst = n != 0
+		return nil
+	}
+	return fmt.Errorf("%s%s: expected 0 or 1 (also true/false, yes/no, on/off), got %q",
+		v.where(), key, s)
 }
 
 // f64 applies a setting written as a decimal number.
@@ -804,8 +891,8 @@ func (c *Config) Validate() error {
 }
 
 // compressionLevelRange gives the level range a compressor accepts, and
-// whether the level is used at all. brb.sh only passes -Xcompression-level for
-// zstd and gzip; lzo takes one too, and xz and lz4 ignore it.
+// whether the level is used at all: mksquashfs takes -Xcompression-level for
+// zstd, gzip and lzo, and xz, lz4 and none ignore it.
 func compressionLevelRange(comp string) (lo, hi int, used bool) {
 	switch comp {
 	case "zstd":

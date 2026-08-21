@@ -110,9 +110,10 @@ func doctor(ctx context.Context, cfg *config.Config, cfgPath string, p *ui.Print
 		p.Warn("mksquashfs is missing, so its capabilities could not be checked")
 	}
 
-	// brb.sh passes -Xcompression-level only for zstd and gzip and says nothing
-	// when the setting cannot apply, so an operator who sets COMPRESSION=xz and
-	// COMPRESSION_LEVEL=9 gets neither the level nor a word about it.
+	// mksquashfs takes -Xcompression-level for zstd, gzip and lzo only, and says
+	// nothing when it is not passed, so an operator who sets COMPRESSION=xz and
+	// COMPRESSION_LEVEL=9 would otherwise get neither the level nor a word
+	// about it, and would go on believing the setting did something.
 	switch {
 	case tools.NoCompression(cfg.Compression):
 		p.Warn("COMPRESSION=%s: COMPRESSION_LEVEL=%d is ignored, nothing is compressed",
@@ -177,6 +178,13 @@ func doctor(ctx context.Context, cfg *config.Config, cfgPath string, p *ui.Print
 	p.Step("burner          %s at %dx", cfg.Burner, cfg.BurnSpeed)
 	p.Step("iso mode        %s  (%s)", cfg.ISOMode, isoModeNote(cfg.ISOMode))
 	p.Step("keep isos       %s  (after a successful burn)", boolInt(cfg.KeepISOs))
+	// The one setting that decides whether the set is confidential at all, and
+	// the one an operator is most likely to have inherited from a copied config
+	// without noticing. Printed here as well as warned about under "encryption",
+	// so the resolved value is visible beside everything else it was resolved
+	// with. `backup --public-archive` cannot show up here: doctor takes no
+	// flags, so this is the config-file and environment spelling only.
+	p.Step("public archive  %s  (1 writes the key onto every disc: no confidentiality)", boolInt(cfg.PublicArchive))
 	p.Step("label prefix    %s", cfg.LabelPrefix)
 	p.Step("prune dirs      %s", summariseList(cfg.PruneDirs))
 	p.Step("exclude masks   %s", summariseList(cfg.ExcludeMasks))
@@ -246,6 +254,19 @@ func reportPayload(cfg *config.Config, p *ui.Printer) {
 // costs milliseconds to rule out.
 func checkKeys(ctx context.Context, cfg *config.Config, p *ui.Printer) int {
 	problems := 0
+
+	// PUBLIC_ARCHIVE mints a keypair per archive and never opens the recipients
+	// file (see backup's loadRecipients), so checking it here would fail a
+	// correctly configured public set over a file the run will not read — and
+	// send the operator to `brb init-key` to mint the long-lived key the mode
+	// exists to avoid needing. Validate already makes the same exemption.
+	if cfg.PublicArchive {
+		p.Warn("PUBLIC_ARCHIVE=1: this set will NOT be confidential — a fresh key is minted for")
+		p.Step("the archive and written onto every disc as identity.txt, so anyone holding a disc")
+		p.Step("can read it. AGE_RECIPIENTS_FILE and AGE_IDENTITY are not consulted in this mode.")
+		p.Step("Unset PUBLIC_ARCHIVE (and drop --public-archive) for an encrypted set.")
+		return problems
+	}
 
 	recips, err := agecrypt.ParseRecipientsFile(cfg.AgeRecipientsFile)
 	switch {
@@ -378,7 +399,8 @@ func defaultIdentityPath(cfg *config.Config) string {
 }
 
 // rawPerDisc converts a compressed-image budget into the raw-content budget the
-// packer works in, matching brb.sh's raw_budget and internal/backup.
+// packer works in, the same arithmetic internal/backup plans with — doctor's
+// number has to be the number the run will use, or it is worse than none.
 func rawPerDisc(imageBudget int64, ratio float64) int64 {
 	if !(ratio > 0) {
 		ratio = 1

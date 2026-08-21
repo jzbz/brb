@@ -99,8 +99,8 @@ func TestResolveDistDirExplicitMissing(t *testing.T) {
 
 // TestDistDirFromFileAndEnvironment covers the two ways the setting arrives:
 // DIST_DIR in the configuration file both implementations read, BRB_DIST_DIR in
-// the environment. A bare DIST_DIR in the environment is ignored, exactly as
-// brb.sh's DIST_DIR="${BRB_DIST_DIR:-}" ignores it.
+// the environment. A bare DIST_DIR in the environment is ignored: the name is
+// generic enough to belong to something else on the machine.
 func TestDistDirFromFileAndEnvironment(t *testing.T) {
 	if got := EnvName("DIST_DIR"); got != "BRB_DIST_DIR" {
 		t.Errorf("EnvName(DIST_DIR) = %q, want BRB_DIST_DIR", got)

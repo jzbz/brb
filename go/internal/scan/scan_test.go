@@ -15,7 +15,7 @@ import (
 
 // mkTree materialises a small tree under a fresh temp dir. The spec strings are
 // "kind:relpath[:payload]" with kind one of f (file), d (dir), l (symlink),
-// h (hard link to payload), p (fifo).
+// h (hard link to payload), p (fifo), s (unix socket).
 func mkTree(t *testing.T, specs ...string) string {
 	t.Helper()
 	root := t.TempDir()
@@ -53,6 +53,24 @@ func mkTree(t *testing.T, specs ...string) string {
 		case "p":
 			if err := syscall.Mkfifo(abs, 0o644); err != nil {
 				t.Skipf("mkfifo unsupported here: %v", err)
+			}
+		case "s":
+			// Bound with the raw syscalls rather than net.Listen so nothing has
+			// to stay open: net's unix listener unlinks the socket on Close,
+			// and the file has to outlive this helper. sun_path is 108 bytes
+			// including the terminator, which a t.TempDir() path is far inside,
+			// but say so if a future layout ever is not.
+			if len(abs) > 100 {
+				t.Skipf("socket path %q too long for sun_path", abs)
+			}
+			fd, err := syscall.Socket(syscall.AF_UNIX, syscall.SOCK_STREAM, 0)
+			if err != nil {
+				t.Skipf("AF_UNIX socket unsupported here: %v", err)
+			}
+			err = syscall.Bind(fd, &syscall.SockaddrUnix{Name: abs})
+			_ = syscall.Close(fd)
+			if err != nil {
+				t.Skipf("bind %q: %v", rel, err)
 			}
 		default:
 			t.Fatalf("bad kind %q in spec %q", kind, s)
@@ -150,13 +168,20 @@ func TestWalkNeverFollowsSymlinks(t *testing.T) {
 }
 
 func TestWalkNonFileKinds(t *testing.T) {
-	root := mkTree(t, "p:pipe")
+	// Both of the kinds a real $HOME actually carries: a fifo and a bound unix
+	// socket. Neither may be opened, and both belong to the skeleton.
+	root := mkTree(t, "p:pipe", "s:sock")
 	res := mustWalk(t, Options{Root: root})
-	if len(res.Entries) != 1 || res.Entries[0].Kind != KindOther {
-		t.Fatalf("entries = %+v, want one KindOther", res.Entries)
+	if got := rels(res); !reflect.DeepEqual(got, []string{"pipe", "sock"}) {
+		t.Fatalf("entries = %v, want [pipe sock]", got)
 	}
-	if res.Skeleton != 1 || res.Files != 0 {
-		t.Fatalf("Skeleton=%d Files=%d, want 1 and 0", res.Skeleton, res.Files)
+	for _, e := range res.Entries {
+		if e.Kind != KindOther {
+			t.Errorf("%s: Kind = %v, want KindOther", e.Rel, e.Kind)
+		}
+	}
+	if res.Skeleton != 2 || res.Files != 0 {
+		t.Fatalf("Skeleton=%d Files=%d, want 2 and 0", res.Skeleton, res.Files)
 	}
 }
 
@@ -621,8 +646,17 @@ func TestUnreadableFileGoesToOnError(t *testing.T) {
 // files only. A fifo with no writer would block an open forever, and the walk
 // with it, so it must be classified and reported without ever being opened.
 // The test would hang, not fail, if that rule were broken — hence the timeout.
+//
+// The unix socket is what makes this test able to fail at all. readable() opens
+// with O_NONBLOCK, and open(fifo, O_RDONLY|O_NONBLOCK) returns immediately even
+// with no writer, so a fifo alone cannot tell whether the `e.Kind == KindFile`
+// guard in walker.dir is still there: delete the guard and the walk still
+// finishes, still yields [a pipe], still records no error. open() on a bound
+// AF_UNIX socket fails with ENXIO, so the socket turns that same deletion into
+// a recorded problem and a missing skeleton entry, which both assertions below
+// catch. Do not drop it for a "simpler" fixture.
 func TestNonRegularEntriesAreNeverOpened(t *testing.T) {
-	root := mkTree(t, "p:pipe", "f:a:x")
+	root := mkTree(t, "p:pipe", "s:sock", "f:a:x")
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	done := make(chan *Result, 1)
@@ -638,14 +672,29 @@ func TestNonRegularEntriesAreNeverOpened(t *testing.T) {
 		if res == nil {
 			return
 		}
-		if got := rels(res); !reflect.DeepEqual(got, []string{"a", "pipe"}) {
-			t.Fatalf("entries = %v, want [a pipe]", got)
+		if got := rels(res); !reflect.DeepEqual(got, []string{"a", "pipe", "sock"}) {
+			t.Fatalf("entries = %v, want [a pipe sock] "+
+				"(a non-regular entry that was opened is dropped from the skeleton)", got)
 		}
 		if len(res.Errors) != 0 {
-			t.Fatalf("Errors = %v, want none", res.Errors)
+			t.Fatalf("Errors = %v, want none: no non-regular entry may be opened", res.Errors)
+		}
+		if res.Skeleton != 2 || res.Files != 1 {
+			t.Fatalf("Skeleton=%d Files=%d, want 2 and 1", res.Skeleton, res.Files)
 		}
 	case <-ctx.Done():
 		t.Fatal("Walk blocked on a fifo: it must not open non-regular entries")
+	}
+}
+
+// TestReadableRefusesASocket is the premise the test above rests on, asserted
+// directly: if open() ever stopped failing on a bound AF_UNIX socket, that test
+// would go quietly vacuous again and this one says why.
+func TestReadableRefusesASocket(t *testing.T) {
+	root := mkTree(t, "s:sock")
+	if err := readable(filepath.Join(root, "sock")); err == nil {
+		t.Fatal("readable(socket) = nil; the socket no longer distinguishes " +
+			"an opened non-regular entry from an unopened one")
 	}
 }
 
@@ -812,5 +861,143 @@ func TestCompiledMasksMatchFilepathMatch(t *testing.T) {
 				t.Errorf("mask %q against %q: excluded = %v, filepath.Match = %v", p, n, got, want)
 			}
 		}
+	}
+}
+
+// TestCompiledPrunesMatchTheUncompiledExpression is the prune twin of the mask
+// test above. compilePrunes hoists the isPattern() classification out of the
+// per-entry loop, which is only sound if pruned() still accepts exactly the set
+// the loop it replaced accepted: for each pattern p, `p == rel` OR (p holds a
+// metacharacter AND filepath.Match(p, rel)). The "[" cases are the ones a naive
+// split gets wrong — a directory really named "core.[0-9]*" must prune itself
+// by literal equality even though the same text is also a glob — which is why
+// the literal set holds every pattern and not only the non-glob ones.
+func TestCompiledPrunesMatchTheUncompiledExpression(t *testing.T) {
+	pats := []string{
+		".cache", ".local/share/Trash", "node_modules", "*.tmp", "core.[0-9]*",
+		"a*b", `a\*b`, "*", "one/two", "dir?",
+	}
+	candidates := []string{
+		".cache", ".cache/x", ".local/share/Trash", ".local/share/Trash/x",
+		"node_modules", "x.tmp", "tmp", "core.1", "core.[0-9]*", "a*b", "axb",
+		"ab", "one/two", "one", "two", "dir1", "dirs", "dir", "*", "",
+	}
+	// The expression compilePrunes replaced, kept verbatim as the oracle.
+	uncompiled := func(pat, rel string) bool {
+		if pat == rel {
+			return true
+		}
+		if isPattern(pat) {
+			if ok, err := filepath.Match(pat, rel); err == nil && ok {
+				return true
+			}
+		}
+		return false
+	}
+	for _, p := range pats {
+		w := &walker{prunes: compilePrunes([]string{p})}
+		for _, rel := range candidates {
+			want := uncompiled(p, rel)
+			if got := w.pruned(rel); got != want {
+				t.Errorf("prune %q against %q: pruned = %v, want %v", p, rel, got, want)
+			}
+		}
+	}
+	// And the whole list at once, which is how the walker actually holds it.
+	w := &walker{prunes: compilePrunes(pats)}
+	for _, rel := range candidates {
+		want := false
+		for _, p := range pats {
+			if uncompiled(p, rel) {
+				want = true
+				break
+			}
+		}
+		if got := w.pruned(rel); got != want {
+			t.Errorf("full prune list against %q: pruned = %v, want %v", rel, got, want)
+		}
+	}
+}
+
+// TestOddPathsInheritedAcrossTwoLevels pins the inheritance that lets the walk
+// stop re-scanning every ancestor's bytes once per descendant: the control byte
+// is in a grandparent and every name below it is clean, so a leaf is odd only
+// because its parent's path is. A base-name-only check would report just the
+// grandparent; the whole-path check this replaced reported all three, and so
+// must this one.
+func TestOddPathsInheritedAcrossTwoLevels(t *testing.T) {
+	root := t.TempDir()
+	gp := filepath.Join(root, "od\td")
+	if err := os.MkdirAll(filepath.Join(gp, "clean"), 0o755); err != nil {
+		t.Skipf("filesystem rejects tabs in names: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(gp, "clean", "leaf"), []byte("x"), 0o644); err != nil {
+		t.Fatalf("write leaf: %v", err)
+	}
+	res := mustWalk(t, Options{Root: root})
+	want := []string{"od\td", "od\td/clean", "od\td/clean/leaf"}
+	if !reflect.DeepEqual(res.OddPaths, want) {
+		t.Fatalf("OddPaths = %q, want %q", res.OddPaths, want)
+	}
+}
+
+// TestOddPathsIgnoresMultiByteUTF8 guards the byte-wise control scan against
+// the one mistake it could make: no byte of a multi-byte UTF-8 sequence is
+// below 0x80, so an accented or CJK name holds no control byte and must not be
+// reported. Reporting it would send the operator hunting for corruption in a
+// perfectly ordinary filename.
+func TestOddPathsIgnoresMultiByteUTF8(t *testing.T) {
+	root := t.TempDir()
+	names := []string{"café", "日本語", "naïve space", "Ω"}
+	for _, n := range names {
+		if err := os.WriteFile(filepath.Join(root, n), []byte("x"), 0o644); err != nil {
+			t.Skipf("filesystem rejects %q: %v", n, err)
+		}
+	}
+	res := mustWalk(t, Options{Root: root})
+	if len(res.OddPaths) != 0 {
+		t.Fatalf("OddPaths = %q, want none: multi-byte UTF-8 is not a control byte", res.OddPaths)
+	}
+	if res.Files != len(names) {
+		t.Fatalf("Files = %d, want %d", res.Files, len(names))
+	}
+}
+
+// TestOneFileSystemDoesNotStopAtANonDirectory pins a deliberate gap so it is
+// not rediscovered as a surprise. -xdev suppresses *descent*, and a file has
+// nothing to descend into, so a file bind mount from another device is walked,
+// charged and backed up like any other file and never appears in
+// SkippedMounts. The blast radius is one file — a bind mount cannot bring a
+// whole subtree in through a non-directory — but README's "One filesystem at a
+// time" paragraph reads as though it covered this case too. If that promise is
+// ever made literal this is the test to change, and the caller's "mounted
+// subtree(s) ... are NOT included" wording has to change with it.
+func TestOneFileSystemDoesNotStopAtANonDirectory(t *testing.T) {
+	root := mkTree(t, "f:onroot:xx", "f:bindmounted:12345")
+
+	// The fake: the one file named "bindmounted" reports the device a real
+	// `mount --bind` from another filesystem would give it. Only a fake will
+	// do — a real bind mount needs root.
+	real := statIDs
+	statIDs = func(fi os.FileInfo) (dev, ino, nlink uint64) {
+		dev, ino, nlink = real(fi)
+		if !fi.IsDir() && fi.Name() == "bindmounted" {
+			dev++
+		}
+		return dev, ino, nlink
+	}
+	t.Cleanup(func() { statIDs = real })
+
+	res := mustWalk(t, Options{Root: root, OneFileSystem: true})
+	if got := rels(res); !reflect.DeepEqual(got, []string{"bindmounted", "onroot"}) {
+		t.Fatalf("entries = %v, want [bindmounted onroot]", got)
+	}
+	if len(res.SkippedMounts) != 0 {
+		t.Fatalf("SkippedMounts = %v, want none: the boundary is enforced at directories",
+			res.SkippedMounts)
+	}
+	if res.RawBytes != 7 {
+		t.Fatalf("RawBytes = %d, want 7 (the cross-device file is charged like any other)",
+			res.RawBytes)
 	}
 }

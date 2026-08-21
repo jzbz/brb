@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strconv"
 	"strings"
 
 	"github.com/jzbz/brb/internal/config"
@@ -100,9 +101,11 @@ COMMANDS
   Exit status: 0 success, 1 failure, 2 usage error.
 `
 
-// packRatioText is brb.sh's usage() explanation of PACK_RATIO, which is the
-// one setting that changes how full the discs come out and the one an operator
-// is most likely to want to tune after a first run.
+// packRatioText explains PACK_RATIO, which is the one setting that changes how
+// full the discs come out and the one an operator is most likely to want to
+// tune after a first run. It is a section of its own because a comment column
+// in the listing below cannot hold the explanation, and an operator who does
+// not get it packs every disc at 1.00 forever.
 const packRatioText = `ABOUT PACK_RATIO
   Discs are packed by uncompressed size, so brb has to guess how well the
   content will compress. The default 1.00 assumes no compression at all, which
@@ -122,21 +125,35 @@ const packRatioText = `ABOUT PACK_RATIO
 
 // writeHelp prints the full help text, with the configuration section filled
 // in from the values actually in force.
+//
+// Whether the values are escaped depends on where they are going, which is the
+// rule the restore side's listings already follow: to a terminal they are
+// rendered visibly, to a pipe or a file they stay byte-exact. See configLines.
 func writeHelp(w io.Writer, cfg *config.Config, cfgPath string) {
 	fmt.Fprintf(w, helpText, version)
+
+	show := helpEscaper(w)
 
 	if cfgPath == "" {
 		cfgPath = config.DefaultConfigPath()
 	}
 	present := "not present; built-in defaults and the environment only"
-	if _, err := os.Stat(cfgPath); err == nil {
+	if cfgPath == "" {
+		// DefaultConfigPath gives up when HOME is unset rather than returning a
+		// path relative to the current directory; say so instead of printing an
+		// empty name and calling it absent. Every other command refuses to run
+		// at all in that state, and help is what an operator reaches for to
+		// find out why.
+		cfgPath = "(none)"
+		present = "HOME is not set, and neither -c nor BRB_CONFIG named one"
+	} else if _, err := os.Stat(cfgPath); err == nil {
 		present = "in use"
 	}
 
-	fmt.Fprintf(w, "\nCONFIGURATION\n  Config file: %s  (%s)\n", cfgPath, present)
+	fmt.Fprintf(w, "\nCONFIGURATION\n  Config file: %s  (%s)\n", show(cfgPath), present)
 	fmt.Fprintf(w, "  Every setting below can also be given in the environment, which wins\n")
 	fmt.Fprintf(w, "  over the file.\n\n")
-	for _, l := range configLines(cfg) {
+	for _, l := range configLines(cfg, show) {
 		fmt.Fprintf(w, "    %s\n", l)
 	}
 
@@ -152,8 +169,24 @@ TYPICAL RUN
   brb verify-disc 1
   brb restore /tmp/testrestore   # once, before you trust the set
   rm -rf %s
-`, cfg.Staging)
+`, show(cfg.Staging))
 }
+
+// helpEscaper decides how the values in the listing are rendered, by where the
+// listing is going: visibly to a terminal, byte-exact to anything else. It is
+// the rule `brb list` and `brb index` already apply to the names they print
+// (see restore's escapingWriter), for the same reason — the bytes are not
+// brb's, and a pipe is not a terminal that can be driven.
+func helpEscaper(w io.Writer) func(string) string {
+	if ui.IsTerminal(w) {
+		return ui.Visible
+	}
+	return passthrough
+}
+
+// passthrough leaves a value exactly as it is, so the listing still pastes back
+// as the configuration in force.
+func passthrough(s string) string { return s }
 
 // configLines renders the configuration as the assignments a config file would
 // hold, with the values currently in force, each with the note that explains
@@ -164,7 +197,19 @@ TYPICAL RUN
 // what it prints has to load back: an operator pastes it into a file and
 // expects both readers to accept it. TestHelpListsEveryConfigKey and
 // TestHelpConfigListingRoundTrips pin both.
-func configLines(cfg *config.Config) []string {
+//
+// show is applied to every value, and to nothing brb wrote itself. It is
+// ui.Visible when the help is going to a terminal and the identity function
+// otherwise. The reason is that these values are not brb's own text: the parser
+// copies any byte it gives no meaning to straight into a value (an ESC
+// included), Validate never runs on the help path, and the README both sends
+// operators here for the key list and tells them that pointing -c at a config
+// file they were handed "is an error message, not an execution". Single quotes
+// make such a value a shell word again but do nothing to stop a terminal acting
+// on it, so a LABEL_PREFIX carrying ESC [ 2 J would wipe the screen the listing
+// was printed on. Escaping only for a terminal keeps the piped listing
+// byte-exact, which is what makes it paste back.
+func configLines(cfg *config.Config, show func(string) string) []string {
 	capacity := ""
 	if cfg.DiscCapacityBytes > 0 {
 		capacity = fmt.Sprintf("%d", cfg.DiscCapacityBytes)
@@ -172,41 +217,65 @@ func configLines(cfg *config.Config) []string {
 	identity := cfg.AgeIdentity
 	identityNote := "restore only"
 	if identity == "" {
-		identityNote = "restore only; defaults to " + defaultIdentityPath(cfg)
+		identityNote = "restore only; defaults to " + show(defaultIdentityPath(cfg))
 	}
 
 	out := []string{
-		assign("SOURCE_DIR", cfg.SourceDir, "the tree to back up"),
-		assign("ARCHIVE_NAME", cfg.ArchiveName, ""),
-		assign("STAGING", cfg.Staging, "working space; holds plaintext images"),
-		assign("DISC_TYPE", string(cfg.DiscType), "bd25 | bd50 | bdxl100 | bdxl128"),
+		assign("SOURCE_DIR", show(cfg.SourceDir), "the tree to back up"),
+		assign("ARCHIVE_NAME", show(cfg.ArchiveName), ""),
+		assign("STAGING", show(cfg.Staging), "working space; holds plaintext images"),
+		assign("DISC_TYPE", show(string(cfg.DiscType)), "bd25 | bd50 | bdxl100 | bdxl128"),
 		assign("DISC_CAPACITY_BYTES", capacity, "override for unusual media"),
-		assign("COMPRESSION", cfg.Compression, "zstd | xz | gzip | lz4 | lzo | none"),
+		assign("COMPRESSION", show(cfg.Compression), "zstd | xz | gzip | lz4 | lzo | none"),
 		assign("COMPRESSION_LEVEL", fmt.Sprint(cfg.CompressionLevel), "zstd 1-22, gzip/lzo 1-9; ignored for xz, lz4, none"),
-		assign("BLOCK_SIZE", cfg.BlockSize, "squashfs data block size"),
-		assign("PACK_RATIO", fmt.Sprintf("%.2f", cfg.PackRatio), "expected compressed/raw; lower = fuller discs"),
+		assign("BLOCK_SIZE", show(cfg.BlockSize), "squashfs data block size"),
+		assign("PACK_RATIO", decimal(cfg.PackRatio), "expected compressed/raw; lower = fuller discs"),
 		assign("PACK_RATIO_ADAPT", boolInt(cfg.PackRatioAdapt), "1 re-learns the ratio from the discs built so far"),
 		assign("PACK_RATIO_WINDOW", fmt.Sprint(cfg.PackRatioWindow), "how many recent discs the estimate considers"),
-		assign("PACK_RATIO_MARGIN", fmt.Sprintf("%.2f", cfg.PackRatioMargin), "safety factor over the measured worst case"),
+		assign("PACK_RATIO_MARGIN", decimal(cfg.PackRatioMargin), "safety factor over the measured worst case"),
 		assign("PAR2_REDUNDANCY", fmt.Sprint(cfg.Par2Redundancy), "% recovery data over the ciphertext"),
 		assign("PAR2_BLOCKS", fmt.Sprint(cfg.Par2Blocks), ""),
 		assign("PAR2_MEMORY_MB", fmt.Sprint(cfg.Par2MemoryMB), ""),
 		assign("RESERVE_BYTES", fmt.Sprint(cfg.ReserveBytes), ui.HumanBytes(cfg.ReserveBytes)+" held back on every disc"),
 		assign("JOBS", fmt.Sprint(cfg.Jobs), "compressor threads; 0 = one per CPU"),
 		assign("MAX_SHRINK_ATTEMPTS", fmt.Sprint(cfg.MaxShrinkAttempts), "re-packs allowed when an image overshoots"),
-		assign("LABEL_PREFIX", cfg.LabelPrefix, "start of each ISO 9660 volume label"),
-		assign("BURNER", cfg.Burner, ""),
+		assign("LABEL_PREFIX", show(cfg.LabelPrefix), "start of each ISO 9660 volume label"),
+		assign("BURNER", show(cfg.Burner), ""),
 		assign("BURN_SPEED", fmt.Sprint(cfg.BurnSpeed), ""),
 		assign("ISO_MODE", cfg.ISOMode.String(), isoModeNote(cfg.ISOMode)),
 		assign("KEEP_ISOS", boolInt(cfg.KeepISOs), "1 keeps each ISO after a successful burn"),
-		assign("AGE_RECIPIENTS_FILE", cfg.AgeRecipientsFile, "public keys images are encrypted to"),
-		assign("AGE_IDENTITY", identity, identityNote),
+		assign("AGE_RECIPIENTS_FILE", show(cfg.AgeRecipientsFile), "public keys images are encrypted to"),
+		assign("AGE_IDENTITY", show(identity), identityNote),
 		assign("PUBLIC_ARCHIVE", boolInt(cfg.PublicArchive), "1 keeps no secret: a fresh key is written onto every disc (see backup --public-archive)"),
-		assign("DIST_DIR", cfg.DistDir, distNote(cfg)),
+		assign("DIST_DIR", show(cfg.DistDir), distNote(cfg, show)),
 	}
-	out = append(out, arrayLines("PRUNE_DIRS", cfg.PruneDirs)...)
-	out = append(out, arrayLines("EXCLUDE_MASKS", cfg.ExcludeMasks)...)
+	out = append(out, arrayLines("PRUNE_DIRS", cfg.PruneDirs, show)...)
+	out = append(out, arrayLines("EXCLUDE_MASKS", cfg.ExcludeMasks, show)...)
 	return out
+}
+
+// decimal renders a configured ratio so that the listing loads back as the
+// configuration in force.
+//
+// Two decimals when that is the value exactly, because PACK_RATIO=1.00 and
+// PACK_RATIO_MARGIN=1.05 are how the defaults are written everywhere else, and
+// full precision when it is not. A plain %.2f used to round: an operator who
+// measured 0.625, set it, and then pasted this listing into a fresh config —
+// which is what the README tells them to do — got 0.62 back, a tighter pack
+// than they chose; PACK_RATIO_MARGIN=1.004 came back as 1.00, silently
+// dropping the safety factor; and anything below 0.005 printed as 0.00, which
+// Validate refuses, so the listing brb itself produced would not load.
+func decimal(f float64) string {
+	if s := fmt.Sprintf("%.2f", f); mustReparse(s, f) {
+		return s
+	}
+	return strconv.FormatFloat(f, 'g', -1, 64)
+}
+
+// mustReparse reports whether s reads back as exactly f.
+func mustReparse(s string, f float64) bool {
+	back, err := strconv.ParseFloat(s, 64)
+	return err == nil && back == f
 }
 
 // isoModeNote explains ISO_MODE in one line, naming the other value so the
@@ -229,12 +298,12 @@ func boolInt(b bool) string {
 // distNote explains DIST_DIR with the directory that would actually be used,
 // since the setting is normally left empty and located automatically. The
 // environment spelling is BRB_DIST_DIR; `brb doctor` lists what it found there.
-func distNote(cfg *config.Config) string {
+func distNote(cfg *config.Config, show func(string) string) string {
 	if cfg.DistDir != "" {
 		return "copies of brb for every disc (env: BRB_DIST_DIR)"
 	}
 	if dist, err := cfg.ResolveDistDir(); err == nil && dist != "" {
-		return "copies of brb for every disc; found " + dist
+		return "copies of brb for every disc; found " + show(dist)
 	}
 	return "copies of brb for every disc; none found, see ./build-dist.sh"
 }
@@ -257,14 +326,14 @@ func assign(key, value, note string) string {
 
 // arrayLines renders a list-valued setting as a shell array, wrapped so that no
 // line runs off a terminal.
-func arrayLines(key string, values []string) []string {
+func arrayLines(key string, values []string, show func(string) string) []string {
 	if len(values) == 0 {
 		return []string{key + "=()"}
 	}
 	const width = 72
 	out := []string{key + "=("}
 	line := "   "
-	for _, v := range quoteAll(values) {
+	for _, v := range quoteAll(values, show) {
 		if len(line)+1+len(v) > width {
 			out = append(out, line)
 			line = "   "
@@ -282,10 +351,10 @@ func arrayLines(key string, values []string) []string {
 // most here: the default EXCLUDE_MASKS are globs, and a bare *.pyc inside a
 // bash array literal is expanded against the current directory the moment
 // the file is sourced.
-func quoteAll(in []string) []string {
+func quoteAll(in []string, show func(string) string) []string {
 	out := make([]string, 0, len(in))
 	for _, s := range in {
-		out = append(out, shellWord(s))
+		out = append(out, shellWord(show(s)))
 	}
 	return out
 }

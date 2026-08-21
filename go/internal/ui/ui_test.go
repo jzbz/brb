@@ -203,10 +203,15 @@ func TestPrinterEscapesTerminalControls(t *testing.T) {
 	}
 }
 
-// TestVisible pins exactly what is escaped and how: the same C-style spelling
-// restore uses for index lines, newline and tab left alone, C1 controls
-// caught in their UTF-8 form, and ordinary text — multi-byte included —
-// returned untouched.
+// TestVisible pins exactly what is escaped and how: the C-style spelling
+// restore uses for index lines, newline and tab left alone, C1 controls caught
+// in BOTH spellings — UTF-8 encoded and as a raw byte in a name that is not
+// valid UTF-8 — and ordinary text, multi-byte included, returned untouched.
+//
+// The raw form matters because escaping only the encoded one defends the
+// encoding the operator's terminal is not using: 0x9B is CSI to a terminal that
+// is not in UTF-8 mode, and a file named "notes\x9b2J.txt" reaching a p.Warn
+// would clear their screen mid-restore.
 func TestVisible(t *testing.T) {
 	tests := []struct {
 		name string
@@ -228,6 +233,9 @@ func TestVisible(t *testing.T) {
 		{"invalid utf-8 passes", "a\xffb", "a\xffb"},       // not ours to rewrite
 		{"stray c2 at end", "a\xc2", "a\xc2"},              // truncated sequence, no C1
 		{"stray c2 before ascii", "a\xc2b", "a\xc2b"},      // not a C1 encoding
+		{"raw c1 byte", "a\x9bb", `a\x9bb`},                // CSI to an 8-bit terminal
+		{"raw c1 nel byte", "a\x85b", `a\x85b`},            // NEL, unencoded
+		{"raw c1 screen wipe", "notes\x9b2J.txt", `notes\x9b2J.txt`},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {

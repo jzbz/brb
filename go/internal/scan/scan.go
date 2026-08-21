@@ -1,15 +1,17 @@
-// Package scan walks a source tree natively, replacing the `find -xdev … -prune`
-// invocation used by brb.sh.
+// Package scan walks a source tree natively, covering the same ground as a
+// `find -xdev … -prune` invocation would. (Do not go looking for that
+// invocation in brb.sh: the shell script in this tree has been reader-only
+// since the first commit and contains no scanner to compare against.)
 //
 // The walk never follows symbolic links, records unreadable directories and
 // unreadable files as problems instead of failing (and keeps the unreadable
 // files out of the entry list, so nothing downstream backs them up as empty),
 // and charges hard-linked files exactly once towards the raw byte total. Paths
-// are kept as native Go strings end-to-end so
-// that a name containing a tab or a newline cannot corrupt the pipeline the way
-// the shell version's NUL/tab-delimited scan file could; such names are still a
-// hazard for the tab-separated on-disc index, so every path holding a control
-// byte is reported in [Result.OddPaths].
+// are kept as native Go strings end-to-end, so a name containing a tab or a
+// newline cannot corrupt the pipeline by being re-split out of a delimited
+// intermediate file. Such names are still a hazard for the tab-separated
+// on-disc index, so every path holding a control byte is reported in
+// [Result.OddPaths].
 //
 // This package is Unix-only: it reads the inode, link count and device number
 // from the underlying stat structure.
@@ -119,7 +121,8 @@ type Result struct {
 	// underneath it is left out. They are listed here, in walk order, so a
 	// caller can say so out loud. Without this the omission was silent — no
 	// problem, no warning — and a NAS mounted under the source tree simply
-	// never made it onto a disc.
+	// never made it onto a disc. Directories only: see Options.OneFileSystem
+	// for the one thing this list does not cover.
 	SkippedMounts []string
 }
 
@@ -145,6 +148,13 @@ type Options struct {
 	// still reported, so the mount point survives into the skeleton, and its
 	// path is added to Result.SkippedMounts so the caller can report what was
 	// left behind.
+	//
+	// The boundary is enforced at directories only, which is what -xdev means:
+	// a NON-directory on another device — in practice a file bind mount, since
+	// symlinks are never followed — is an ordinary entry, charged to RawBytes,
+	// backed up, and absent from SkippedMounts. That is one file, never a
+	// subtree, and it is deliberate rather than overlooked; see
+	// TestOneFileSystemDoesNotStopAtANonDirectory for the case that pins it.
 	OneFileSystem bool
 	// OnEntry, when non-nil, is called for every kept entry in walk order.
 	OnEntry func(Entry)
@@ -180,10 +190,11 @@ func Walk(ctx context.Context, opts Options) (*Result, error) {
 	}
 	root := filepath.Clean(opts.Root)
 
-	prunes, err := cleanPatterns(opts.PruneDirs, "PruneDirs")
+	prunePats, err := cleanPatterns(opts.PruneDirs, "PruneDirs")
 	if err != nil {
 		return nil, err
 	}
+	prunes := compilePrunes(prunePats)
 	maskPats, err := cleanPatterns(opts.ExcludeMasks, "ExcludeMasks")
 	if err != nil {
 		return nil, err
@@ -207,7 +218,7 @@ func Walk(ctx context.Context, opts Options) (*Result, error) {
 		linked:  make(map[fileID]struct{}),
 		res:     &Result{Root: root},
 	}
-	if err := w.dir(ctx, root, ""); err != nil {
+	if err := w.dir(ctx, root, "", false); err != nil {
 		return nil, fmt.Errorf("scan: walking %s: %w", root, err)
 	}
 	return w.res, nil
@@ -227,7 +238,7 @@ var statIDs = fileIDs
 
 type walker struct {
 	opts    Options
-	prunes  []string
+	prunes  prunes
 	masks   []mask
 	rootDev uint64
 	linked  map[fileID]struct{}
@@ -237,7 +248,15 @@ type walker struct {
 
 // dir reads one directory and recurses. It returns an error only for context
 // cancellation; everything else is recorded as a problem.
-func (w *walker) dir(ctx context.Context, abs, rel string) error {
+//
+// relOdd must say whether rel already holds a control byte, so the check for
+// [Result.OddPaths] can be made once per base name instead of once per full
+// path. Scanning e.Rel whole re-read every ancestor's bytes once for each of
+// its descendants — O(entries × depth × name length) on a tree the walk sees
+// 10^4..10^6 times. Inheriting the answer is exact because the only byte
+// concatenation adds is the '/' separator (0x2f), which is not a control byte:
+// a path holds one iff its parent's path does or its own base name does.
+func (w *walker) dir(ctx context.Context, abs, rel string, relOdd bool) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -299,7 +318,10 @@ func (w *walker) dir(ctx context.Context, abs, rel string) error {
 				continue
 			}
 		}
-		w.emit(e, dev)
+		// Computed here rather than at the top of the loop so an entry a mask
+		// or an unreadable open dropped is never charged for it.
+		childOdd := relOdd || hasControl(name)
+		w.emit(e, dev, childOdd)
 
 		if e.Kind == KindDir {
 			if w.opts.OneFileSystem && dev != w.rootDev {
@@ -308,7 +330,7 @@ func (w *walker) dir(ctx context.Context, abs, rel string) error {
 				w.res.SkippedMounts = append(w.res.SkippedMounts, childRel)
 				continue
 			}
-			if err := w.dir(ctx, filepath.Join(abs, name), childRel); err != nil {
+			if err := w.dir(ctx, filepath.Join(abs, name), childRel, childOdd); err != nil {
 				return err
 			}
 		}
@@ -316,8 +338,9 @@ func (w *walker) dir(ctx context.Context, abs, rel string) error {
 	return nil
 }
 
-// emit records a kept entry and updates the running totals.
-func (w *walker) emit(e Entry, dev uint64) {
+// emit records a kept entry and updates the running totals. odd says whether
+// e.Rel holds a control byte; see [walker.dir] for why the caller computes it.
+func (w *walker) emit(e Entry, dev uint64, odd bool) {
 	w.res.Entries = append(w.res.Entries, e)
 	if e.Kind == KindFile {
 		w.res.Files++
@@ -327,7 +350,7 @@ func (w *walker) emit(e Entry, dev uint64) {
 	} else {
 		w.res.Skeleton++
 	}
-	if strings.IndexFunc(e.Rel, isControl) >= 0 {
+	if odd {
 		w.res.OddPaths = append(w.res.OddPaths, e.Rel)
 	}
 	if w.opts.OnEntry != nil {
@@ -359,16 +382,43 @@ func (w *walker) problem(path string, err error) {
 	w.res.Errors = append(w.res.Errors, Problem{Path: path, Err: err})
 }
 
+// prunes is the compiled PruneDirs list. Whether a pattern holds a
+// metacharacter depends on the pattern alone, but pruned() runs before the
+// stat for every entry the walk sees — directories included, unlike the mask
+// path — so asking strings.ContainsAny once per pattern per entry re-derived a
+// fixed answer 15 times over for the default configuration, on 10^4..10^6
+// entries. This is the same redundancy compileMasks below was written to
+// remove, and the same shape of fix.
+type prunes struct {
+	// lit holds every pattern, glob or not: a pattern is also a literal name,
+	// so a directory actually called "core.[0-9]*" still prunes itself.
+	lit map[string]struct{}
+	// glob holds only the patterns carrying a metacharacter. Under the default
+	// PRUNE_DIRS it is empty, so the whole per-entry cost is one map lookup.
+	glob []string
+}
+
+// compilePrunes splits already-cleaned patterns into the literal set and the
+// glob subset. See [prunes] for why.
+func compilePrunes(pats []string) prunes {
+	p := prunes{lit: make(map[string]struct{}, len(pats))}
+	for _, s := range pats {
+		p.lit[s] = struct{}{}
+		if isPattern(s) {
+			p.glob = append(p.glob, s)
+		}
+	}
+	return p
+}
+
 // pruned reports whether rel matches any prune pattern.
 func (w *walker) pruned(rel string) bool {
-	for _, p := range w.prunes {
-		if p == rel {
+	if _, ok := w.prunes.lit[rel]; ok {
+		return true
+	}
+	for _, g := range w.prunes.glob {
+		if ok, err := filepath.Match(g, rel); err == nil && ok {
 			return true
-		}
-		if isPattern(p) {
-			if ok, err := filepath.Match(p, rel); err == nil && ok {
-				return true
-			}
 		}
 	}
 	return false
@@ -440,6 +490,23 @@ func (w *walker) excluded(name string) bool {
 // escapes only backslash, tab and newline, so a CR travels into the index raw,
 // where it overwrites the start of its own line on any terminal.
 func isControl(r rune) bool { return r < 0x20 || r == 0x7f }
+
+// hasControl is the byte-wise form of isControl, applied to a whole string. It
+// accepts exactly the strings strings.IndexFunc(s, isControl) >= 0 accepts:
+// every rune isControl admits is below 0x80 and so a single byte, and no byte
+// of a multi-byte UTF-8 sequence is below 0x80, so no valid encoding can be
+// misread. Nor can an invalid one — IndexFunc turns a stray byte into U+FFFD,
+// which isControl rejects, and this loop rejects it too. The walk calls this
+// once per entry, so the rune decode and the indirect call through a func value
+// that IndexFunc pays for every byte are worth not paying.
+func hasControl(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] < 0x20 || s[i] == 0x7f {
+			return true
+		}
+	}
+	return false
+}
 
 // HasIndexEscape reports whether a path from [Result.OddPaths] is one the
 // on-disc index can still render as a single readable row: it holds a tab or a

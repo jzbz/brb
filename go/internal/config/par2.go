@@ -29,8 +29,12 @@ const (
 
 // Par2BlockCount returns how many blocks par2 should split a file of size bytes
 // into, aiming for roughly 1 MiB per block and clamped to the range par2
-// accepts. It mirrors brb.sh exactly, so both implementations produce the same
-// recovery geometry for the same image.
+// accepts.
+//
+// The geometry is recorded in MANIFEST.txt and the .par2 files themselves carry
+// it, so a repair years from now needs nothing from this function — but a
+// re-created recovery set has to match the one on the disc, which is why the
+// rule lives in one place rather than at the call site.
 //
 // A size of zero or less yields the minimum, which keeps the caller from having
 // to special-case an empty file.

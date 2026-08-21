@@ -10,8 +10,9 @@ import (
 
 // SystemDistDirs are the packaged locations searched for the disc payload when
 // DIST_DIR is unset and there is no dist directory beside the running program.
-// The order is brb.sh's: a locally installed payload wins over a distribution
-// one.
+// The order matters: a locally installed payload wins over a distribution
+// one, so a machine that built its own copies burns those rather than an older
+// packaged set.
 //
 // It is a variable only so that a test can point the search at a directory it
 // controls; nothing in brb assigns to it.
@@ -20,9 +21,9 @@ var SystemDistDirs = []string{"/usr/local/share/brb", "/usr/share/brb"}
 // ResolveDistDir returns the directory holding the disc payload — the copies of
 // brb that go onto every disc — or "" when there is none.
 //
-// The search is brb.sh's resolve_dist_dir: DIST_DIR (BRB_DIST_DIR in the
-// environment) if it is set, then a "dist" directory beside the running
-// program, then SystemDistDirs. Only directories that exist are returned.
+// The search is DIST_DIR (BRB_DIST_DIR in the environment) if it is set, then
+// a "dist" directory beside the running program, then SystemDistDirs. Only
+// directories that exist are returned.
 //
 // A DIST_DIR that names nothing is reported as an error rather than falling
 // quietly through to the search: an operator who set it meant it, and burning
@@ -77,7 +78,8 @@ func checkDistDir(path string) error {
 }
 
 // executableDir is the directory holding the running program, with symlinks
-// resolved the way brb.sh's `readlink -f -- "$0"` does. It returns "" when the
+// resolved, so that a brb reached through /usr/local/bin/brb still finds the
+// dist directory beside the real binary. It returns "" when the
 // path cannot be determined, which drops one candidate from the search rather
 // than failing it.
 func executableDir() string {

@@ -11,7 +11,12 @@ import (
 	"github.com/jzbz/brb/internal/disc"
 )
 
-func TestDefaultMatchesBrbSh(t *testing.T) {
+// TestDefaultValues pins the built-in configuration value by value. It used to
+// be called TestDefaultMatchesBrbSh, which was a cross-check that could not
+// fail: brb.sh defines four of these settings (STAGING, AGE_RECIPIENTS_FILE,
+// AGE_IDENTITY, BURNER) and none of the rest, so "matches brb.sh" said nothing
+// about the twenty-four that shape how a set is written.
+func TestDefaultValues(t *testing.T) {
 	setHome(t, "/home/tester")
 	c := Default()
 
@@ -43,15 +48,14 @@ func TestDefaultMatchesBrbSh(t *testing.T) {
 	if c.PackRatio != 1.00 {
 		t.Errorf("PackRatio = %v, want 1.00", c.PackRatio)
 	}
-	// brb.sh: PACK_RATIO_ADAPT=1, PACK_RATIO_WINDOW=3, PACK_RATIO_MARGIN=1.05.
-	// Adaptation is on by default in both, so a set built by either implementation
-	// comes out on the same number of discs.
+	// Adaptation is on by default: a first run with no measurements would
+	// otherwise pack every disc at PACK_RATIO=1.00 and leave a compressible set
+	// on twice the discs it needs.
 	if !c.PackRatioAdapt || c.PackRatioWindow != 3 || c.PackRatioMargin != 1.05 {
 		t.Errorf("pack ratio adaptation defaults = %v/%d/%v, want true/3/1.05",
 			c.PackRatioAdapt, c.PackRatioWindow, c.PackRatioMargin)
 	}
-	// brb.sh: PAR2_REDUNDANCY=10, PAR2_BLOCKS= (empty), PAR2_MEMORY_MB= (empty).
-	// Both blanks are deliberate. An empty block count means "size the blocks
+	// Both zeros are deliberate. An empty block count means "size the blocks
 	// from the image", which is what keeps a 22 GB image at ~1 MiB blocks
 	// instead of 7.5 MiB ones; an empty memory cap leaves par2 its own default
 	// of half of RAM, where a low cap forces extra full passes over the image.
@@ -158,7 +162,8 @@ func TestCapacityAndBudget(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Budget: %v", err)
 	}
-	// The same integer arithmetic brb.sh performs.
+	// The arithmetic spelled out, so a change to disc.Compute has to be meant:
+	// integer truncation at each step, not float rounding.
 	usable := int64(25025314816) * 98 / 100
 	image := (usable - 104857600) * 100 / (100 + 10 + 1)
 	if b.Usable != usable || b.Image != image {
@@ -296,8 +301,8 @@ func TestApplyErrors(t *testing.T) {
 		{"bad iso mode", map[string]Value{"ISO_MODE": {Scalar: "nonsense", Line: 2}},
 			`unknown ISO_MODE "nonsense" (expected ondemand or eager)`},
 		{"iso mode names its line", map[string]Value{"ISO_MODE": {Scalar: "nonsense", Line: 2}}, "line 2"},
-		{"keep isos is not a word", map[string]Value{"KEEP_ISOS": {Scalar: "yes", Line: 2}},
-			`KEEP_ISOS: expected 0 or 1, got "yes"`},
+		{"keep isos is not a boolean at all", map[string]Value{"KEEP_ISOS": {Scalar: "maybe", Line: 2}},
+			`KEEP_ISOS: expected 0 or 1 (also true/false, yes/no, on/off), got "maybe"`},
 		{"array for a scalar", map[string]Value{"STAGING": {Array: []string{"a"}, IsArray: true, Line: 2}},
 			"does not take an array"},
 	}
@@ -552,10 +557,10 @@ func TestLoadMalformedFileIsAnError(t *testing.T) {
 	}
 }
 
-// TestISOModeIsCheckedAtLoad keeps a typo from being interpreted. brb.sh tests
-// for "eager" and treats every other value as ondemand, so "ISO_MODE=egaer"
-// would silently skip the ISO build the operator asked for — and here it would
-// have to survive as far as Validate, which not every command runs.
+// TestISOModeIsCheckedAtLoad keeps a typo from being interpreted. There are
+// only two modes, so "ISO_MODE=egaer" quietly taken as the default would skip
+// the ISO build the operator asked for — and an error raised later would have
+// to survive as far as Validate, which not every command runs.
 func TestISOModeIsCheckedAtLoad(t *testing.T) {
 	home := t.TempDir()
 	setHome(t, home)
@@ -574,7 +579,7 @@ func TestISOModeIsCheckedAtLoad(t *testing.T) {
 		}
 	}
 
-	// The environment layer is checked the same way; brb.sh reads it too.
+	// The environment layer is checked the same way, and wins over the file.
 	if err := os.WriteFile(path, []byte("ISO_MODE=eager\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -617,6 +622,96 @@ func TestLoadUsesDefaultConfigPath(t *testing.T) {
 	}
 	if c.LabelPrefix != "VIA_BRB_CONFIG" {
 		t.Errorf("LabelPrefix = %q, want the file named by BRB_CONFIG to be read", c.LabelPrefix)
+	}
+}
+
+// TestNoHomeIsRefusedNotReRooted pins the refusal that replaced a silent
+// relative path. filepath.Join drops an empty element, so with HOME unset the
+// home-derived defaults used to come out as ".config/brb/recipients.txt" and
+// ".config/brb/config" — read, and written by init-key, under whatever
+// directory brb happened to be started in, which on /tmp or /var/tmp is a
+// directory any local user can plant a recipients file in. brb.sh dies on the
+// same condition under set -u; this is the Go build saying so in words.
+func TestNoHomeIsRefusedNotReRooted(t *testing.T) {
+	setHome(t, "")
+	t.Setenv("BRB_CONFIG", "")
+
+	if got := Default().AgeRecipientsFile; got != "" {
+		t.Errorf("Default().AgeRecipientsFile with no HOME = %q, want it left empty", got)
+	}
+	if got := DefaultConfigPath(); got != "" {
+		t.Errorf("DefaultConfigPath() with no HOME = %q, want it left empty", got)
+	}
+
+	_, err := Load("")
+	if err == nil {
+		t.Fatal("Load with no HOME succeeded; it must refuse rather than read the current directory")
+	}
+	if !strings.Contains(err.Error(), "HOME") {
+		t.Errorf("Load error = %v, want it to name HOME", err)
+	}
+
+	// Naming the file explicitly gets past the first refusal; the recipients
+	// file, which still has no value and no default, is caught by the second.
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config")
+	if err := os.WriteFile(path, []byte("LABEL_PREFIX=X\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(path); err == nil || !strings.Contains(err.Error(), "AGE_RECIPIENTS_FILE") {
+		t.Errorf("Load(%s) with no HOME = %v, want AGE_RECIPIENTS_FILE refused by name", path, err)
+	}
+
+	// Spelling the paths out is the way to run without a home directory.
+	t.Setenv("AGE_RECIPIENTS_FILE", filepath.Join(dir, "recipients.txt"))
+	c, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load with AGE_RECIPIENTS_FILE given explicitly: %v", err)
+	}
+	if c.LabelPrefix != "X" {
+		t.Errorf("LabelPrefix = %q, want the named file to have been read", c.LabelPrefix)
+	}
+}
+
+// TestBoolSettingSpellings pins the grammar brb.sh's bool_setting accepts
+// (brb.sh:391-398), which the README promises both readers share. A KEEP_ISOS
+// written as "true" used to stop every Go command at config load, the
+// restore-side ones included, while brb.sh read the same file happily.
+func TestBoolSettingSpellings(t *testing.T) {
+	setHome(t, "/home/tester")
+	for _, v := range []string{"1", "true", "TRUE", "yes", "Yes", "on", " on "} {
+		c := Default()
+		if err := c.Apply(map[string]Value{"KEEP_ISOS": {Scalar: v, Line: 1}}); err != nil {
+			t.Errorf("KEEP_ISOS=%q: %v", v, err)
+			continue
+		}
+		if !c.KeepISOs {
+			t.Errorf("KEEP_ISOS=%q gave false, want true", v)
+		}
+	}
+	for _, v := range []string{"0", "false", "False", "no", "off", "OFF"} {
+		c := Default()
+		c.KeepISOs = true
+		if err := c.Apply(map[string]Value{"KEEP_ISOS": {Scalar: v, Line: 1}}); err != nil {
+			t.Errorf("KEEP_ISOS=%q: %v", v, err)
+			continue
+		}
+		if c.KeepISOs {
+			t.Errorf("KEEP_ISOS=%q gave true, want false", v)
+		}
+	}
+	// A word neither reader understands is still refused: read as "off" it
+	// would quietly switch off the thing the operator asked for.
+	for _, v := range []string{"maybe", "y", "n", "sure"} {
+		c := Default()
+		err := c.Apply(map[string]Value{"PUBLIC_ARCHIVE": {Scalar: v, Line: 7}})
+		if err == nil {
+			t.Errorf("PUBLIC_ARCHIVE=%q was accepted, want it refused", v)
+			continue
+		}
+		if !strings.Contains(err.Error(), "true/false, yes/no, on/off") {
+			t.Errorf("PUBLIC_ARCHIVE=%q error = %v, want it to list the spellings that work", v, err)
+		}
 	}
 }
 
@@ -812,11 +907,21 @@ func TestPackRatioAdaptationFromFileAndEnvironment(t *testing.T) {
 			c.PackRatioAdapt, c.PackRatioWindow, c.PackRatioMargin)
 	}
 
-	// PACK_RATIO_ADAPT is one of brb.sh's (( VAR )) settings, where a word is
-	// an unset variable name and reads as 0 — the opposite of what it says.
+	// The boolean grammar is brb.sh's bool_setting grammar, so a word it would
+	// have accepted is accepted here too rather than stopping every Go command.
 	t.Setenv("PACK_RATIO_ADAPT", "yes")
+	c, err = Load(path)
+	if err != nil {
+		t.Fatalf("Load with PACK_RATIO_ADAPT=yes: %v", err)
+	}
+	if !c.PackRatioAdapt {
+		t.Errorf("PACK_RATIO_ADAPT=yes gave %v, want true", c.PackRatioAdapt)
+	}
+	// A word that is not a boolean in either reader is still refused: a typo
+	// read as "off" would quietly disable the adaptation it names.
+	t.Setenv("PACK_RATIO_ADAPT", "maybe")
 	if _, err := Load(path); err == nil ||
 		!strings.Contains(err.Error(), "PACK_RATIO_ADAPT: expected 0 or 1") {
-		t.Errorf("Load error = %v, want PACK_RATIO_ADAPT=yes refused", err)
+		t.Errorf("Load error = %v, want PACK_RATIO_ADAPT=maybe refused", err)
 	}
 }

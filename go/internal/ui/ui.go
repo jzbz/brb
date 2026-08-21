@@ -161,6 +161,16 @@ func (p *Printer) write(s string) {
 	fmt.Fprint(p.w, s)
 }
 
+// Visible renders text so that nothing in it can drive the terminal, for the
+// few places that write to stdout without going through a Printer.
+//
+// The Printer applies this to every message it emits, which is why almost
+// nothing needs to call it directly; `brb help` does, because it prints
+// configuration values — read from a file the operator may have been handed
+// rather than written — straight to stdout. See [visible] for what is escaped
+// and why.
+func Visible(s string) string { return visible(s) }
+
 // visible renders a message so that nothing in it can drive the terminal.
 //
 // Every message the Printer emits passes through here, whatever it was built
@@ -176,20 +186,30 @@ func (p *Printer) write(s string) {
 // than at each call site, means a caller cannot forget.
 //
 // What is escaped: every C0 control byte except newline and tab, DEL, and the
-// C1 controls U+0080..U+009F (which xterm-compatible terminals honour when
-// they arrive UTF-8 encoded, exactly as ESC-bracket sequences). Newline is
-// kept because callers deliberately emit multi-line messages through one
-// call; tab is kept because it cannot move the cursor anywhere but along the
-// current line and subprocess output is often tab-aligned. Bytes that are not
-// valid UTF-8 pass through: a terminal shows them as replacement characters,
-// which is honest, and rewriting them would misreport the name.
+// C1 controls U+0080..U+009F in both spellings — UTF-8 encoded (0xC2 0x9B),
+// which xterm-compatible terminals honour exactly as ESC-bracket sequences,
+// and as a raw 0x80..0x9F byte that is not part of a valid UTF-8 sequence,
+// which is what an 8-bit terminal acts on. Escaping only one of the two would
+// have covered whichever encoding the operator's terminal is not using.
+// Newline is kept because callers deliberately emit multi-line messages
+// through one call; tab is kept because it cannot move the cursor anywhere but
+// along the current line and subprocess output is often tab-aligned. Other
+// bytes that are not valid UTF-8 pass through: a terminal shows them as
+// replacement characters, which is honest, and rewriting them would misreport
+// the name.
 //
-// The rendering is the C-style one restore's escapeControls uses for index
-// lines — \r for CR, \xNN for anything else, one escape per byte — so an
-// operator sees the same spelling for the same name whichever command printed
-// it, and can feed it back through printf to reproduce the bytes. The colour
-// codes the Printer wraps around a message are added after this runs and are
-// never touched.
+// The rendering is C-style — \r for CR, \xNN for anything else, one escape per
+// byte — so an operator can feed it back through printf to reproduce the bytes.
+// It is the notation restore's escapeControls uses for index lines, but not yet
+// the same coverage: that escaper spells newline \n (it works on lines, where a
+// raw newline would forge a second entry) and passes C1 controls through in
+// both spellings, as does brb.sh's esc_controls. A name printed by `brb index`
+// can therefore still render differently from the same name in a Printer
+// message; widening those two together is the fix, and it has to happen in both
+// implementations at once or the readers stop agreeing.
+//
+// The colour codes the Printer wraps around a message are added after this runs
+// and are never touched.
 func visible(s string) string {
 	if !needsEscaping(s) {
 		return s
@@ -210,13 +230,20 @@ func visible(s string) string {
 			i++
 		case c >= utf8.RuneSelf:
 			r, size := utf8.DecodeRuneInString(s[i:])
-			if r >= 0x80 && r <= 0x9f {
+			switch {
+			case r >= 0x80 && r <= 0x9f:
 				// A C1 control, UTF-8 encoded: spell out both bytes so the
 				// escape round-trips through printf like every other one.
 				for _, cb := range []byte(s[i : i+size]) {
 					fmt.Fprintf(&b, `\x%02x`, cb)
 				}
-			} else {
+			case r == utf8.RuneError && size == 1 && c <= 0x9f:
+				// A raw 0x80..0x9F byte, not valid UTF-8 here: it is CSI, OSC
+				// or another C1 control to a terminal that is not decoding
+				// UTF-8, so it drives the screen just as the encoded form does
+				// on one that is.
+				fmt.Fprintf(&b, `\x%02x`, c)
+			default:
 				b.WriteString(s[i : i+size])
 			}
 			i += size
@@ -228,18 +255,32 @@ func visible(s string) string {
 	return b.String()
 }
 
-// needsEscaping is visible's fast path: almost every message is clean, and
-// the printer is on the hot path of every forwarded subprocess line.
+// needsEscaping is visible's fast path: almost every message is clean, and the
+// printer is on the hot path of every forwarded subprocess line.
+//
+// It walks runes rather than bytes above ASCII, so that it answers exactly the
+// question visible's loop asks. A byte test would be cheaper but wrong in both
+// directions: 0x80..0xBF are also the continuation bytes of every ordinary
+// multi-byte rune, so plain text in any non-Latin script would take the slow
+// path, while a raw C1 byte would be missed unless it happened to follow 0xC2.
 func needsEscaping(s string) bool {
-	for i := 0; i < len(s); i++ {
+	for i := 0; i < len(s); {
 		c := s[i]
-		if (c < 0x20 && c != '\n' && c != '\t') || c == 0x7f {
-			return true
+		if c < utf8.RuneSelf {
+			if (c < 0x20 && c != '\n' && c != '\t') || c == 0x7f {
+				return true
+			}
+			i++
+			continue
 		}
-		// 0xC2 is the lead byte of every UTF-8 encoded C1 control.
-		if c == 0xc2 && i+1 < len(s) && s[i+1] >= 0x80 && s[i+1] <= 0x9f {
-			return true
+		r, size := utf8.DecodeRuneInString(s[i:])
+		if r >= 0x80 && r <= 0x9f {
+			return true // a C1 control, UTF-8 encoded
 		}
+		if r == utf8.RuneError && size == 1 && c <= 0x9f {
+			return true // a raw C1 byte in an invalid-UTF-8 name
+		}
+		i += size
 	}
 	return false
 }

@@ -9,6 +9,8 @@ import (
 	"strings"
 	"testing"
 
+	"filippo.io/age"
+
 	"github.com/jzbz/brb/internal/agecrypt"
 	"github.com/jzbz/brb/internal/config"
 	"github.com/jzbz/brb/internal/tools"
@@ -263,6 +265,11 @@ func TestMainUsageErrors(t *testing.T) {
 		{"extra argument", []string{"plan", "now"}, `plan: unexpected argument "now"`},
 		{"missing argument", []string{"burn"}, "burn: not enough arguments"},
 		{"bad disc number", []string{"list", "one"}, `list: "one" is not a disc number`},
+		// --disc 0 used to parse: 0 is RestoreOptions.Disc's sentinel for
+		// "every disc", so it restored the whole set over the destination
+		// tree — with -y, without a confirmation — where the operator had
+		// asked for one disc. brb.sh refuses it too.
+		{"disc zero", []string{"restore", "/dest", "--disc", "0"}, `restore: --disc: "0" is not a disc number`},
 		{"bad burn selector", []string{"burn", "some"}, `burn: expected a number, a range like 7-20, or 'all' (got "some")`},
 		{"bad iso selector", []string{"iso", "7-3"}, `iso: range "7-3" ends before it starts`},
 		{"iso without a selector", []string{"iso"}, "iso: not enough arguments"},
@@ -332,6 +339,38 @@ func TestDoctorWithoutARecipientsFile(t *testing.T) {
 	} {
 		if !strings.Contains(errOut, want) {
 			t.Errorf("doctor output does not mention %q:\n%s", want, errOut)
+		}
+	}
+}
+
+// TestDoctorUnderPublicArchive pins that doctor knows the mode. A public
+// archive mints its own keypair and never reads AGE_RECIPIENTS_FILE, so doctor
+// used to fail a correctly configured public set over a missing file the run
+// would not have opened — and told the operator to run 'brb init-key', minting
+// the long-lived key the mode exists to avoid needing. It also said nothing
+// about the set not being confidential.
+func TestDoctorUnderPublicArchive(t *testing.T) {
+	home := isolate(t)
+	src := filepath.Join(home, "src")
+	if err := os.MkdirAll(src, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeConfig(t, home, "SOURCE_DIR="+src+"\nSTAGING="+filepath.Join(home, "staging")+
+		"\nPUBLIC_ARCHIVE=1\nAGE_RECIPIENTS_FILE="+filepath.Join(home, "nope", "recipients.txt")+"\n")
+
+	_, _, errOut := runMain(t, "doctor")
+	for _, unwanted := range []string{"no recipients file", "brb init-key"} {
+		if strings.Contains(errOut, unwanted) {
+			t.Errorf("doctor complains %q about a public archive, which never reads that file:\n%s",
+				unwanted, errOut)
+		}
+	}
+	for _, want := range []string{
+		"PUBLIC_ARCHIVE=1: this set will NOT be confidential",
+		"public archive  1",
+	} {
+		if !strings.Contains(errOut, want) {
+			t.Errorf("doctor output does not contain %q:\n%s", want, errOut)
 		}
 	}
 }
@@ -598,6 +637,63 @@ func TestInitKeyLeavesOtherPeoplesDirectoriesAlone(t *testing.T) {
 		}
 	})
 
+	// The rescue identity is written beside the RECIPIENTS file, never beside
+	// AGE_IDENTITY. When the two are in different directories the recipients
+	// one used to get a bare MkdirAll: no chmod of brb's own default, and no
+	// warning about a directory open to others — so the directory that ends up
+	// holding a rescue container was the one prepareKeyDir's promise skipped.
+	t.Run("recipients directory elsewhere gets the same treatment", func(t *testing.T) {
+		home := isolate(t)
+		private := filepath.Join(home, "private")
+		if err := os.Mkdir(private, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		shared := filepath.Join(home, "shared-keys")
+		if err := os.Mkdir(shared, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if got := dirMode(t, shared); got != 0o755 {
+			t.Skipf("umask left the fixture at %04o", got)
+		}
+		writeConfig(t, home, "AGE_IDENTITY="+filepath.Join(private, "identity.txt")+"\n"+
+			"AGE_RECIPIENTS_FILE="+filepath.Join(shared, "recipients.txt")+"\n")
+
+		status, _, errOut := runMain(t, "init-key")
+		if status != exitOK {
+			t.Fatalf("init-key exit = %d\n%s", status, errOut)
+		}
+		if got := dirMode(t, shared); got != 0o755 {
+			t.Errorf("the recipients directory mode = %04o, want 0755 left alone", got)
+		}
+		if !strings.Contains(errOut, "warn "+shared+" is accessible to others (mode 0755)") {
+			t.Errorf("no warning that the directory the rescue key would land in is open to others:\n%s", errOut)
+		}
+	})
+
+	t.Run("default recipients directory is made private from elsewhere", func(t *testing.T) {
+		home := isolate(t)
+		private := filepath.Join(home, "private")
+		if err := os.Mkdir(private, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		def := filepath.Join(home, ".config", "brb")
+		if err := os.MkdirAll(def, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if got := dirMode(t, def); got != 0o755 {
+			t.Skipf("umask left the fixture at %04o", got)
+		}
+		writeConfig(t, home, "AGE_IDENTITY="+filepath.Join(private, "identity.txt")+"\n")
+
+		status, _, errOut := runMain(t, "init-key")
+		if status != exitOK {
+			t.Fatalf("init-key exit = %d\n%s", status, errOut)
+		}
+		if got := dirMode(t, def); got != 0o700 {
+			t.Errorf("the default recipients directory mode = %04o after init-key, want 0700", got)
+		}
+	})
+
 	t.Run("existing non-default recipients directory is left alone", func(t *testing.T) {
 		home := isolate(t)
 		shared := filepath.Join(home, "shared-keys")
@@ -619,6 +715,52 @@ func TestInitKeyLeavesOtherPeoplesDirectoriesAlone(t *testing.T) {
 			t.Errorf("no warning about the group-accessible directory:\n%s", errOut)
 		}
 	})
+}
+
+// TestInitKeyRefusesToBuildARecipientSetAgeWontEncryptTo: age refuses to
+// encrypt to a set that mixes post-quantum and classic recipients, init-key
+// can only ever mint classic ones, and AppendRecipient validates a key in
+// isolation. So init-key against a post-quantum recipients file used to exit
+// 0, print the key it had recorded, and hand the operator an archive whose
+// every backup dies in preflight — with an identity file a second init-key
+// then refuses to overwrite. The refusal has to come before anything is
+// written, and it has to leave the recipients file byte-identical so the
+// operator can fix it and retry.
+func TestInitKeyRefusesToBuildARecipientSetAgeWontEncryptTo(t *testing.T) {
+	home := isolate(t)
+	keys := filepath.Join(home, "keys")
+	if err := os.Mkdir(keys, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	recips := filepath.Join(keys, "recipients.txt")
+	writeConfig(t, home, "AGE_RECIPIENTS_FILE="+recips+"\n")
+
+	pq, err := age.GenerateHybridIdentity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	before := pq.Recipient().String() + "\n"
+	if err := os.WriteFile(recips, []byte(before), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	status, _, errOut := runMain(t, "init-key")
+	if status != exitError {
+		t.Fatalf("init-key exit = %d against a post-quantum recipients file, want %d\n%s", status, exitError, errOut)
+	}
+	if !strings.Contains(errOut, "post-quantum") {
+		t.Errorf("the refusal does not say what is wrong with the set:\n%s", errOut)
+	}
+	after, err := os.ReadFile(recips)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(after) != before {
+		t.Errorf("the recipients file was changed by a run that refused:\n%s", after)
+	}
+	if _, err := os.Lstat(filepath.Join(keys, "identity.txt")); !os.IsNotExist(err) {
+		t.Errorf("an identity was written despite the refusal (%v) — a later init-key would refuse to replace it", err)
+	}
 }
 
 func TestMainReportsCancellation(t *testing.T) {

@@ -154,8 +154,15 @@ func loadConfig(path string, p *ui.Printer) (*config.Config, string, error) {
 	}
 	if explicit {
 		if _, err := os.Stat(path); errors.Is(err, fs.ErrNotExist) {
+			// The advice to drop -c is only advice when there is somewhere to
+			// drop back to: DefaultConfigPath gives up when HOME is unset
+			// rather than naming a path relative to the current directory.
+			fallback := "drop -c to use " + config.DefaultConfigPath()
+			if config.DefaultConfigPath() == "" {
+				fallback = "set HOME or BRB_CONFIG if you meant the default location"
+			}
 			return nil, path, fmt.Errorf("config file not found: %s (named by -c; "+
-				"check the path, or drop -c to use %s)", path, config.DefaultConfigPath())
+				"check the path, or %s)", path, fallback)
 		}
 	}
 	cfg, err := config.Load(path)
@@ -357,7 +364,7 @@ func dispatch(ctx context.Context, g globals, cfg *config.Config, cfgPath string
 		var ro restore.RestoreOptions
 		f := newFlags("restore")
 		f.StringList(&ro.Only, "--only")
-		f.Int(&ro.Disc, "--disc")
+		f.DiscNum(&ro.Disc, "--disc")
 		f.Bool(&ro.KeepImages, "--keep-images")
 		if err := f.parse(g.args); err != nil {
 			return err

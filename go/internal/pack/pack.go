@@ -9,9 +9,20 @@
 //     whose target landed on another disc would be restored as a second full
 //     copy at best and as nothing at all at worst.
 //   - Every non-file entry (directory, symlink, fifo, socket, device node)
-//     forms the skeleton, which is replicated into every bin. The skeleton
-//     carries no data, so copying it onto each disc is nearly free and lets a
-//     single disc show the complete directory structure.
+//     forms the skeleton, which is replicated into every bin, so that a single
+//     disc shows the complete directory structure.
+//
+// The skeleton carries no file data, but it is not free: each member costs an
+// inode in every image, plus a directory-table entry and a symlink its target
+// string. That cost is charged to no budget — [Bin.RawBytes] counts the chosen
+// file units only, and [Packer.Oversized] compares file units alone — so a tree
+// with an enormous number of non-file entries overshoots every disc by the same
+// fixed amount and is re-packed once per disc for it. Ordinary trees are
+// nowhere near this; the shape that would reach it is millions of symlinks with
+// long targets. If it is ever seen in the field the fix is to charge an
+// estimated per-entry skeleton cost against the budget and to refuse up front
+// when the skeleton alone exceeds it, because neither of the shrink loop's two
+// pieces of advice can help once it does.
 //
 // The whole scan is held in memory and assignment is tracked in a bitset, so
 // planning N discs costs one O(n log n) sort plus one O(n) sweep per disc,
@@ -81,12 +92,23 @@ type Packer struct {
 // result is deterministic: units are ordered by size descending with ties
 // broken by their first path.
 //
-// Note that grouping uses the inode number alone, as brb.sh does. Two distinct
-// hard-linked inodes on two different filesystems can therefore collide into
-// one unit. No data is lost when that happens — every name still travels
-// together onto one disc — but the group is charged for only the larger of the
-// two sizes, so a scan that crosses filesystems may slightly under-estimate a
-// disc. Scanning with OneFileSystem removes the possibility entirely.
+// Note that grouping uses the inode number alone, not the device-and-inode
+// pair. Two distinct hard-linked inodes on two different filesystems can
+// therefore collide into one unit. No data is lost when that happens — every
+// name still travels together onto one disc — but the group is charged for only
+// the larger of the two sizes, so a scan that crosses filesystems may slightly
+// under-estimate a disc. brb's own commands all but close the door on it:
+// backup scans with scan.Options.OneFileSystem set, which keeps every directory
+// on the root's device. The one thing that slips through is a bind-mounted
+// *file* from another filesystem, which -xdev does not stop (see
+// scan.Options.OneFileSystem) — and it would have to be hard-linked and share
+// an inode number with a link group on the root device before this mattered. A
+// caller of this package that scans without OneFileSystem accepts the
+// under-estimate outright.
+//
+// (Nothing in the frozen on-disc format records an inode, so the grouping key
+// is an implementation choice, not a compatibility constraint — it could become
+// the device-and-inode pair the day a caller needs it to.)
 func New(entries []scan.Entry) *Packer {
 	var skeleton []string
 	var singles []Unit

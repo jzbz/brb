@@ -6,10 +6,12 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 
 	"github.com/jzbz/brb/internal/config"
+	"github.com/jzbz/brb/internal/ui"
 )
 
 // TestHelpListsEveryConfigKey pins the README's promise that `brb help` is the
@@ -75,6 +77,12 @@ func TestHelpDocumentsEveryBackupFlag(t *testing.T) {
 // quoting (a space, a single quote, a literal $HOME and #, globs) and values
 // that render empty (DISC_CAPACITY_BYTES=, DIST_DIR=), which are the two ways
 // the rendered sample used to be rejected by the parser that printed it.
+//
+// The two ratios are deliberately values that %.2f cannot hold: PACK_RATIO=0.625
+// is the shape the README's own advice produces ("set PACK_RATIO=0.65"), and
+// PACK_RATIO_MARGIN=1.004 rounds to exactly 1.00, which is the margin switched
+// off. With the defaults in place — 1.00 and 1.05 — this test passed with the
+// rounding intact, so it pinned nothing.
 func TestHelpConfigListingRoundTrips(t *testing.T) {
 	home := isolate(t)
 	src := filepath.Join(home, "My Photos")
@@ -82,6 +90,8 @@ func TestHelpConfigListingRoundTrips(t *testing.T) {
 	cfg.SourceDir = src
 	cfg.ArchiveName = "photos 2026 #1 $HOME's ~tilde"
 	cfg.LabelPrefix = "FAMILY PHOTOS"
+	cfg.PackRatio = 0.625
+	cfg.PackRatioMargin = 1.004
 	cfg.PruneDirs = []string{".cache", "Old Stuff", "it's"}
 	cfg.ExcludeMasks = []string{"*.pyc", "core.[0-9]*", "*~"}
 	cfg.ResolveDefaults()
@@ -130,6 +140,88 @@ printf '%s\n' "${PRUNE_DIRS[@]}" "${EXCLUDE_MASKS[@]}"`
 	want = append(want, cfg.ExcludeMasks...)
 	if got := strings.Split(strings.TrimSuffix(string(raw), "\n"), "\n"); !reflect.DeepEqual(got, want) {
 		t.Errorf("bash read the listing back as %q, want %q", got, want)
+	}
+}
+
+// TestHelpDecimalsAreExact pins that a ratio prints as the number in force.
+// %.2f rendered a measured PACK_RATIO=0.625 as 0.62 in the listing the README
+// calls authoritative, and a PACK_RATIO_MARGIN=1.004 as 1.00 — the safety
+// factor gone — while anything under 0.005 printed as 0.00, which Validate
+// then refuses. The defaults still print the way the README's sample writes
+// them.
+func TestHelpDecimalsAreExact(t *testing.T) {
+	tests := []struct{ in, want string }{
+		{"1", "1.00"},
+		{"1.05", "1.05"},
+		{"0.625", "0.625"},
+		{"1.004", "1.004"},
+		{"0.001", "0.001"},
+	}
+	for _, tc := range tests {
+		f, err := strconv.ParseFloat(tc.in, 64)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := decimal(f); got != tc.want {
+			t.Errorf("decimal(%v) = %s, want %s", f, got, tc.want)
+		}
+		back, err := strconv.ParseFloat(decimal(f), 64)
+		if err != nil || back != f {
+			t.Errorf("decimal(%v) = %s, which loads back as %v", f, decimal(f), back)
+		}
+	}
+}
+
+// TestHelpEscapesConfigValuesForATerminal pins the rule writeHelp applies to
+// values it did not write. A config file is data — the README sends operators
+// to `brb help` for the key list and tells them the Go build treats a hostile
+// config as "an error message, not an execution" — and config.Parse copies an
+// ESC byte into a value untouched, with Validate never running on this path.
+// Single-quoting makes such a value a shell word again but does not stop a
+// terminal from acting on it.
+func TestHelpEscapesConfigValuesForATerminal(t *testing.T) {
+	isolate(t)
+	cfg := config.Default()
+	cfg.LabelPrefix = "\x1b[2Jgotcha"
+	cfg.ArchiveName = "bell\x07"
+	cfg.ExcludeMasks = []string{"esc\x1bmask"}
+	cfg.ResolveDefaults()
+
+	// The choice of escaper is made by where the listing is going. A character
+	// device stands in for a terminal here, as it does in ui's own tests.
+	if dev, err := os.Open(os.DevNull); err != nil {
+		t.Logf("cannot open %s, skipping the terminal half: %v", os.DevNull, err)
+	} else {
+		defer dev.Close()
+		if ui.IsTerminal(dev) {
+			if got := helpEscaper(dev)("a\x1bb"); got != `a\x1bb` {
+				t.Errorf("help to a terminal renders %q as %q, want it escaped", "a\x1bb", got)
+			}
+		}
+	}
+	if got := helpEscaper(&bytes.Buffer{})("a\x1bb"); got != "a\x1bb" {
+		t.Errorf("help to a buffer renders %q as %q, want it byte-exact", "a\x1bb", got)
+	}
+
+	// To a terminal: nothing that can drive it survives.
+	for _, l := range configLines(cfg, ui.Visible) {
+		if strings.ContainsAny(l, "\x1b\x07\x00\x7f") {
+			t.Errorf("terminal listing line %q still carries a control byte", l)
+		}
+	}
+	joined := strings.Join(configLines(cfg, ui.Visible), "\n")
+	for _, want := range []string{`\x1b[2Jgotcha`, `bell\x07`, `esc\x1bmask`} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("terminal listing does not spell out %s:\n%s", want, joined)
+		}
+	}
+
+	// To anything else — a pipe, a file, this test — the bytes are exact, so
+	// the listing still pastes back as the configuration in force.
+	var out bytes.Buffer
+	writeHelp(&out, cfg, "")
+	if !strings.Contains(out.String(), "\x1b[2Jgotcha") {
+		t.Errorf("piped listing lost the raw value it must reproduce:\n%s", out.String())
 	}
 }
 
