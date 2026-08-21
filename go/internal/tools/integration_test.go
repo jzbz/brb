@@ -205,6 +205,39 @@ func TestBuildImageRejectsABadFileList(t *testing.T) {
 	}
 }
 
+// TestBuildImageRejectsARelativeOutput pins the guard against the one path in
+// this package that is resolved against two different working directories.
+// mksquashfs runs with SourceDir as its cwd and resolves the output path on its
+// command line there; BuildImage's own Remove, cleanup defer and Stat resolve
+// the same string in brb's cwd. A relative Out therefore names two files, and
+// the dangerous half of that is silent: with a matching directory under
+// SourceDir the tool writes a whole disc of plaintext where brb never looks,
+// never cleans up and never encrypts.
+func TestBuildImageRejectsARelativeOutput(t *testing.T) {
+	s := realSet(t, Mksquashfs)
+	src := t.TempDir()
+	if err := os.WriteFile(filepath.Join(src, "a"), []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// A directory the relative path would resolve into, so a missing guard
+	// fails by writing the image in the wrong place rather than by erroring.
+	if err := os.Mkdir(filepath.Join(src, "img"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	err := s.BuildImage(t.Context(), MkOptions{
+		SourceDir: src, Out: filepath.Join("img", "disc01.squashfs"), Files: []string{"a"},
+	})
+	if err == nil {
+		t.Fatal("BuildImage() = nil for a relative output path, want a rejection")
+	}
+	if !strings.Contains(err.Error(), "absolute") {
+		t.Errorf("BuildImage() = %v, want an error saying the output path must be absolute", err)
+	}
+	if _, statErr := os.Stat(filepath.Join(src, "img", "disc01.squashfs")); statErr == nil {
+		t.Error("an image was written under SourceDir, where brb would never find or delete it")
+	}
+}
+
 func TestMksquashfsCapabilities(t *testing.T) {
 	s := realSet(t, Mksquashfs)
 	ctx := t.Context()
@@ -432,8 +465,8 @@ func TestMakeISO(t *testing.T) {
 func TestMakeISOHonoursTheExitStatus(t *testing.T) {
 	s := realSet(t, Xorriso)
 	src, _ := makeTree(t)
-	// A destination whose parent does not exist: xorriso fails, and brb.sh's
-	// "| grep ... || true" would have reported success.
+	// A destination whose parent does not exist: xorriso fails, and a
+	// "| grep ... || true" pipeline would have reported success.
 	out := filepath.Join(t.TempDir(), "no-such-dir", "disc01.iso")
 	err := s.MakeISO(t.Context(), ISOOptions{Dir: src, Out: out, Label: "PROBE"})
 	if err == nil {

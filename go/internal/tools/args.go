@@ -29,8 +29,6 @@ type MkOptions struct {
 	BlockSize string
 	// Processors caps the compressor thread count; 0 leaves it to mksquashfs.
 	Processors int
-	// MemMB caps the cache memory in mebibytes; 0 leaves it to mksquashfs.
-	MemMB int
 	// Xattrs stores extended attributes when true.
 	Xattrs bool
 	// Log receives the tool's output line by line; nil discards it.
@@ -42,8 +40,11 @@ type MkOptions struct {
 //
 // mksquashfs accepts -Xcompression-level for zstd, gzip and lzo only. xz and
 // lz4 are tuned through entirely different options (-Xdict-size / -Xbcj and
-// -Xhc), and "none" takes no options at all. brb.sh silently drops the level in
-// those cases; callers of this package are expected to warn instead.
+// -Xhc), and "none" takes no options at all. mksquashfs neither applies the
+// level nor complains, so a COMPRESSION_LEVEL set beside one of those
+// compressors vanishes without trace; callers of this package are expected to
+// warn rather than let it go silently, which is what README's Limitations
+// section promises.
 func LevelApplies(compression string) bool {
 	switch strings.ToLower(strings.TrimSpace(compression)) {
 	case "zstd", "gzip", "lzo":
@@ -77,9 +78,6 @@ func MksquashfsArgs(o MkOptions) []string {
 	if o.Processors > 0 {
 		a = append(a, "-processors", strconv.Itoa(o.Processors))
 	}
-	if o.MemMB > 0 {
-		a = append(a, "-mem", fmt.Sprintf("%dM", o.MemMB))
-	}
 	if NoCompression(o.Compression) {
 		a = append(a, "-no-compression")
 		return a
@@ -111,8 +109,6 @@ type Par2Options struct {
 	Blocks int
 	// MemoryMB caps par2's memory use; 0 leaves the par2 default.
 	MemoryMB int
-	// Threads sets -t; 0 omits it.
-	Threads int
 	// Log receives the tool's output line by line; nil discards it.
 	Log io.Writer
 }
@@ -136,9 +132,6 @@ func Par2CreateArgs(o Par2Options) []string {
 	}
 	if o.MemoryMB > 0 {
 		a = append(a, "-m"+strconv.Itoa(o.MemoryMB))
-	}
-	if o.Threads > 0 {
-		a = append(a, "-t"+strconv.Itoa(o.Threads))
 	}
 	a = append(a, "--", o.File)
 	return append(a, o.Inputs...)
@@ -263,9 +256,10 @@ const maxLabel = 32
 // uppercases, replaces everything outside [A-Z0-9_] with '_', and truncates to
 // 32 characters.
 //
-// Like brb.sh's "tr '[:lower:]' '[:upper:]' | tr -c 'A-Z0-9_' '_'" it works a
-// byte at a time, so one multi-byte character becomes one '_' per byte and the
-// result is always ASCII.
+// It works a byte at a time rather than a rune at a time, so one multi-byte
+// character becomes one '_' per byte and the result is always ASCII. That is
+// what ISO 9660 requires, and it is what keeps the 32 in [maxLabel] a byte
+// count: the volume identifier field is 32 bytes wide, not 32 characters.
 func SanitiseLabel(s string) string {
 	b := []byte(s)
 	out := make([]byte, 0, len(b))
@@ -285,16 +279,40 @@ func SanitiseLabel(s string) string {
 	return string(out)
 }
 
-// DiscLabel builds the volume ID brb.sh writes: "<prefix>_<nn>_OF_<nn>",
-// sanitised and truncated.
+// DiscLabel builds one disc's ISO 9660 volume ID: "<prefix>_<nn>_OF_<nn>",
+// sanitised and held to the 32-byte limit.
+//
+// The PREFIX is what gets cut when the whole thing will not fit, never the
+// "_07_OF_20" suffix, and that asymmetry is the whole point of the function.
+// Sanitising the concatenation and letting [SanitiseLabel] truncate would eat
+// the tail first, because the disc number is at the end: a 30-byte
+// LABEL_PREFIX left every disc from 1 to 9 with the identical volume ID
+// "..._0", and a 31-byte one gave all twenty discs the same ID, so the label
+// that exists precisely to say "disc 07 of 20" identified nothing — silently,
+// permanently, on the media. The prefix is the operator's decoration; the disc
+// number is the information, so the information survives.
+//
+// The suffix width is measured rather than assumed, because a set of more than
+// 99 discs renders "_100_OF_120" and a hardcoded bound would be wrong there.
+// Nothing reads this label back — neither reader parses it — so trimming the
+// prefix costs the operator some of their chosen name and nothing else.
 func DiscLabel(prefix string, n, total int) string {
-	return SanitiseLabel(fmt.Sprintf("%s_%02d_OF_%02d", prefix, n, total))
+	suffix := fmt.Sprintf("_%02d_OF_%02d", n, total)
+	p := SanitiseLabel(prefix)
+	if room := maxLabel - len(suffix); len(p) > room {
+		if room < 0 {
+			room = 0
+		}
+		p = p[:room]
+	}
+	return SanitiseLabel(p + suffix)
 }
 
 // isoNoise matches the xorriso chatter that carries no information about
-// success or failure. brb.sh pipes xorriso through "grep -v ... || true", which
-// throws away the exit status along with the noise; KeepISOLine does the same
-// filtering in process so the status can still be checked.
+// success or failure. The obvious way to drop it — piping xorriso through
+// "grep -v ... || true" — throws the exit status away along with the noise, so
+// KeepISOLine does the same filtering in process and leaves the child's status
+// to be checked; see [(*Set).MakeISO].
 var isoNoise = regexp.MustCompile(`(?i)xorriso : (UPDATE|NOTE)|^Media |^Added to ISO|^ISO image produced|^Written to medium|completed successfully`)
 
 // KeepISOLine reports whether a line of xorriso output is worth logging.

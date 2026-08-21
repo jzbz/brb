@@ -54,8 +54,8 @@ func TestRunFiltersOutputButKeepsStatus(t *testing.T) {
 		name: "sh", path: sh,
 		args: []string{"-c", `printf 'xorriso : UPDATE : busy\nxorriso : FAILURE : nope\n'; exit 1`},
 		log:  &log,
-		// This is the shape of the brb.sh bug: filtering must not cost the
-		// exit status.
+		// This is the shape of the "tool | grep -v ... || true" bug: filtering
+		// must not cost the exit status.
 		filter: KeepISOLine,
 	})
 	if err == nil {

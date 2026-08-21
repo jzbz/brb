@@ -30,8 +30,9 @@ func TestWriteIndexLines(t *testing.T) {
 		},
 		{
 			// The disc number is not zero-padded in the index, unlike the file
-			// names: brb.sh writes "$bin", and `awk -F'\t' '$1==3'` in the
-			// on-disc README depends on that.
+			// names. Both readers depend on it: brb.sh splits these lines with
+			// `awk -F'\t'` and compares field 1 numerically (brb.sh:1392), and
+			// the recipe printed in the on-disc README does the same.
 			name: "disc numbers are not padded", disc: 3,
 			paths: []string{"x"}, want: "3\tx\n",
 		},

@@ -347,6 +347,19 @@ func TestSidecarParityFailureIsOnlyAWarning(t *testing.T) {
 	if !strings.Contains(log.String(), "could not protect the sidecar files on disc 1") {
 		t.Errorf("the failure was not reported:\n%s", log.String())
 	}
+	// And reported again at the end. A real run prints hours of output between
+	// the warning and the summary, and the disc is burned on the strength of
+	// "backup complete": a loss of recovery data that scrolled away is a loss
+	// the operator never learns about until a restore fifteen years later.
+	out := log.String()
+	i := strings.LastIndex(out, "backup complete")
+	if i < 0 {
+		t.Fatalf("the run never reported completion:\n%s", out)
+	}
+	tail := out[i:]
+	if !strings.Contains(tail, "no sidecar recovery data on disc(s) 1") {
+		t.Errorf("the closing summary does not name the disc that lost its sidecar parity:\n%s", tail)
+	}
 
 	dirs := cfg.Dirs()
 	total := discCount(t, dirs.Discs)
@@ -937,12 +950,20 @@ func TestAdaptingTheRatioNeedsFewerDiscs(t *testing.T) {
 	}
 }
 
-// TestIncompressibleContentHoldsTheRatioAtOne is the other direction, and the
-// one that would have been catastrophic to get wrong: content that does not
-// compress must leave the estimate at the ceiling. An estimate that collapsed
-// to the clamp floor here — the bash bug — would plan fifty disc-budgets of
-// files onto the next disc, build the image, reject it and rebuild it.
-func TestIncompressibleContentHoldsTheRatioAtOne(t *testing.T) {
+// TestIncompressibleContentHoldsTheRatioAtTheTop is the other direction, and
+// the one that would have been catastrophic to get wrong: content that does
+// not compress must leave the estimate at the top of its range. An estimate
+// that collapsed to the clamp floor here — the bash bug — would plan fifty
+// disc-budgets of files onto the next disc, build the image, reject it and
+// rebuild it.
+//
+// "The top" is measured*margin and not 1.000. A squashfs of incompressible
+// content is slightly LARGER than the bytes that went into it (stored blocks,
+// plus the inode, directory and fragment tables, plus padding), so planning
+// the next disc at exactly 1.000 plans it to overshoot, and an overshoot costs
+// a second full mksquashfs pass over the whole disc. The margin is what keeps
+// that from happening once per disc for a set of photos or video.
+func TestIncompressibleContentHoldsTheRatioAtTheTop(t *testing.T) {
 	ctx := context.Background()
 	set := realTools(t, ctx)
 	noSystemDist(t)
@@ -973,8 +994,13 @@ func TestIncompressibleContentHoldsTheRatioAtOne(t *testing.T) {
 			t.Errorf("measured ratio %q on incompressible content", m[1])
 		}
 	}
-	if strings.Contains(out, "pack ratio 1.000 ->") {
-		t.Errorf("the ratio moved off 1.0 on incompressible content:\n%s", out)
+	// Every move the estimator makes must be upward. Downward on this content
+	// is the bash bug, and 1.000 exactly is the clamp that used to discard the
+	// shrink retry's correction and buy a rebuild on every disc.
+	for _, m := range regexp.MustCompile(`pack ratio [0-9.]+ -> ([0-9.]+)`).FindAllStringSubmatch(out, -1) {
+		if v, err := strconv.ParseFloat(m[1], 64); err != nil || v <= 1.0 {
+			t.Errorf("the estimate moved to %q on incompressible content, want a ratio above 1.0:\n%s", m[1], out)
+		}
 	}
 	// No overshoot, therefore no rebuild: the estimate never planned more onto
 	// a disc than fitted.

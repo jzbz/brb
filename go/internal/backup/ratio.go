@@ -9,13 +9,27 @@ import (
 	"github.com/jzbz/brb/internal/ui"
 )
 
-// The bounds the adaptive estimate is clamped to, matching brb.sh's awk.
+// The bounds a measurement is clamped to before the estimate is made.
 //
 // The ceiling is the safe assumption brb starts from: nothing compresses. The
 // floor is there because the raw budget is the image budget divided by the
 // ratio, so an estimate of 0.001 would plan a thousand disc-budgets of content
 // into one disc and pay for it with a rebuild of every gigabyte of it. 0.02 is
 // already a 50:1 estimate, which is past anything real content achieves.
+//
+// The ceiling clamps the MEASUREMENT and not the estimate, and that
+// distinction is the whole of a defect this once had. An image can come out
+// LARGER than the raw bytes it was built from — squashfs stores incompressible
+// blocks verbatim and adds inode, directory and fragment tables plus padding
+// on top — which is exactly why buildImage's shrink loop exists and why it
+// re-packs at measured*1.05. Clamping the finished estimate at 1.0 threw that
+// correction away the moment the retry succeeded: adapt would drop the ratio
+// back to 1.000 for the next disc, which then overshot in precisely the same
+// way and rebuilt its whole multi-gigabyte image again, once per disc, for a
+// set of already-compressed content. Capping the measurement instead leaves
+// the margin to do its job above 1.0 as it does everywhere else, so the
+// estimator lands on the same ratio the shrink loop would have had to
+// discover the expensive way.
 const (
 	ratioFloor = 0.02
 	ratioCeil  = 1.0
@@ -87,11 +101,14 @@ func (e *ratioEstimator) carry(measured []float64) []float64 {
 // recent returns the measurements the estimate is taken from: the last window
 // entries, or all of them when fewer than that exist.
 //
-// This is the one place the bash implementation got wrong, and it got it wrong
-// in the direction that destroys a run rather than the direction that wastes a
-// disc: its negative slice offset yielded NOTHING when the array was shorter
-// than the window, so awk saw no input, and the estimate collapsed to the clamp
-// floor regardless of what had been measured. On content compressing to 0.9
+// This is the one place the shell writer that preceded this package got wrong
+// — brb.sh is the reader now and has no packer, so the bug is not findable
+// there; it is recorded here because the shape of it is easy to reintroduce.
+// It got it wrong in the direction that destroys a run rather than the
+// direction that wastes a disc: its negative slice offset yielded NOTHING when
+// the array was shorter than the window, so awk saw no input, and the estimate
+// collapsed to the clamp floor regardless of what had been measured. On
+// content compressing to 0.9
 // that plans fifty disc-budgets of files onto one disc, and every one of them
 // is written, measured, rejected and rebuilt. A window shorter than its limit
 // must be the whole list.
@@ -131,15 +148,24 @@ func (e *ratioEstimator) observe(measured float64) (next float64, window []float
 			worst = r
 		}
 	}
-	next = worst * e.margin
-	if next > ratioCeil {
-		next = ratioCeil
+	// Clamp the measurement, then apply the margin — see [ratioCeil] for why
+	// the order is the point. A measurement above the ceiling is a tree whose
+	// squashfs metadata outweighs its file bytes; the shrink loop handles that
+	// one disc at a time rather than letting a single freak measurement decide
+	// how the whole rest of the set is packed.
+	if worst > ratioCeil {
+		worst = ratioCeil
 	}
+	next = worst * e.margin
+	// The floor stays on the estimate rather than on the measurement: it is a
+	// statement about the raw budget this returns (never more than fifty
+	// disc-budgets of content planned into one disc), not about what a disc
+	// can plausibly have compressed to.
 	if next < ratioFloor {
 		next = ratioFloor
 	}
-	// brb.sh formats the result to three decimals; reproducing the rounding
-	// keeps the two implementations planning identical discs.
+	// Three decimals, so the ratio the operator reads in the log is the ratio
+	// the budget was actually derived from.
 	return round3(next), append([]float64(nil), w...), true
 }
 

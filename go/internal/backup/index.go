@@ -19,10 +19,11 @@ import (
 // resumed run can carry on appending to it.
 const indexFileName = "index.tsv"
 
-// writeIndexLines serialises one disc's file list in brb.sh's index format:
+// writeIndexLines serialises one disc's file list in the on-disc index format:
 // the disc number, a tab, the escaped path relative to the source directory,
-// and a newline. The format is deliberately unchanged from the shell version so
-// that an index written by either implementation reads with the other.
+// and a newline. This one IS frozen — brb.sh parses these lines to answer
+// "which disc holds this file", and xcompat-test.sh holds the two readers to
+// the same answers — so it changes only when the on-disc format does.
 //
 // The path is escaped by [indexfmt.EscapePath], so a tab or a newline in a
 // filename can neither add a field nor split one file over two rows. Writing
@@ -223,9 +224,12 @@ func rewriteIndex(ctx context.Context, path string, maxDisc int) (sum indexSumma
 	return sum, nil
 }
 
-// gzipFile compresses src to dst at maximum compression, matching brb.sh's
-// `gzip -9 -c`. The output is written to dst+".part" and renamed, so dst never
-// exists half-written.
+// gzipFile compresses src to dst at maximum compression. The output is written
+// to dst+".part" and renamed, so dst never exists half-written.
+//
+// That it is gzip at all is part of the on-disc format: brb.sh reads the index
+// with `gunzip -c`. The LEVEL is not — a decompressor cannot tell — so -9 is
+// only a choice about a file of a few hundred kilobytes.
 //
 // gzip rather than zstd, and deliberately so. The disc images use zstd because
 // the KERNEL decompresses them on mount, so it costs no userspace dependency.

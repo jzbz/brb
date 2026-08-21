@@ -77,3 +77,37 @@ func TestLockStagingIsNotBlockedByADeadHolder(t *testing.T) {
 	}
 	again.Release()
 }
+
+// The lock file is opened O_RDWR|O_CREAT and then truncated, so a symlink
+// planted at <STAGING>/.brb.lock is a request to empty whatever it points at,
+// with this run's privileges — root's, under the sudo run the README
+// recommends. STAGING's default lives under a world-writable /var/tmp, so the
+// planter needs no privilege of their own.
+//
+// LockStaging does not assume its caller secured the directory first: the
+// refusal has to come from the open itself. iso.Build reached this function
+// without a SecureStaging in front of it, and "every caller remembers" is not
+// a property a file-truncating open should depend on.
+func TestLockStagingRefusesASymlinkedLockFile(t *testing.T) {
+	dir := t.TempDir()
+	victim := filepath.Join(dir, "victim")
+	const contents = "the operator's file, which this run has no business touching"
+	if err := os.WriteFile(victim, []byte(contents), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(victim, filepath.Join(dir, LockName)); err != nil {
+		t.Fatal(err)
+	}
+
+	l, err := LockStaging(dir)
+	if err == nil {
+		l.Release()
+		t.Fatal("LockStaging opened through a symlink planted at the lock path")
+	}
+	if !strings.Contains(err.Error(), "is a symlink") || !strings.Contains(err.Error(), victim) {
+		t.Errorf("LockStaging = %v, want a refusal naming the link and its target", err)
+	}
+	if got, _ := os.ReadFile(victim); string(got) != contents {
+		t.Fatalf("the planted symlink was followed: the victim now holds %q", got)
+	}
+}

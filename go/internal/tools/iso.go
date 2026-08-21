@@ -12,12 +12,15 @@ import (
 
 // MakeISO builds one ISO 9660 image from ISOOptions.Dir.
 //
-// brb.sh runs "xorriso ... | grep -v ... || true", which discards xorriso's
-// exit status twice over: the pipeline reports grep's status, and "|| true"
-// throws even that away. Here the noise is filtered line by line inside this
-// process (see KeepISOLine) while the child's real exit status is checked, and
-// the output is confirmed to be a non-empty file. A partial ISO is removed when
-// the build fails or the context is cancelled.
+// xorriso is chatty enough that the natural thing to write is
+// "xorriso ... | grep -v ... || true" — and that discards its exit status twice
+// over: the pipeline reports grep's status, and the "|| true" that stops grep's
+// own "no lines matched" from failing the build throws even that away. A failed
+// burn image then looks exactly like a successful one. Here the noise is
+// filtered line by line inside this process (see KeepISOLine) while the child's
+// real exit status is checked, and the output is confirmed to be a non-empty
+// file. A partial ISO is removed when the build fails or the context is
+// cancelled.
 func (s *Set) MakeISO(ctx context.Context, o ISOOptions) error {
 	path, err := s.bin(Xorriso)
 	if err != nil {

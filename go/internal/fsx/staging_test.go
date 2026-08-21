@@ -325,3 +325,69 @@ func TestSecureDirRefusesASymlinkSpelledWithATrailingSlash(t *testing.T) {
 		t.Errorf("SecureDir = %v, want the symlink refusal", err)
 	}
 }
+
+// TestSecureDirRefusesASymlinkPlantedAfterTheCheck is the reason SecureDir
+// works through a descriptor rather than through the path.
+//
+// The refusal above is an Lstat, and an Lstat only describes what the name
+// meant at the moment it ran. When STAGING is the documented default under a
+// world-writable /var/tmp and does not exist yet — the state after every
+// install, and after every "rm -rf staging" the tool itself advises — a local
+// user can loop `ln -s /etc <STAGING>` and land the link in the gap. The old
+// code then did three more lookups by name: MkdirAll accepted the link's
+// target as an existing directory, chmod 0700 landed on that target, and the
+// ownership rule passed anyway because under the recommended sudo run the
+// target is root's too. The hook plants the link in exactly that gap, so the
+// interleaving is a fact of the test rather than a race it has to win.
+func TestSecureDirRefusesASymlinkPlantedAfterTheCheck(t *testing.T) {
+	base := t.TempDir()
+	victim := filepath.Join(base, "victim")
+	if err := os.Mkdir(victim, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	staging := filepath.Join(base, "staging")
+
+	planted := false
+	testHookAfterLstat = func() {
+		if planted {
+			return
+		}
+		planted = true
+		if err := os.Symlink(victim, staging); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Cleanup(func() { testHookAfterLstat = nil })
+
+	err := SecureDir(staging)
+	if err == nil || !strings.Contains(err.Error(), "is a symlink") {
+		t.Fatalf("SecureDir = %v, want the symlink refusal for a link planted after the Lstat", err)
+	}
+	// A refusal is worth little if the damage was done on the way to it: the
+	// chmod through the link is what locks a directory nobody asked about.
+	fi, serr := os.Stat(victim)
+	if serr != nil {
+		t.Fatal(serr)
+	}
+	if fi.Mode().Perm() != 0o755 {
+		t.Errorf("the link's target is now %o: it was chmodded through the planted symlink", fi.Mode().Perm())
+	}
+}
+
+// TestSecureDirCreatesMissingParents pins that splitting MkdirAll (the
+// parents) from Mkdir (the directory itself) did not cost the ordinary case:
+// STAGING is operator-typed and may name a path several levels below anything
+// that exists.
+func TestSecureDirCreatesMissingParents(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "one", "two", "three")
+	if err := SecureDir(dir); err != nil {
+		t.Fatalf("SecureDir: %v", err)
+	}
+	fi, err := os.Stat(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !fi.IsDir() || fi.Mode().Perm() != 0o700 {
+		t.Errorf("%s is %v, want a 0700 directory", dir, fi.Mode())
+	}
+}

@@ -32,12 +32,13 @@ const docsAllowance = 2 << 20
 
 // measureDiscOverhead reports what each disc will carry besides its data.
 //
-// This is the whole point of HL-4: brb.sh's self-copy is a ~114 KB shell script
-// and this program's is a ~8 MB static binary, so the same
-// (DISC_CAPACITY_BYTES, RESERVE_BYTES) pair can be comfortable for one
-// implementation and impossible for the other. Discovering that after building
-// every image — which is where checkDiscSizes sits — wastes hours. Measure it
-// before anything is built instead.
+// This is the whole point of HL-4. What a disc carries besides its data is not
+// one small file: it is brb.sh (about 90 KB), a static brb binary of several
+// megabytes for each architecture in the dist payload, and the source tarball
+// — so a RESERVE_BYTES that was set for a lighter payload, or copied from an
+// older configuration, can be impossible without anything saying so.
+// Discovering that after building every image — which is where checkDiscSizes
+// sits — wastes hours. Measure it before anything is built instead.
 //
 // Errors are never fatal: a payload we cannot stat is simply not counted, and
 // the late check still catches anything this misses.
@@ -84,10 +85,11 @@ func containsName(entries []string, name string) bool {
 // plan that reports N discs is a plan that will actually finish.
 //
 // It deliberately does NOT adjust the image budget to make room. That budget is
-// what decides how files are packed into discs, and changing it here would make
-// this implementation lay out a set differently from brb.sh for the same input.
-// The operator raises RESERVE_BYTES (or the capacity) instead, and both
-// implementations then agree.
+// what decides how files are packed into discs, so silently shrinking it here
+// would mean two runs of the same configuration over the same tree could
+// produce different sets depending on how big the payload happened to be that
+// day. The operator raises RESERVE_BYTES (or the capacity) instead, and the
+// layout stays a function of the configuration alone.
 func (r *runner) checkReserve() error {
 	d := r.measureDiscOverhead()
 	if d.Total() <= r.cfg.ReserveBytes {
@@ -96,8 +98,8 @@ func (r *runner) checkReserve() error {
 	need := d.Total()
 	return fmt.Errorf("backup: every disc carries %s of tool and documentation "+
 		"(%v) but RESERVE_BYTES is only %s. Set RESERVE_BYTES=%d (or larger) and re-run.\n"+
-		"  Note this program's copy of itself is a static binary of a few megabytes, where "+
-		"brb.sh's is a shell script of a few hundred kilobytes, so a configuration that "+
-		"fits the shell version can still be too tight for this one",
+		"  Most of that is the brb binaries, which are static and a few megabytes each: "+
+		"a DIST_DIR carrying more architectures needs a larger reserve than one carrying "+
+		"fewer, and the default was chosen for the shipped payload",
 		ui.HumanBytes(d.Total()), d.Names, ui.HumanBytes(r.cfg.ReserveBytes), need)
 }

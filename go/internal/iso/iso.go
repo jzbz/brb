@@ -35,9 +35,14 @@ import (
 )
 
 // slack is the headroom demanded on top of the source tree before an ISO is
-// built, matching brb.sh's 67108864: an ISO is slightly larger than the tree it
-// is made from, and a staging filesystem that fills up mid-write leaves a
-// truncated image behind.
+// built: an ISO is slightly larger than the tree it is made from, and a staging
+// filesystem that fills up mid-write leaves a truncated image behind.
+//
+// The 64 MiB figure is inherited from the shell writer this package replaced.
+// That writer is not in this tree — brb.sh here is the READER only (brb.sh:3-8)
+// — so nothing cross-checks the number and it is now this build's own
+// definition. It is not part of the on-disc format: it only has to cover the
+// ISO 9660 metadata a tree of any realistic size adds.
 const slack = 64 << 20
 
 // Options carries the dependencies building an ISO needs.
@@ -67,8 +72,11 @@ func (o Options) check() error {
 	return nil
 }
 
-// Name returns one disc's ISO file name, e.g. "disc07.iso". It is part of the
-// staging layout shared with brb.sh.
+// Name returns one disc's ISO file name, e.g. "disc07.iso". The zero-padded
+// "disc%02d" stem is the numbering the whole staging layout uses — the reader
+// looks for disc07.squashfs.age and sidecars-disc07.par2 by the same rule — but
+// the ISO is a burn-time artefact that never reaches a disc, so no reader ever
+// names this file.
 func Name(n int) string { return fmt.Sprintf("disc%02d.iso", n) }
 
 // dirName returns one disc's staging directory name, e.g. "disc07".
@@ -87,12 +95,13 @@ func (o Options) sourceDir(n int) string { return filepath.Join(o.Cfg.Dirs().Dis
 // 20"), so a burn or an iso run started days later must resolve it from
 // MANIFEST.txt rather than from whatever is in staging; see Total.
 //
-// Every check brb.sh makes is made here. There is room for the image before
-// xorriso is started; xorriso's exit status is checked rather than swallowed by
-// a pipeline; a partial ISO is removed on failure; and the finished file is
-// held to both bounds that catch a truncated write — an ISO is never smaller
-// than the tree it was built from, and never larger than the media it is going
-// onto.
+// The four checks below are the ones a shell pipeline around xorriso cannot
+// make, and each of them is here because its absence is silent. There is room
+// for the image before xorriso is started; xorriso's exit status is checked
+// rather than swallowed by a pipeline; a partial ISO is removed on failure; and
+// the finished file is held to both bounds that catch a truncated write — an
+// ISO is never smaller than the tree it was built from, and never larger than
+// the media it is going onto.
 func (o Options) BuildOne(ctx context.Context, n, total int) error {
 	if err := o.check(); err != nil {
 		return err
@@ -170,8 +179,8 @@ func (o Options) BuildOne(ctx context.Context, n, total int) error {
 }
 
 // RoomFor reports whether avail bytes are enough to write an ISO of a tree of
-// srcSize bytes, with brb.sh's 64 MiB of headroom on top. It is exported so the
-// rule is testable without filling a filesystem up.
+// srcSize bytes, with [slack]'s 64 MiB of headroom on top. It is exported so
+// the rule is testable without filling a filesystem up.
 func RoomFor(avail, srcSize int64) bool {
 	need := srcSize + slack
 	if need < srcSize { // overflow; nothing is ever this large, but do not wrap
@@ -193,9 +202,10 @@ func (o Options) remove(path string) {
 // successful burn it has been deleted again; either way the disc directory is
 // still in staging, so this builds from that rather than refusing.
 //
-// A file that is there is held to the same completeness bound BuildOne holds a
-// fresh one to: an ISO is never smaller than the disc directory it was built
-// from. A zero-length file, or one that is shorter than its tree, is the
+// A file that is there is held to the same two bounds BuildOne holds a fresh
+// one to: an ISO is never smaller than the disc directory it was built from,
+// and never larger than the media this run is configured for. A zero-length
+// file, or one that is shorter than its tree, is the
 // remains of a run that died while writing it — power loss part-way through a
 // 22 GiB xorriso run leaves 6 GiB that passes every "is it there" test — and
 // rebuilding it is strictly better than burning it. It used to be enough for
@@ -227,10 +237,19 @@ func (o Options) Ensure(ctx context.Context, n, total int) (string, error) {
 	return path, nil
 }
 
-// complete reports whether an existing ISO of size bytes is at least as large
-// as the disc directory it was built from, which is the bound BuildOne applies
-// to a fresh one. A missing disc directory counts as complete — see Ensure —
-// and a short file is reported, with why it will be rebuilt.
+// complete reports whether an existing ISO of size bytes passes both bounds
+// BuildOne applies to a fresh one. A missing disc directory counts as complete
+// — see Ensure — and a short file is reported, with why it will be rebuilt.
+//
+// The upper bound is an error rather than a rebuild, which is the one place
+// this differs from BuildOne. An ISO that is too big for the media was built
+// for larger media: rebuilding it from the same disc directory would spend the
+// whole build only to hit BuildOne's own capacity refusal, and that refusal
+// deletes the image, throwing away an ISO that is still perfectly good for the
+// blanks it was made for. Refusing here instead keeps the file and says which
+// setting to change. Without it, Ensure applied only the lower bound and burn
+// handed the oversized image straight to xorriso — the operator found out with
+// a blank already in the tray.
 func (o Options) complete(ctx context.Context, n int, size int64) (bool, error) {
 	src := o.sourceDir(n)
 	if st, err := os.Stat(src); err != nil || !st.IsDir() {
@@ -240,12 +259,18 @@ func (o Options) complete(ctx context.Context, n int, size int64) (bool, error) 
 	if err != nil {
 		return false, fmt.Errorf("iso: %w", err)
 	}
-	if size >= srcSize {
-		return true, nil
+	if size < srcSize {
+		o.UI.Warn("%s is %s but its disc directory holds %s — the file is truncated (a run died while "+
+			"writing it); rebuilding it rather than burning it", Name(n), ui.HumanBytes(size), ui.HumanBytes(srcSize))
+		return false, nil
 	}
-	o.UI.Warn("%s is %s but its disc directory holds %s — the file is truncated (a run died while "+
-		"writing it); rebuilding it rather than burning it", Name(n), ui.HumanBytes(size), ui.HumanBytes(srcSize))
-	return false, nil
+	if capacity := o.Cfg.Capacity(); capacity > 0 && size > capacity {
+		return false, fmt.Errorf("iso: disc %d ISO is %s, larger than the %s media this run is "+
+			"configured for — it was built for larger media, so set DISC_TYPE (or "+
+			"DISC_CAPACITY_BYTES) to match the blanks you are burning, or delete %s and let "+
+			"this run rebuild it", n, ui.HumanBytes(size), ui.HumanBytes(capacity), o.Path(n))
+	}
+	return true, nil
 }
 
 // BuildAll builds the ISOs of discs 1..total, which is what ISO_MODE=eager does
@@ -282,6 +307,25 @@ func Build(ctx context.Context, o Options, spec string) error {
 	}
 	if len(nums) == 0 {
 		return fmt.Errorf("iso: no disc directories in %s — run 'brb backup' first", o.Cfg.Dirs().Discs)
+	}
+	// Secure before locking, because the lock file is created inside the tree
+	// and [fsx.LockStaging] says so in its own contract: it opens .brb.lock
+	// with a plain O_RDWR|O_CREATE and then truncates it, so a symlink planted
+	// at that name is followed and its target is destroyed. Nothing stops that
+	// but [fsx.SecureDir] having already refused a staging root that is a
+	// symlink or belongs to another account — and the README's default STAGING
+	// lives under a world-writable /var/tmp, where any local account can create
+	// the tree ahead of the operator.
+	//
+	// `brb iso` was the one staging-writing command that skipped this; backup
+	// secures in preflight and burn/restore secure in their own lockStaging, so
+	// the refusal here is the same one those commands already make rather than
+	// new behaviour. The ISO directory is secured alongside the root because
+	// BuildOne creates it with os.MkdirAll, whose mode reaches only what it
+	// makes: an iso/ the operator made by hand keeps whatever the umask gave
+	// it, and it holds a full second copy of every disc.
+	if err := fsx.SecureStaging(o.Cfg.Staging, o.Cfg.Dirs().ISO); err != nil {
+		return fmt.Errorf("iso: %w", err)
 	}
 	// Locked here rather than at the top, and the order is the point twice
 	// over. There is nowhere to put a lock file until staging exists, and
@@ -432,11 +476,15 @@ type Range struct {
 	From, To int
 }
 
-// rangeMax stands in for "no upper bound", matching brb.sh's 9999.
+// rangeMax stands in for "no upper bound". The value is inherited from the
+// shell writer this package replaced and is not a limit on anything: it only
+// has to exceed any disc count a set could plausibly have, and nothing on a
+// disc records it.
 const rangeMax = 9999
 
-// ParseRange reads brb.sh's disc selection syntax: "all", a single number "7",
-// a closed range "7-20", or an open one "7-" meaning "seven onwards".
+// ParseRange reads the disc selection the `iso` and `burn` commands take:
+// "all", a single number "7", a closed range "7-20", or an open one "7-"
+// meaning "seven onwards".
 //
 // It only parses; nothing here knows which discs exist, so a range naming discs
 // that are not in staging is not an error until the caller finds nothing in it.

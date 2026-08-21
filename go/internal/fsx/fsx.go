@@ -7,12 +7,24 @@
 // use them — the backup checks a disc directory against the media, the ISO
 // builder checks the same tree against the free space it needs to copy it.
 //
-// The rest are the staging area's safety rules — [SecureStaging], [SecureDir],
-// [CreateFresh], [OpenAppend]. The writer and the reader share one staging
-// tree layout and one threat: its default lives under a world-writable
-// /var/tmp, and it holds plaintext. These rules used to be written once per
-// caller, and each rewrite lost a piece of them, which is why they are here
-// and not there.
+// Most of the rest are the staging area's safety rules — [SecureStaging],
+// [SecureDir], [CreateFresh], [OpenAppend], with [FileOwner] under them. The
+// writer and the reader share one staging tree layout and one threat: its
+// default lives under a world-writable /var/tmp, and it holds plaintext. These
+// rules used to be written once per caller, and each rewrite lost a piece of
+// them, which is why they are here and not there.
+//
+// One more is exclusion rather than a rule: [LockStaging] holds an flock on
+// the staging root for as long as a run lasts, so two brb processes cannot
+// build into one tree. It is the newest thing here and the least visible in
+// its absence — see [LockStaging] for why a set built by two runs at once
+// verifies clean and does not restore.
+//
+// This package is Unix-only, as internal/scan and internal/backup are: the
+// rules above are made of flock(2), O_NOFOLLOW, fchmod(2) and statfs(2), and
+// there is no useful way to fake any of them. There are no non-Unix stubs, on
+// purpose — a build in which the staging lock quietly does nothing is worse
+// than no build at all.
 package fsx
 
 import (
@@ -22,9 +34,10 @@ import (
 	"path/filepath"
 )
 
-// DirBytes sums the apparent size of every regular file beneath dir, which is
-// what brb.sh measures with `du -sb --apparent-size`. Directories, symlinks and
-// device nodes count for nothing, matching what ends up in an ISO of the tree.
+// DirBytes sums the apparent size of every regular file beneath dir — the
+// bytes the files contain, not the blocks they occupy. Directories, symlinks
+// and device nodes count for nothing, matching what ends up in an ISO of the
+// tree, which is what every caller is really asking about.
 //
 // ctx is checked once per entry, so a walk of a large tree stops promptly.
 func DirBytes(ctx context.Context, dir string) (int64, error) {

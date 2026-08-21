@@ -136,6 +136,10 @@ func TestBuildRanges(t *testing.T) {
 
 // TestBuildWithoutADiscSet refuses rather than producing an empty ISO
 // directory an operator would then try to burn.
+// TestBuildWithoutADiscSet also pins an ordering the securing pass must not
+// disturb: "run 'brb backup' first" is a far better answer to an empty staging
+// area than a permissions or lock error, so the cheap disc-set check keeps
+// coming before fsx.SecureStaging and fsx.LockStaging.
 func TestBuildWithoutADiscSet(t *testing.T) {
 	o := testOptions(t)
 	needXorriso(t, o)
@@ -306,5 +310,132 @@ func TestEnsureRebuildsATruncatedISO(t *testing.T) {
 	}
 	if !strings.Contains(log.String(), "truncated") {
 		t.Errorf("the rebuild was not explained to the operator:\n%s", log.String())
+	}
+}
+
+// TestBuildRefusesASymlinkedStagingRootBeforeTakingTheLock is the `iso`
+// command's half of the staging rules, and it is about ORDER as much as about
+// the refusal. Build used to go straight from "are there disc directories?" to
+// fsx.LockStaging, which is the one thing fsx.LockStaging's own contract says
+// not to do: it creates .brb.lock with a plain O_RDWR|O_CREATE and truncates it,
+// so a symlink planted at that name is followed and the target destroyed. On
+// the README's default STAGING under a world-writable /var/tmp, a local account
+// can lay the whole tree — root and lock file both — before the operator's first
+// run. Backup secures in preflight and burn/restore secure in their own
+// lockStaging; `brb iso` was the one staging-writing command that did not, and
+// the file below is what that cost.
+func TestBuildRefusesASymlinkedStagingRootBeforeTakingTheLock(t *testing.T) {
+	o := testOptions(t)
+	stageDiscs(t, o, 1)
+
+	victim := filepath.Join(t.TempDir(), "bashrc")
+	const content = "# the operator's file, which must still be here afterwards\n"
+	if err := os.WriteFile(victim, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(victim, filepath.Join(o.Cfg.Staging, fsx.LockName)); err != nil {
+		t.Fatal(err)
+	}
+	// Point STAGING at the tree through a symlink, which is the first of
+	// SecureDir's three rules and the one a test can arrange without a second
+	// uid. Securing has to happen before the lock is opened, so a Build that
+	// reaches LockStaging at all truncates the victim.
+	link := filepath.Join(t.TempDir(), "staging-link")
+	if err := os.Symlink(o.Cfg.Staging, link); err != nil {
+		t.Fatal(err)
+	}
+	o.Cfg.Staging = link
+
+	err := Build(context.Background(), o, "all")
+	if err == nil {
+		t.Fatal("Build over a symlinked STAGING = nil, want the same refusal backup and burn make")
+	}
+	if !strings.Contains(err.Error(), "symlink") {
+		t.Errorf("Build over a symlinked STAGING = %v, want an error naming the symlink", err)
+	}
+	got, readErr := os.ReadFile(victim)
+	if readErr != nil {
+		t.Fatalf("the symlink target is gone: %v", readErr)
+	}
+	if string(got) != content {
+		t.Fatalf("the staging lock was opened before the tree was secured and truncated the "+
+			"operator's file: %q", got)
+	}
+}
+
+// TestBuildTightensALooseStagingRoot is the same defect with no attacker in it.
+// BuildOne creates the ISO directory with os.MkdirAll, whose mode reaches only
+// what it makes, so a staging tree the operator laid out by hand under a loose
+// umask kept those permissions for the whole run — while holding a full second
+// copy of every disc in the clear. Securing forces 0700 whether or not the
+// directory was just created, which is precisely the rule MkdirAll does not
+// have.
+func TestBuildTightensALooseStagingRoot(t *testing.T) {
+	o := testOptions(t)
+	needXorriso(t, o)
+	stageDiscs(t, o, 1)
+	if err := os.MkdirAll(o.Cfg.Dirs().ISO, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(o.Cfg.Staging, 0o777); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := Build(context.Background(), o, "all"); err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	for _, dir := range []string{o.Cfg.Staging, o.Cfg.Dirs().ISO} {
+		st, err := os.Stat(dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if perm := st.Mode().Perm(); perm != 0o700 {
+			t.Errorf("%s is %o after Build, want 0700 — it holds a full copy of every disc", dir, perm)
+		}
+	}
+}
+
+// TestEnsureRefusesAnISOTooLargeForTheMedia holds an ISO that is already on disk
+// to the upper bound BuildOne holds a fresh one to. Ensure used to apply only
+// the lower bound, so an image built for 100 GB BD-R XL was handed to the burner
+// unchanged after DISC_TYPE was changed to a 25 GB bd-r — the operator found out
+// from xorriso with a blank already in the tray. The existing file must survive
+// the refusal: it is still exactly right for the media it was built for, and
+// rebuilding it would only hit BuildOne's own capacity check hours later.
+func TestEnsureRefusesAnISOTooLargeForTheMedia(t *testing.T) {
+	ctx := context.Background()
+	o := testOptions(t)
+	needXorriso(t, o)
+	stageDiscs(t, o, 1)
+
+	path, err := o.Ensure(ctx, 1, 1)
+	if err != nil {
+		t.Fatalf("Ensure: %v", err)
+	}
+	built, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Now the same staging tree, with media too small for what is in it.
+	o.Cfg.DiscCapacityBytes = built.Size() - 1
+	if _, err := o.Ensure(ctx, 1, 1); err == nil {
+		t.Fatal("Ensure returned an ISO larger than the configured media")
+	} else if !strings.Contains(err.Error(), "larger than the") {
+		t.Errorf("Ensure = %v, want an error naming the media size", err)
+	}
+	after, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("the oversized ISO was deleted rather than refused: %v", err)
+	}
+	if after.Size() != built.Size() {
+		t.Errorf("the existing ISO was rewritten: %d bytes, was %d", after.Size(), built.Size())
+	}
+
+	// Capacity 0 means "media size unknown", and the bound is not applied then.
+	o.Cfg.DiscCapacityBytes = 0
+	o.Cfg.DiscType = ""
+	if got, err := o.Ensure(ctx, 1, 1); err != nil || got != path {
+		t.Errorf("Ensure with no known capacity = %q, %v; want the existing ISO", got, err)
 	}
 }

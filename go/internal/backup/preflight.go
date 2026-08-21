@@ -97,9 +97,9 @@ func (r *runner) requireTools(ctx context.Context) error {
 				r.cfg.Compression, strings.Join(comps, ", "))
 		}
 	}
-	// brb.sh passes -Xcompression-level only for zstd and gzip and says nothing
-	// when the setting is dropped, so a run configured for xz at level 19
-	// silently used the default. Say so.
+	// mksquashfs takes -Xcompression-level for zstd and gzip and not for the
+	// others, and says nothing when the flag is absent — so a run configured
+	// for xz at level 19 silently uses the default. Say so.
 	if r.cfg.CompressionLevel != 0 && !tools.NoCompression(r.cfg.Compression) &&
 		!tools.LevelApplies(r.cfg.Compression) {
 		r.p.Warn("COMPRESSION_LEVEL=%d is ignored for %s: mksquashfs takes -Xcompression-level "+
@@ -250,7 +250,9 @@ func (r *runner) publicIdentityPath() string {
 }
 
 // readPubkeys returns the age1 public keys of a recipients file verbatim, for
-// the manifest. brb.sh records them with `grep '^age1'`.
+// the manifest — verbatim because the manifest's job is to tell a restorer
+// which key opens this set, and a re-encoded or re-wrapped key is one they
+// cannot compare with the one in their own keyring.
 func readPubkeys(path string) ([]string, error) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -374,7 +376,8 @@ func (r *runner) checkSpace() error {
 	need := RequiredSpace(r.budget.Image, r.cfg.Par2Redundancy)
 	if avail < need {
 		return fmt.Errorf("backup: not enough free space in %s: need %s, have %s "+
-			"(one plaintext image, one round-trip copy, and one ciphertext with %d%% parity)",
+			"(one plaintext image and, beside it, one ciphertext with %d%% parity — "+
+			"the plaintext is not removed until the ciphertext is written and verified)",
 			r.cfg.Staging, ui.HumanBytes(need), ui.HumanBytes(avail), r.cfg.Par2Redundancy)
 	}
 	perDisc := r.budget.Image * int64(100+r.cfg.Par2Redundancy) / 100

@@ -3,6 +3,8 @@ package backup
 import (
 	"bytes"
 	"context"
+	"crypto/sha512"
+	"encoding/hex"
 	"errors"
 	"io"
 	"math"
@@ -14,9 +16,11 @@ import (
 
 	"filippo.io/age"
 
+	"github.com/jzbz/brb/internal/agecrypt"
 	"github.com/jzbz/brb/internal/config"
 	"github.com/jzbz/brb/internal/disc"
 	"github.com/jzbz/brb/internal/iso"
+	"github.com/jzbz/brb/internal/pack"
 	"github.com/jzbz/brb/internal/scan"
 	"github.com/jzbz/brb/internal/ui"
 )
@@ -32,19 +36,20 @@ func TestRequiredSpace(t *testing.T) {
 		redundancy int
 		want       int64
 	}{
-		// Two plaintext-sized copies (the image and its round-trip check) plus
-		// one ciphertext with its parity.
-		{name: "no parity", image: 1000, redundancy: 0, want: 3000},
-		{name: "ten percent", image: 1000, redundancy: 10, want: 3100},
-		{name: "hundred percent", image: 1000, redundancy: 100, want: 4000},
+		// One plaintext image and, beside it, one ciphertext with its parity —
+		// the two that exist at the same moment. The round-trip check adds
+		// nothing: it hashes the decrypted stream and stores none of it.
+		{name: "no parity", image: 1000, redundancy: 0, want: 2000},
+		{name: "ten percent", image: 1000, redundancy: 10, want: 2100},
+		{name: "hundred percent", image: 1000, redundancy: 100, want: 3000},
 		{
 			// A real bd25 budget at the shipped defaults.
 			name: "bd25 default", image: 21999955782, redundancy: 10,
-			want: 2*21999955782 + 21999955782*110/100,
+			want: 21999955782 + 21999955782*110/100,
 		},
 		{name: "zero budget", image: 0, redundancy: 10, want: 0},
 		{name: "negative budget", image: -5, redundancy: 10, want: 0},
-		{name: "negative redundancy is treated as zero", image: 1000, redundancy: -1, want: 3000},
+		{name: "negative redundancy is treated as zero", image: 1000, redundancy: -1, want: 2000},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -56,14 +61,157 @@ func TestRequiredSpace(t *testing.T) {
 	}
 }
 
-func TestRequiredSpaceIsBelowThreeAndAHalfImages(t *testing.T) {
+func TestRequiredSpaceIsBelowTwoAndAHalfImages(t *testing.T) {
 	t.Parallel()
 	// A sanity bound: the requirement must stay proportional to the budget, so
-	// a preflight failure always names a believable number.
+	// a preflight failure always names a believable number. It must also stay
+	// ABOVE two images, because the plaintext and the ciphertext really do
+	// coexist and a floor that forgot one of them would let a run start that
+	// cannot finish its first disc.
 	const image = 21999955782
 	got := RequiredSpace(image, 10)
-	if got < 3*image || got > 4*image {
-		t.Errorf("RequiredSpace = %d, want between %d and %d", got, 3*image, 4*image)
+	if got < 2*image || got > 5*image/2 {
+		t.Errorf("RequiredSpace = %d, want between %d and %d", got, 2*image, 5*image/2)
+	}
+}
+
+// TestRoundTripNeedsNoStagingSpace. The round-trip check wants one thing from
+// the decrypted image: its SHA-512. It used to get that by decrypting to a
+// temporary file in <STAGING>/work — an image-sized sequential write plus an
+// fsync, up to 95 GB on BD-XL media — which nothing ever opened and which was
+// unlinked a moment later.
+//
+// The fixture makes work/ read-only, so a run that writes there at all cannot
+// finish. That is the only way to observe the difference after the fact: the
+// old code deleted its temporary file too, so a check for leftovers passes
+// either way.
+func TestRoundTripNeedsNoStagingSpace(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("skipping: root writes into a read-only directory, so the fixture proves nothing")
+	}
+	ctx := context.Background()
+	id, err := age.GenerateX25519Identity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := runnerFor(t, nil)
+	r.opts.VerifyRoundTrip = true
+	r.identities = []age.Identity{id}
+	for _, d := range []string{r.dirs.Work, r.dirs.Img, r.dirs.Enc} {
+		if err := os.MkdirAll(d, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Content that does not compress, so the ciphertext is a real stream and
+	// not a few bytes of age header.
+	plain := filepath.Join(r.dirs.Img, imageName(1))
+	body := bytes.Repeat([]byte("brb round-trip fixture\n"), 40_000)
+	if err := os.WriteFile(plain, body, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	enc := filepath.Join(r.dirs.Enc, imageName(1)+".age")
+	sums, err := agecrypt.Encrypt(ctx, plain, enc, []age.Recipient{id.Recipient()}, nil)
+	if err != nil {
+		t.Fatalf("Encrypt: %v", err)
+	}
+
+	if err := os.Chmod(r.dirs.Work, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(r.dirs.Work, 0o700) })
+
+	if err := r.roundTrip(ctx, 1, enc, int64(len(body)), sums.Plain); err != nil {
+		t.Fatalf("roundTrip: %v", err)
+	}
+	if left, err := os.ReadDir(r.dirs.Work); err != nil {
+		t.Fatal(err)
+	} else if len(left) != 0 {
+		t.Errorf("%s holds %d file(s) after the round-trip", r.dirs.Work, len(left))
+	}
+
+	// The point of the check survives the change: a digest that does not match
+	// still stops the run before the plaintext is deleted.
+	wrong := strings.Repeat("0", len(sums.Plain))
+	err = r.roundTrip(ctx, 1, enc, int64(len(body)), wrong)
+	if err == nil || !strings.Contains(err.Error(), "round-trip mismatch") {
+		t.Fatalf("roundTrip against the wrong digest = %v, want the mismatch refusal", err)
+	}
+}
+
+// TestWriteSumsTakesTheKnownDigestShortcut pins the single wiring point of the
+// project's largest I/O saving: SHA512SUMS is written from the digests the run
+// already measured while encrypting, instead of re-reading twenty to ninety
+// gigabytes per disc to arrive at the same numbers.
+//
+// The shortcut is keyed by the exact "./data/<name>" strings agecrypt records,
+// built by hand on this side (see knownSums) and by a directory walk on the
+// other. Nothing fails when they stop matching: agecrypt hashes the file the
+// long way and writes a correct SHA512SUMS, so the only symptom is a run that
+// is quietly hours slower. That is why this test plants a digest that is
+// deliberately WRONG for the bytes on disc — it is the one observation that
+// distinguishes "the shortcut was taken" from "the file was hashed".
+func TestWriteSumsTakesTheKnownDigestShortcut(t *testing.T) {
+	ctx := context.Background()
+	r := runnerFor(t, nil)
+	data := filepath.Join(r.dirs.Discs, discDirName(1), "data")
+	if err := os.MkdirAll(data, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(r.dirs.Enc, 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	// The disc directory's copies are hard links to enc/, which is what lets
+	// agecrypt's inode check accept a digest taken from the other name.
+	planted := map[string]string{}
+	for _, name := range []string{imageName(1) + ".age", indexName} {
+		src := filepath.Join(r.dirs.Enc, name)
+		if err := os.WriteFile(src, []byte("ciphertext of "+name), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Link(src, filepath.Join(data, name)); err != nil {
+			t.Fatal(err)
+		}
+		sum := sha512.Sum512([]byte("a digest of something else entirely: " + name))
+		planted["./data/"+name] = hex.EncodeToString(sum[:])
+	}
+	r.discCipher[1] = planted["./data/"+imageName(1)+".age"]
+	r.indexCipher = planted["./data/"+indexName]
+
+	if err := r.writeSums(ctx, 1); err != nil {
+		t.Fatalf("writeSums: %v", err)
+	}
+	sums, err := os.ReadFile(filepath.Join(r.dirs.Discs, discDirName(1), agecrypt.SumsName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, digest := range planted {
+		if !strings.Contains(string(sums), digest+"  "+name) {
+			t.Errorf("SHA512SUMS does not carry the recorded digest for %s — the shortcut's key "+
+				"no longer matches the name agecrypt records, so every disc re-reads its image:\n%s",
+				name, sums)
+		}
+	}
+
+	// The other half of the contract, and the reason the keys can be trusted:
+	// --verify-roundtrip is the operator asking for every byte to be proved
+	// twice, so nothing is shortcut and SHA512SUMS holds the real digests.
+	r.opts.VerifyRoundTrip = true
+	if got := r.knownSums(1); got != nil {
+		t.Errorf("knownSums under --verify-roundtrip = %v, want nothing shortcut", got)
+	}
+	if err := r.writeSums(ctx, 1); err != nil {
+		t.Fatalf("writeSums: %v", err)
+	}
+	sums, err = os.ReadFile(filepath.Join(r.dirs.Discs, discDirName(1), agecrypt.SumsName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, digest := range planted {
+		if strings.Contains(string(sums), digest) {
+			t.Errorf("SHA512SUMS carries the recorded digest for %s under --verify-roundtrip", name)
+		}
 	}
 }
 
@@ -104,7 +252,7 @@ func TestCheckSpace(t *testing.T) {
 	}
 
 	// A budget that cannot possibly fit.
-	big := avail // 2*big alone already exceeds what is available
+	big := avail // one image plus its ciphertext already exceeds what is available
 	r = &runner{cfg: cfg, p: quiet(), budget: disc.Budget{Image: big}}
 	err = r.checkSpace()
 	if err == nil {
@@ -173,9 +321,9 @@ func TestMeasuredRatio(t *testing.T) {
 
 func TestShrinkRatio(t *testing.T) {
 	t.Parallel()
-	// brb.sh computes  ratio = printf "%.3f" (image/raw)  and then
-	// PACK_RATIO = printf "%.3f" (ratio * 1.05). Both roundings are reproduced,
-	// so the two implementations re-pack an over-budget disc identically.
+	// Two roundings, not one: the measured ratio is rounded to three decimals
+	// and the margin is applied to THAT, so the ratio in the log is the ratio
+	// the re-pack used. Collapsing them changes the budget in the last digit.
 	tests := []struct {
 		name       string
 		image, raw int64
@@ -440,6 +588,51 @@ func TestResumeFilterKeepsEverythingOnAFreshRun(t *testing.T) {
 	}
 }
 
+// TestEmptyBinErrorNamesTheFileAndNotPackRatio. When an image overshoots, the
+// shrink loop re-plans the disc at the ratio the content actually achieved —
+// a SMALLER raw budget than the one buildDiscs checked for oversized files. A
+// file between the two budgets therefore gets past the up-front check and is
+// discovered here, with nothing left that fits.
+//
+// The message this path used to print told the operator to "lower PACK_RATIO
+// manually". That is inert: the budget here comes from the measured ratio, so
+// a re-run at any PACK_RATIO packs the same bin, measures the same overshoot
+// and stops in exactly the same place. The operator has to be told which file
+// it is and what actually works.
+func TestEmptyBinErrorNamesTheFileAndNotPackRatio(t *testing.T) {
+	t.Parallel()
+	p := pack.New([]scan.Entry{
+		{Rel: "media/one-big-mkv", Kind: scan.KindFile, Size: 900},
+		{Rel: "media/notes.txt", Kind: scan.KindFile, Size: 10},
+	})
+	// The budget after a 1.05 shrink of a 1000-byte image budget: the 900-byte
+	// file fitted the planned budget and does not fit the measured one.
+	const rb = 800
+	if _, ok := p.Next(rb); ok {
+		// A bin containing only the small file is fine; the fixture is about
+		// the big one, so make sure it really is impossible.
+		if over := p.Oversized(rb); len(over) == 0 {
+			t.Fatal("fixture: nothing is oversized at this budget")
+		}
+	}
+
+	err := emptyBinError(7, p, rb, 1.052)
+	if err == nil {
+		t.Fatal("emptyBinError returned nil")
+	}
+	msg := err.Error()
+	for _, want := range []string{"disc 7", "media/one-big-mkv", "measured ratio 1.052",
+		"EXCLUDE_MASKS", "DISC_TYPE=bdxl100"} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("the refusal does not mention %q:\n%s", want, msg)
+		}
+	}
+	if strings.Contains(msg, "PACK_RATIO") {
+		t.Errorf("the refusal still sends the operator to PACK_RATIO, which cannot change "+
+			"a budget derived from the measured ratio:\n%s", msg)
+	}
+}
+
 func TestDirBytes(t *testing.T) {
 	t.Parallel()
 	dir := writeTree(t, 10, 20, 30)
@@ -527,7 +720,7 @@ func TestFilesMatching(t *testing.T) {
 
 // TestSidecarNames pins down what sidecars.par2 covers, which is the part of
 // this feature a reader is most likely to get wrong: every .sha512 sidecar and
-// the encrypted index itself, in brb.sh's order, and nothing else — not the
+// the encrypted index itself, in that order, and nothing else — not the
 // image, not the image's own parity, and not a previous run's sidecars.par2.
 func TestSidecarNames(t *testing.T) {
 	dir := t.TempDir()

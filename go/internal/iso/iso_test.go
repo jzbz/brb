@@ -139,7 +139,7 @@ func TestRoomFor(t *testing.T) {
 		t.Error("RoomFor allowed an ISO with no headroom at all")
 	}
 	if RoomFor(tree+slack, tree) {
-		t.Error("RoomFor allowed exactly the tree plus the slack; brb.sh demands more")
+		t.Error("RoomFor allowed exactly the tree plus the slack; the headroom must be strict")
 	}
 	if !RoomFor(tree+slack+1, tree) {
 		t.Error("RoomFor refused the tree plus the slack plus a byte")

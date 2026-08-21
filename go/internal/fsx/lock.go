@@ -57,13 +57,28 @@ type StagingLock struct {
 // for; it is not a defence against another user, which is what [SecureDir]'s
 // ownership rule is for. Call it AFTER securing the directory, so the lock
 // file is created somewhere this process has already proven it owns.
+//
+// It does not TRUST the caller to have done that, though. The open below is
+// O_NOFOLLOW because the very next thing this function does to the file is
+// truncate it: with the default STAGING under a world-writable /var/tmp, a
+// symlink planted at <STAGING>/.brb.lock would otherwise be followed and some
+// file of the planter's choosing emptied, with this run's privileges — which
+// under the recommended sudo run is anything on the machine. The flag makes
+// that impossible whatever order the caller does things in, and costs nothing
+// when the directory really was secured first.
 func LockStaging(dir string) (*StagingLock, error) {
 	if dir == "" {
 		return nil, fmt.Errorf("no STAGING directory to lock")
 	}
 	path := filepath.Join(filepath.Clean(dir), LockName)
-	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0o600)
+	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|oNoFollow, 0o600)
 	if err != nil {
+		if isSymlinkLoop(err) {
+			target, _ := os.Readlink(path)
+			return nil, fmt.Errorf("the staging lock %s is a symlink (-> %s); this run truncates it "+
+				"and writes its pid into it, so following the link would empty a file that is none of "+
+				"its business — remove the link, or point STAGING at a directory you own", path, target)
+		}
 		return nil, fmt.Errorf("opening the staging lock %s: %w", path, err)
 	}
 	locked, err := tryLockExclusive(f)

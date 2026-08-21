@@ -3,12 +3,16 @@ package backup
 import (
 	"bytes"
 	"context"
+	"crypto/sha512"
+	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"time"
 
@@ -325,11 +329,41 @@ func (r *runner) buildImage(ctx context.Context, p *pack.Packer, bin *pack.Bin, 
 		}
 		next, ok := p.Next(rb)
 		if !ok || len(next.Files) == 0 {
-			return nil, 0, fmt.Errorf("backup: re-packing disc %d produced an empty bin; "+
-				"lower PACK_RATIO manually", n)
+			return nil, 0, emptyBinError(n, p, rb, r.packRatio)
 		}
 		bin = next
 	}
+}
+
+// emptyBinError explains a re-pack that has nothing left to put on the disc.
+//
+// This is almost always the "file larger than one disc" case discovered late.
+// buildDiscs ran pack.Oversized against the budget derived from the ratio it
+// GUESSED; the shrink loop has since replaced that with the ratio the content
+// actually achieved, which is smaller, so a unit that sat between the two
+// budgets got past the up-front check and is only now impossible. Naming it,
+// with the three ways out oversizedError already gives that case up front, is
+// the whole point.
+//
+// The message this replaced said "lower PACK_RATIO manually", which cannot
+// work: rb here is imageBudget divided by the MEASURED ratio, and PACK_RATIO
+// only seeds the first attempt of a disc. A re-run at any PACK_RATIO packs the
+// same first bin, measures the same overshoot, shrinks to the same budget and
+// stops in the same place — the operator would have been sent round that loop
+// for as long as they were willing.
+func emptyBinError(n int, p *pack.Packer, rb int64, ratio float64) error {
+	if over := p.Oversized(rb); len(over) > 0 {
+		return fmt.Errorf("backup: disc %d: at the compression this content actually achieves "+
+			"(measured ratio %.3f) one disc holds %s of raw content, and %s",
+			n, ratio, ui.HumanBytes(rb), oversizedDetail(over, rb))
+	}
+	// Not reachable from a tree that has anything left in it, since a unit that
+	// does not fit is by definition oversized at this budget. Kept as a message
+	// rather than a panic: an unexplained abort hours into a run is worse than
+	// a sentence that says what was being attempted.
+	return fmt.Errorf("backup: re-packing disc %d produced an empty bin at a raw budget of %s "+
+		"(measured ratio %.3f) with nothing oversized — exclude the largest remaining files via "+
+		"EXCLUDE_MASKS, or use larger media (DISC_TYPE=bdxl100)", n, ui.HumanBytes(rb), ratio)
 }
 
 // protect proves the image is readable, encrypts and hashes it in one pass,
@@ -428,23 +462,26 @@ func (r *runner) protect(ctx context.Context, n int, img string, size int64) err
 }
 
 // roundTrip decrypts a freshly written image back and compares its hash with
-// the plaintext hash taken while encrypting. brb.sh deletes the plaintext with
-// nothing having proved the ciphertext decrypts at all.
-func (r *runner) roundTrip(ctx context.Context, n int, enc string, size int64, want string) (err error) {
+// the plaintext hash taken while encrypting, so the plaintext is never deleted
+// with nothing having proved the ciphertext decrypts at all.
+//
+// The plaintext is hashed as it streams and never stored. Only the digest is
+// wanted here, and writing the decrypted image to a temporary file — which is
+// what this did until the file was noticed to have no reader — cost an
+// image-sized sequential write and an fsync per disc, up to 95 GB on BD-XL
+// media, for bytes that were unlinked moments later. It is also what made
+// [RequiredSpace] charge staging for a third image-sized file.
+func (r *runner) roundTrip(ctx context.Context, n int, enc string, size int64, want string) error {
 	if !r.opts.VerifyRoundTrip || len(r.identities) == 0 {
 		return nil
 	}
-	tmp := filepath.Join(r.dirs.Work, imageName(n)+".roundtrip")
-	defer func() {
-		if rerr := os.Remove(tmp); rerr != nil && !errors.Is(rerr, fs.ErrNotExist) && err == nil {
-			err = fmt.Errorf("backup: removing %s: %w", tmp, rerr)
-		}
-	}()
 
 	r.p.Step("verifying disc %d decrypts back to the same bytes", n)
 	prog := r.p.NewProgress("verify disc"+fmt.Sprintf("%02d", n), size)
-	got, derr := agecrypt.Decrypt(ctx, enc, tmp, r.identities, prog.Writer())
+	h := sha512.New()
+	derr := agecrypt.DecryptTo(ctx, enc, io.MultiWriter(h, prog.Writer()), r.identities)
 	prog.Done()
+	got := hex.EncodeToString(h.Sum(nil))
 	if derr != nil {
 		return fmt.Errorf("backup: disc %d round-trip: %w", n, derr)
 	}
@@ -654,8 +691,8 @@ func (r *runner) writePublicIdentity(n int) error {
 }
 
 // The recovery set over a disc's small files. The parameters are fixed rather
-// than configurable, and are the ones brb.sh uses: these files total a few
-// kilobytes, so there is nothing here worth tuning.
+// than configurable: these files total a few kilobytes, so there is nothing
+// here worth tuning and a knob would only be a way to get it wrong.
 const (
 	// sidecarsPar2Name is the base name of the set. It is part of the on-disc
 	// format: a restorer reads it out of the README and types it at par2.
@@ -668,8 +705,12 @@ const (
 
 // sidecarNames lists the files in a disc's data directory that sidecars.par2
 // protects: every .sha512 sidecar, and the encrypted index itself rather than
-// only its hash. The order matches brb.sh's `*.sha512 index.tsv.gz.age`, so
-// both implementations build the same set from the same disc.
+// only its hash.
+//
+// The membership is part of the on-disc format, not an internal choice: the
+// README tells a restorer to run `par2 repair -- sidecars.par2`, and brb.sh
+// prints that same instruction (brb.sh:611, :1709), so a file left out of this
+// set is a file the printed repair cannot recover.
 func sidecarNames(data string) ([]string, error) {
 	names, err := filesMatching(data, func(nm string) bool {
 		return strings.HasSuffix(nm, ".sha512")
@@ -698,15 +739,28 @@ func sidecarNames(data string) ([]string, error) {
 // Failure is a warning and never fatal: without sidecars.par2 the set loses
 // redundancy over its smallest files, which is not a reason to throw away a
 // backup that is otherwise complete.
+//
+// It is remembered, though. A twenty-disc run prints hours of output, and a
+// warning on disc 14 is gone off the top of the terminal long before the run
+// ends; the disc is then burned, shelved, and read for the first time in
+// fifteen years by someone following its README. So every failure is recorded
+// here and listed again by finish(), where the operator is still looking.
 func (r *runner) protectSidecars(ctx context.Context, n int, data string) {
+	if err := r.sidecarParity(ctx, n, data); err != nil {
+		r.p.Warn("could not protect the sidecar files on disc %d: %v", n, err)
+		r.sidecarFailures = append(r.sidecarFailures, n)
+	}
+}
+
+// sidecarParity is protectSidecars' work, with the failures returned rather
+// than warned about, so there is one place that decides what a failure means.
+func (r *runner) sidecarParity(ctx context.Context, n int, data string) error {
 	names, err := sidecarNames(data)
 	if err != nil {
-		r.p.Warn("could not protect the sidecar files on disc %d: %v", n, err)
-		return
+		return err
 	}
 	if len(names) == 0 {
-		r.p.Warn("disc %d has no sidecar files to protect", n)
-		return
+		return fmt.Errorf("there are no sidecar files in %s to protect", data)
 	}
 	// A resumed run finds the previous run's set here, and par2 will not
 	// overwrite one. Removing it first also means a set that is left behind is
@@ -716,18 +770,16 @@ func (r *runner) protectSidecars(ctx context.Context, n int, data string) {
 		return strings.HasPrefix(nm, "sidecars") && strings.HasSuffix(nm, ".par2")
 	})
 	if err != nil {
-		r.p.Warn("could not protect the sidecar files on disc %d: %v", n, err)
-		return
+		return err
 	}
 	for _, f := range stale {
 		if err := os.Remove(filepath.Join(data, f)); err != nil && !errors.Is(err, fs.ErrNotExist) {
-			r.p.Warn("could not remove the previous %s: %v", f, err)
-			return
+			return fmt.Errorf("removing the previous %s: %w", f, err)
 		}
 	}
 
 	r.p.Step("disc %d: %d%% recovery data over %d sidecar file(s)", n, SidecarRedundancy, len(names))
-	if err := r.tools.Par2Create(ctx, tools.Par2Options{
+	return r.tools.Par2Create(ctx, tools.Par2Options{
 		Dir:        data,
 		File:       sidecarsPar2Name,
 		Inputs:     names,
@@ -736,9 +788,7 @@ func (r *runner) protectSidecars(ctx context.Context, n int, data string) {
 		// No log: par2 announces every one of these four tiny files by name on
 		// every disc, which buries the run's real output on a twenty-disc set.
 		// A failure still carries the tail of that output in its error.
-	}); err != nil {
-		r.p.Warn("could not protect the sidecar files on disc %d: %v", n, err)
-	}
+	})
 }
 
 // writeManifest renders MANIFEST.txt, which describes the whole set, and puts
@@ -879,12 +929,12 @@ func (r *runner) copySelf(ctx context.Context, total int) (string, error) {
 		r.p.Warn("could not locate this program to copy onto the discs: %v", err)
 		return "", nil
 	}
-	// Never call it plain "brb". brb.sh copies its own 113 KB shell script under
-	// that name, and this binary is 8 MB of architecture-specific machine code;
-	// a set built partly by each would carry discs where "brb" is a script and
-	// discs where it is an ELF binary for a CPU the reader may not even have.
-	// Name it for what it is, the way build-dist.sh names the release artifacts,
-	// so `uname -m` tells a restorer which file to reach for.
+	// Never call it plain "brb". Every disc already carries brb.sh, the shell
+	// reader, and this is 8 MB of machine code for one architecture; two files
+	// called "brb" on the same disc, one runnable anywhere and one runnable on
+	// a CPU the restorer may not have, is the worst possible naming. Name it
+	// for what it is, the way build-dist.sh names the release artifacts, so
+	// `uname -m` tells a restorer which file to reach for.
 	name := SelfCopyName()
 	staged := filepath.Join(r.cfg.Staging, name)
 	if err := copyFile(ctx, self, staged, 0o755); err != nil {
@@ -916,8 +966,9 @@ func SelfCopyName() string {
 	return "brb-" + runtime.GOOS + "-" + arch
 }
 
-// selfPath returns the absolute path of the running program, resolving symlinks
-// the way brb.sh's `readlink -f -- "$0"` does.
+// selfPath returns the absolute path of the running program, resolving
+// symlinks: what lands on the disc must be the binary itself and not a copy of
+// a symlink's contents, and os.Executable can hand back the link.
 func selfPath() (string, error) {
 	exe, err := os.Executable()
 	if err != nil {
@@ -1015,13 +1066,23 @@ func (r *runner) finish(total int) {
 	// The state file exists to say "this set is half built". Leaving it behind
 	// after a completed run makes staging claim an interruption that never
 	// happened, and the next plain backup into the same directory refuses to
-	// start until the operator works out why. brb.sh removes it here too.
+	// start until the operator works out why.
 	if err := os.Remove(r.statePath); err != nil && !errors.Is(err, fs.ErrNotExist) {
 		r.p.Warn("could not remove the resume state %s: %v", r.statePath, err)
 	}
 	mins := int(time.Since(r.started).Round(time.Minute) / time.Minute)
 	r.p.Raw("")
 	r.p.OK("backup complete in %d minute(s)", mins)
+	// Said again here because the disc is about to be burned. Without
+	// sidecars.par2 the .sha512 files and the encrypted index on that disc have
+	// no recovery data of their own, and a single rotted byte in the index is
+	// the map of the whole set — the image's parity does not cover it.
+	if len(r.sidecarFailures) > 0 {
+		r.p.Warn("no sidecar recovery data on disc(s) %s: their small files (the .sha512 "+
+			"sidecars and the encrypted index) are on the disc but unprotected. Re-run the "+
+			"backup for those discs, or accept it and rely on the other copies of the index",
+			joinInts(r.sidecarFailures))
+	}
 	r.p.Raw("")
 	r.p.Raw("  Archive : %s", r.cfg.ArchiveName)
 	r.p.Raw("  Discs   : %d", total)
@@ -1043,6 +1104,21 @@ func (r *runner) finish(total int) {
 	r.p.Raw("")
 	r.p.Raw("  Then wipe staging:  rm -rf %s", r.cfg.Staging)
 	r.p.Raw("")
+}
+
+// joinInts renders disc numbers for a message: "3", or "3, 7 and 14".
+func joinInts(ns []int) string {
+	parts := make([]string, 0, len(ns))
+	for _, n := range ns {
+		parts = append(parts, strconv.Itoa(n))
+	}
+	switch len(parts) {
+	case 0:
+		return ""
+	case 1:
+		return parts[0]
+	}
+	return strings.Join(parts[:len(parts)-1], ", ") + " and " + parts[len(parts)-1]
 }
 
 // firstLine returns the first non-empty line of s.

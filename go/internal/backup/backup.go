@@ -1,7 +1,7 @@
 // Package backup turns a source tree into a set of independent, encrypted,
 // mountable Blu-ray discs.
 //
-// The pipeline is the one brb.sh documents:
+// The pipeline:
 //
 //	bin-pack the tree into disc-sized groups
 //	  -> mksquashfs (one self-contained image per disc)
@@ -9,13 +9,19 @@
 //	      -> par2 (recovery data over the ciphertext)
 //	        -> xorriso (one ISO per disc)
 //
-// Two things differ from the shell version by design. The plaintext image is
-// never deleted until the ciphertext has been hashed, the image has been proven
-// to be a readable squashfs, and — when [Options.VerifyRoundTrip] is set — the
-// ciphertext has been decrypted back and compared with the plaintext hash. And
-// the run is resumable: after every completed disc a state file is written to
-// <Staging>/state.json so that an interrupted twenty-disc set can be continued
-// with Run(Resume: true) instead of started over.
+// This is the only writer. brb.sh, which ships on every disc, reads a set and
+// never builds one (see its header), so nothing outside this package observes
+// how discs are packed — only the on-disc format the reader depends on is
+// frozen. Where a comment below says something is fixed, it says which of the
+// two reasons it means.
+//
+// The plaintext image is never deleted until the ciphertext has been hashed,
+// the image has been proven to be a readable squashfs, and — when
+// [Options.VerifyRoundTrip] is set — the ciphertext has been decrypted back
+// and compared with the plaintext hash. And the run is resumable: after every
+// completed disc a state file is written to <Staging>/state.json so that an
+// interrupted twenty-disc set can be continued with Run(Resume: true) instead
+// of started over.
 //
 // This package is Unix-only; it reads the free space of the staging filesystem
 // with statfs(2).
@@ -44,12 +50,14 @@ import (
 )
 
 // Version is the brb version recorded in MANIFEST.txt, in each disc's README
-// and in the ISO application id. It mirrors brb.sh's VERSION so that a disc set
-// produced by either implementation reads the same.
+// and in the ISO application id. It must stay equal to brb.sh's VERSION
+// (brb.sh:61): both are printed on the same disc, and a restorer comparing
+// them must not be told the reader and the writer are different releases.
 const Version = "1.0.0"
 
 // shrinkMargin is the safety factor applied to a measured compression ratio
-// before an over-budget disc is re-packed with it, matching brb.sh's r*1.05.
+// before an over-budget disc is re-packed with it: at exactly the measured
+// ratio the disc only fits by integer truncation.
 const shrinkMargin = 1.05
 
 // Options configures [Plan] and [Run].
@@ -96,8 +104,17 @@ type PlanDisc struct {
 }
 
 // RequiredSpace returns the number of free bytes the staging filesystem must
-// have before a backup may start: room for one plaintext image, one decrypted
-// round-trip copy of it, and one ciphertext with its par2 recovery data.
+// have before a backup may start: room for one plaintext image and, beside it,
+// one ciphertext with its par2 recovery data.
+//
+// That pair is the real peak of a disc. The plaintext image is not removed
+// until the ciphertext has been written, hashed, protected and — under
+// [Options.VerifyRoundTrip] — decrypted back, so both exist at once; nothing
+// else in the pipeline is image-sized. The round-trip check used to add a
+// third image-sized file here, because it decrypted to a temporary file it
+// never read back; it hashes the plaintext as it streams now and writes
+// nothing, so the requirement no longer charges for a copy that does not
+// exist.
 //
 // It is a floor, not the total a full run consumes. Every finished disc leaves
 // its ciphertext and parity in <Staging>/enc, and its ISO in <Staging>/iso,
@@ -116,12 +133,13 @@ func RequiredSpace(imageBudget int64, par2Redundancy int) int64 {
 	if scaled < imageBudget {
 		return math.MaxInt64
 	}
-	return 2*imageBudget + scaled
+	return imageBudget + scaled
 }
 
 // rawBudget converts a compressed-size budget into the raw-content budget the
-// packer works in, exactly as brb.sh's raw_budget does: integer truncation of
-// budget/ratio, with a non-positive or non-finite ratio treated as 1.0.
+// packer works in: integer truncation of budget/ratio, with a non-positive or
+// non-finite ratio treated as 1.0. Truncating rather than rounding is the safe
+// direction — it plans slightly less content per disc, never slightly more.
 func rawBudget(imageBudget int64, ratio float64) int64 {
 	if !(ratio > 0) || math.IsInf(ratio, 0) || math.IsNaN(ratio) {
 		ratio = 1.0
@@ -133,8 +151,9 @@ func rawBudget(imageBudget int64, ratio float64) int64 {
 	return b
 }
 
-// round3 rounds to three decimal places, the precision brb.sh's
-// `awk printf "%.3f"` produces.
+// round3 rounds to three decimal places, which is the precision every pack
+// ratio is carried and printed at, so the number in the log is the number the
+// budget was derived from.
 func round3(f float64) float64 { return math.Round(f*1000) / 1000 }
 
 // measuredRatio is the compressed/raw ratio an image actually achieved.
@@ -148,9 +167,11 @@ func measuredRatio(imageSize, rawBytes int64) float64 {
 // shrinkRatio returns the pack ratio to re-plan an over-budget disc with: the
 // ratio the image actually achieved, plus a 5% margin.
 //
-// Both roundings are deliberate. brb.sh formats the measured ratio to three
-// decimals, multiplies that by 1.05 and formats again, and reproducing the
-// arithmetic keeps the two implementations packing identically.
+// Both roundings are deliberate: the ratio the operator is shown, the ratio
+// recorded in state.json and the ratio the next raw budget is computed from
+// are then the same three-decimal number, so a re-plan is reproducible from
+// what the log says. Nothing outside this package reads it — the pack ratio is
+// not part of the on-disc format — so the arithmetic is free to change.
 func shrinkRatio(imageSize, rawBytes int64) float64 {
 	return round3(measuredRatio(imageSize, rawBytes) * shrinkMargin)
 }
@@ -190,6 +211,12 @@ type runner struct {
 	// again in MANIFEST.txt's "excluded from this backup" section, so a disc
 	// read years later still says what was under the tree and not on the set.
 	skippedMounts []string
+
+	// sidecarFailures lists the discs whose sidecars.par2 could not be written.
+	// That is a warning rather than an error (see protectSidecars), but it is a
+	// warning about a disc that will be burned and shelved, so it is repeated
+	// in the closing summary instead of being left hours up the scrollback.
+	sidecarFailures []int
 
 	// discCipher and indexCipher hold the ciphertext digests this run measured
 	// while encrypting, so SHA512SUMS does not re-read twenty gigabytes per
@@ -360,8 +387,8 @@ func (r *runner) scan(ctx context.Context) (*scan.Result, error) {
 		}
 	}
 	// A mount point under SOURCE_DIR is kept as an empty directory and its whole
-	// subtree left out, because the scan does not cross filesystems (find -xdev
-	// in brb.sh, OneFileSystem here). That is deliberate — a backup of /home
+	// subtree left out, because the scan does not cross filesystems
+	// (scan.Options.OneFileSystem). That is deliberate — a backup of /home
 	// must not swallow the NAS mounted under it — but it used to be silent, and
 	// a silent omission of an entire subtree is a data-loss report waiting to
 	// happen. Say so, name the paths, and carry them into the manifest.
@@ -414,11 +441,17 @@ func reportPaths(p *ui.Printer, paths []string) {
 	}
 }
 
-// oversizedError reports units that can never fit a disc, largest first, the
-// way brb.sh's packer does.
+// oversizedError reports units that can never fit a disc, largest first.
 func oversizedError(over []pack.Unit, budget int64) error {
+	return errors.New("backup: " + oversizedDetail(over, budget))
+}
+
+// oversizedDetail is oversizedError's message without the package prefix, so
+// that buildImage can say what the measured ratio did to the budget first and
+// still give the operator the same list and the same three ways out.
+func oversizedDetail(over []pack.Unit, budget int64) string {
 	var b strings.Builder
-	fmt.Fprintf(&b, "backup: %d file(s) are larger than one disc can hold (%s raw budget):",
+	fmt.Fprintf(&b, "%d file(s) are larger than one disc can hold (%s raw budget):",
 		len(over), ui.HumanBytes(budget))
 	for i, u := range over {
 		if i == 20 {
@@ -429,7 +462,7 @@ func oversizedError(over []pack.Unit, budget int64) error {
 	}
 	b.WriteString("\n  exclude them via EXCLUDE_MASKS, use larger media (DISC_TYPE=bdxl100), " +
 		"or split them yourself before backing up")
-	return errors.New(b.String())
+	return b.String()
 }
 
 // sortedStrings returns a sorted copy of in.
@@ -439,10 +472,10 @@ func sortedStrings(in []string) []string {
 	return out
 }
 
-// dirBytes sums the apparent size of every regular file beneath dir, which is
-// what brb.sh measures with `du -sb --apparent-size`. The ISO builder measures
-// the same trees for its own space check, so the walk itself lives in
-// internal/fsx and this only names the failure.
+// dirBytes sums the apparent size of every regular file beneath dir — apparent
+// size, not blocks, because that is what will be written into an ISO of the
+// tree. The ISO builder measures the same trees for its own space check, so the
+// walk itself lives in internal/fsx and this only names the failure.
 func dirBytes(ctx context.Context, dir string) (int64, error) {
 	n, err := fsx.DirBytes(ctx, dir)
 	if err != nil {

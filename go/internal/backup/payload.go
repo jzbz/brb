@@ -44,8 +44,9 @@ func PayloadMode(name string) fs.FileMode {
 // Nothing about a missing payload fails a backup: a set without it is still a
 // complete, restorable set. A dist directory that cannot be found, or a file
 // missing from one that can, is reported and stepped over. Only a genuine
-// failure to place a file that is there stops the run, which is what brb.sh
-// does too.
+// failure to place a file that is there stops the run: a payload that exists
+// and could not be copied is a disc that will be short of the tool it promises,
+// which is different from a payload that was never configured.
 //
 // It runs after buildDiscDirs, so the disc directories exist, and before
 // writeReadmes, so that the cross-built brb-linux-<arch> from the payload wins

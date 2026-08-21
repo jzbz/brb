@@ -30,7 +30,7 @@ func estimator(t *testing.T, tweak func(*config.Config)) *ratioEstimator {
 // disc-budgets of files onto the next disc, writes it, measures it, rejects it
 // and rebuilds it — repeatedly, over multiple gigabytes.
 //
-// One measurement must produce min(1.0, measured*margin), and never the floor.
+// One measurement must produce min(1.0, measured)*margin, and never the floor.
 func TestASingleMeasurementIsNotAnEmptyWindow(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -39,8 +39,9 @@ func TestASingleMeasurementIsNotAnEmptyWindow(t *testing.T) {
 	}{
 		{"barely compressible content is not mistaken for 50:1", 0.9, 0.945},
 		{"typical mixed content", 0.4, 0.42},
-		{"content that does not compress at all stays at the ceiling", 1.0, 1.0},
-		{"an estimate above the ceiling is clamped, not wrapped", 0.98, 1.0},
+		{"content that does not compress at all still gets the margin", 1.0, 1.05},
+		{"the margin is not eaten as the measurement approaches 1.0", 0.98, 1.029},
+		{"a measurement above the ceiling is clamped, not wrapped", 1.4, 1.05},
 		{"only genuinely extreme content reaches the floor", 0.005, ratioFloor},
 	}
 	for _, tc := range tests {
@@ -94,6 +95,35 @@ func TestTheEstimateFollowsTheWorstOfTheWindow(t *testing.T) {
 	}
 	if n := len(e.recent()); n != 3 {
 		t.Errorf("the window holds %d entries, want 3", n)
+	}
+}
+
+// TestTheEstimatorDoesNotUndoAShrinkRetry. An image can come out larger than
+// the raw bytes it was built from, and buildImage's shrink loop is the only
+// thing that notices: it raises the pack ratio above 1.0 and rebuilds the
+// disc, at the cost of a second full mksquashfs pass over multiple gigabytes.
+// adapt runs immediately afterwards on the disc that finally fit, and while
+// the estimate was clamped at 1.0 it handed the next disc back the very ratio
+// that had just been measured to overshoot — so a set of already-compressed
+// content (photos, video, archives) rebuilt every disc it built, and the log
+// showed the estimator cancelling the correction one line after making it.
+func TestTheEstimatorDoesNotUndoAShrinkRetry(t *testing.T) {
+	r := runnerFor(t, func(c *config.Config) { c.PackRatio = 1.0 })
+
+	// The numbers buildImage would have: an image 0.3% larger than its raw
+	// input, which is what squashfs does to incompressible content.
+	const raw, image = 2_000_000_000, 2_005_000_000
+	measured := measuredRatio(image, raw)
+	r.packRatio = shrinkRatio(image, raw) // what the shrink loop re-packs with
+	if r.packRatio <= 1.0 {
+		t.Fatalf("fixture: shrinkRatio(%d, %d) = %v, want a ratio above 1.0", image, raw, r.packRatio)
+	}
+
+	r.adapt(measured)
+
+	if r.packRatio <= 1.0 {
+		t.Fatalf("after adapt(%.3f) the pack ratio is %v: the shrink retry's correction was "+
+			"discarded, so the next disc is planned to overshoot again", measured, r.packRatio)
 	}
 }
 

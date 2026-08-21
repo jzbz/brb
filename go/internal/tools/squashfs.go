@@ -9,6 +9,7 @@ import (
 	"io"
 	"io/fs"
 	"os"
+	"path/filepath"
 	"strings"
 )
 
@@ -19,9 +20,14 @@ import (
 // cannot deadlock against a full pipe buffer.
 //
 // It returns only an error. mksquashfs's stdout goes to MkOptions.Log and
-// nowhere else: brb.sh's img="$(build_one_image ...)" captured the tool's
-// chatter into what it then treated as a path, and that must never happen here.
-// A partial image is removed when the build fails or the context is cancelled.
+// nowhere else, and the caller learns the image's path from MkOptions.Out,
+// which it already knows. A helper that returns the path on stdout instead —
+// img="$(build_one_image ...)" — hands the tool's chatter back as if it were a
+// path, and every later step then operates on a file name that is really a log
+// line. That is why nothing in this package makes a subprocess's stdout the
+// return value except [(*Set).ImageStats], which is a read-only query with no
+// path in it. A partial image is removed when the build fails or the context is
+// cancelled.
 //
 // The exit status is not the whole verdict. mksquashfs exits 0 on a source
 // file it cannot open — it prints "Failed to read file X, creating empty file"
@@ -41,6 +47,22 @@ func (s *Set) BuildImage(ctx context.Context, o MkOptions) error {
 	}
 	if o.Out == "" {
 		return errors.New("mksquashfs: no output path given")
+	}
+	// Out is resolved twice against two different working directories: the
+	// child gets SourceDir as its cwd (runSpec.dir below) and resolves the path
+	// on its command line there, while the Remove above, the cleanup defer and
+	// the Stat at the end resolve the same string in brb's own cwd. A relative
+	// Out therefore names two different files, and the mismatch is worst when
+	// it half-works: with a matching directory under SourceDir, mksquashfs
+	// writes a full disc of PLAINTEXT somewhere brb will never stat, never
+	// clean up on failure and never encrypt — it just reports "no such file"
+	// against the other path. Par2Create guards the mirror image of this for
+	// the same reason. Nothing upstream enforces an absolute STAGING (config
+	// validation only checks it is non-empty), so the guard belongs here.
+	if !filepath.IsAbs(o.Out) {
+		return fmt.Errorf("mksquashfs: output path must be absolute, got %q — mksquashfs runs with %s "+
+			"as its working directory and would write the image there instead; set STAGING to an "+
+			"absolute path", o.Out, o.SourceDir)
 	}
 	if len(o.Files) == 0 {
 		return errors.New("mksquashfs: empty file list")

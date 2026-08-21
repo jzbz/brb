@@ -1,6 +1,7 @@
 package tools
 
 import (
+	"fmt"
 	"slices"
 	"strings"
 	"testing"
@@ -69,7 +70,7 @@ func TestMksquashfsArgs(t *testing.T) {
 				"-quiet", "-no-xattrs", "-no-exports", "-no-compression"},
 		},
 		{
-			name: "zstd with level and the brb.sh defaults",
+			name: "zstd with level and the shipped defaults",
 			mod: func(o *MkOptions) {
 				o.Compression, o.Level, o.BlockSize, o.Xattrs = "zstd", 19, "1M", true
 			},
@@ -117,18 +118,17 @@ func TestMksquashfsArgs(t *testing.T) {
 				"-Xcompression-level", "3"},
 		},
 		{
-			name: "processors and memory",
+			name: "processors",
 			mod: func(o *MkOptions) {
-				o.Compression, o.Processors, o.MemMB = "zstd", 4, 2048
+				o.Compression, o.Processors = "zstd", 4
 			},
 			want: []string{"-", "/img/disc01.squashfs", "-cpiostyle0", "-no-progress",
-				"-quiet", "-no-xattrs", "-no-exports", "-processors", "4",
-				"-mem", "2048M", "-comp", "zstd"},
+				"-quiet", "-no-xattrs", "-no-exports", "-processors", "4", "-comp", "zstd"},
 		},
 		{
-			name: "zero processors and memory are omitted",
+			name: "zero processors is omitted",
 			mod: func(o *MkOptions) {
-				o.Compression, o.Processors, o.MemMB = "zstd", 0, 0
+				o.Compression, o.Processors = "zstd", 0
 			},
 			want: []string{"-", "/img/disc01.squashfs", "-cpiostyle0", "-no-progress",
 				"-quiet", "-no-xattrs", "-no-exports", "-comp", "zstd"},
@@ -179,7 +179,7 @@ func TestPar2CreateArgs(t *testing.T) {
 		want []string
 	}{
 		{
-			name: "brb.sh defaults",
+			name: "the shipped defaults",
 			o:    Par2Options{Dir: "/enc", File: "disc01.squashfs.age", Redundancy: 10, Blocks: 3000, MemoryMB: 1024},
 			want: []string{"create", "-q", "-r10", "-n1", "-b3000", "-m1024", "--", "disc01.squashfs.age"},
 		},
@@ -189,17 +189,12 @@ func TestPar2CreateArgs(t *testing.T) {
 			want: []string{"create", "-q", "-n1", "--", "x.age"},
 		},
 		{
-			name: "threads",
-			o:    Par2Options{Dir: "/enc", File: "x.age", Redundancy: 5, Threads: 8},
-			want: []string{"create", "-q", "-r5", "-n1", "-t8", "--", "x.age"},
-		},
-		{
 			name: "a file starting with a dash is protected by --",
 			o:    Par2Options{Dir: "/enc", File: "-weird.age"},
 			want: []string{"create", "-q", "-n1", "--", "-weird.age"},
 		},
 		{
-			// brb.sh: par2 create -q -r50 -n1 -b100 -- sidecars.par2 *.sha512 index.tsv.gz.age
+			// par2 create -q -r50 -n1 -b100 -- sidecars.par2 *.sha512 index.tsv.gz.age
 			name: "the sidecar set names itself first and its members after",
 			o: Par2Options{
 				Dir: "/discs/disc01/data", File: "sidecars.par2", Redundancy: 50, Blocks: 100,
@@ -388,22 +383,79 @@ func TestSanitiseLabel(t *testing.T) {
 
 func TestDiscLabel(t *testing.T) {
 	tests := []struct {
+		name       string
 		prefix     string
 		n, total   int
 		want       string
 		wantLength int
 	}{
-		{"BACKUP", 1, 3, "BACKUP_01_OF_03", 15},
-		{"my photos", 7, 12, "MY_PHOTOS_07_OF_12", 18},
-		{strings.Repeat("X", 40), 1, 2, strings.Repeat("X", 32), 32},
+		{"short prefix is untouched", "BACKUP", 1, 3, "BACKUP_01_OF_03", 15},
+		{"sanitised on the way through", "my photos", 7, 12, "MY_PHOTOS_07_OF_12", 18},
+		{
+			// 23 bytes plus the 9-byte suffix is exactly 32: the last prefix
+			// that fits whole.
+			"a prefix that exactly fills the label",
+			strings.Repeat("X", 23), 7, 20, strings.Repeat("X", 23) + "_07_OF_20", 32,
+		},
+		{
+			// One byte more, and it is the PREFIX that loses the byte. Before
+			// this was fixed the tail was cut instead and every disc in the set
+			// carried the same volume ID.
+			"an over-long prefix loses its own tail, never the disc number",
+			strings.Repeat("X", 40), 7, 20, strings.Repeat("X", 23) + "_07_OF_20", 32,
+		},
+		{
+			// A three-digit set renders "_100_OF_120", two bytes wider, so the
+			// room left for the prefix has to be measured and not assumed.
+			"a wider suffix takes its room from the prefix",
+			strings.Repeat("X", 40), 100, 120, strings.Repeat("X", 21) + "_100_OF_120", 32,
+		},
 	}
 	for _, tc := range tests {
-		got := DiscLabel(tc.prefix, tc.n, tc.total)
-		if got != tc.want {
-			t.Errorf("DiscLabel(%q, %d, %d) = %q, want %q", tc.prefix, tc.n, tc.total, got, tc.want)
-		}
-		if len(got) != tc.wantLength {
-			t.Errorf("DiscLabel(%q, ...) length = %d, want %d", tc.prefix, len(got), tc.wantLength)
+		t.Run(tc.name, func(t *testing.T) {
+			got := DiscLabel(tc.prefix, tc.n, tc.total)
+			if got != tc.want {
+				t.Errorf("DiscLabel(%q, %d, %d) = %q, want %q", tc.prefix, tc.n, tc.total, got, tc.want)
+			}
+			if len(got) != tc.wantLength {
+				t.Errorf("DiscLabel(%q, ...) length = %d, want %d", tc.prefix, len(got), tc.wantLength)
+			}
+			if got != SanitiseLabel(got) {
+				t.Errorf("DiscLabel(%q, ...) = %q is not a legal volume id", tc.prefix, got)
+			}
+		})
+	}
+}
+
+// TestDiscLabelKeepsEveryDiscDistinct is the defect this function's prefix-first
+// truncation exists to prevent. A LABEL_PREFIX long enough to fill the 32-byte
+// volume id used to push the "_07_OF_20" suffix off the end, so a twenty-disc
+// set was burned with twenty identical volume ids — permanently, on the media,
+// with nothing said at plan, backup or burn time. The label exists to say which
+// disc this is; if it cannot say that it is worth nothing.
+func TestDiscLabelKeepsEveryDiscDistinct(t *testing.T) {
+	for _, prefix := range []string{
+		"BACKUP",
+		strings.Repeat("A", 30), // clipped the number to "_0" for discs 1..9
+		strings.Repeat("A", 31), // clipped it away entirely
+		strings.Repeat("A", 64),
+	} {
+		seen := make(map[string]int, 20)
+		for n := 1; n <= 20; n++ {
+			label := DiscLabel(prefix, n, 20)
+			if first, dup := seen[label]; dup {
+				t.Fatalf("with a %d-byte LABEL_PREFIX, discs %d and %d both get the volume id %q",
+					len(prefix), first, n, label)
+			}
+			seen[label] = n
+			if len(label) > maxLabel {
+				t.Fatalf("DiscLabel(%d bytes, %d, 20) = %q is %d bytes, over the %d byte limit",
+					len(prefix), n, label, len(label), maxLabel)
+			}
+			if want := fmt.Sprintf("_%02d_OF_20", n); !strings.HasSuffix(label, want) {
+				t.Fatalf("disc %d's label %q does not end in %q — the disc number was truncated away",
+					n, label, want)
+			}
 		}
 	}
 }

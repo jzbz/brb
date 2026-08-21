@@ -9,9 +9,13 @@
 // functions all take a context.Context, terminate the child process when the
 // context is cancelled, and delete partial output.
 //
-// Two habits of brb.sh are deliberately not reproduced here: a subprocess's
-// stdout is never conflated with a returned value, and an exit status is never
-// discarded by piping the tool into a filter.
+// Two habits that shell makes easy are deliberately not reproduced here: a
+// subprocess's stdout is never conflated with a returned value, and an exit
+// status is never discarded by piping the tool into a filter. Both cost a
+// backup silently — see [(*Set).BuildImage] and [(*Set).MakeISO] for the shape
+// of each failure. (brb.sh in this tree is the reader and runs none of these
+// writer-side tools; the habits belong to the shell writer this package
+// replaced, which is not in the repository.)
 package tools
 
 import (
@@ -277,9 +281,11 @@ func (s *Set) bin(name string) (string, error) {
 // mksquashfsHelp returns mksquashfs's help text, probed at most once.
 //
 // squashfs-tools 4.6 and newer split the help across sections: "-help" prints
-// only a summary and "-help-all" prints everything. brb.sh greps "-help" for
-// "-cpiostyle0" and therefore reports a false negative on those versions. Ask
-// for "-help-all" first and fall back to "-help".
+// only a summary and "-help-all" prints everything. Probing with "-help" alone
+// and grepping it for "-cpiostyle0" therefore reports a false negative on those
+// versions — the flag is supported and the feature detection says it is not, so
+// brb refuses to run on a perfectly good mksquashfs. Ask for "-help-all" first
+// and fall back to "-help".
 func (s *Set) mksquashfsHelp(ctx context.Context) string {
 	s.mu.Lock()
 	if s.sqHelpDone {

@@ -95,8 +95,8 @@ func TestPlacePayloadHardLinksWhenTheModeIsRight(t *testing.T) {
 	}
 }
 
-// TestPlacePayloadCopiesWhenTheModeIsWrong is the bug brb.sh hit and comments
-// on. A hard link shares an inode with the file in the operator's dist
+// TestPlacePayloadCopiesWhenTheModeIsWrong pins the reason placePayload does
+// not always link. A hard link shares an inode with the file in the operator's dist
 // directory, so chmodding through it would rewrite their copy. When the mode
 // has to change, the file is copied and only the copy is touched.
 func TestPlacePayloadCopiesWhenTheModeIsWrong(t *testing.T) {

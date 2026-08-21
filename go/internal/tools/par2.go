@@ -115,6 +115,22 @@ func isPar2Volume(name, base string) bool {
 
 // Par2Verify checks a file against its recovery set. A damaged file makes par2
 // exit non-zero, which surfaces as an error here rather than being swallowed.
+//
+// NO COMMAND CALLS THIS TODAY, and that is deliberate rather than an oversight
+// left lying around. The restore path never wants verify-without-repair: `par2
+// repair` verifies first and only rewrites what is broken, so calling verify
+// ahead of it would read the whole recovery set twice for no extra information.
+// `brb verify-disc` does not use it either — it checks SHA512SUMS, which needs
+// nothing but sha512sum, and adding a par2 verify would make par2 a hard
+// dependency of the one command an operator runs on a strange machine to find
+// out whether a disc is readable at all. brb.sh's verify-disc would then have
+// to match it, or the two readers would disagree about what "verified" means.
+//
+// It is kept because it is the honest tools-layer counterpart of Par2Repair,
+// it is covered against real par2 by TestPar2CreateVerifyRepair, and wiring it
+// into a read-only check is a decision about the reader contract rather than
+// about this package. Delete it if that decision goes the other way; do not
+// call it from a repair path.
 func (s *Set) Par2Verify(ctx context.Context, dir, par2 string, log io.Writer) error {
 	path, err := s.bin(Par2)
 	if err != nil {
