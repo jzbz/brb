@@ -1593,7 +1593,11 @@ assert0 "go brb honours KEEP_IMAGES from the config file" go_reads_keep_images_f
 # both — the alternative, a key that means "do not ask" to brb.sh and nothing at
 # all to the Go build, is the worse failure of the two.
 sh_and_go_take_assume_yes_from_config() { # ..._from_config sh|go
-  local who=$1 st=$T/ycfg-$who dest=$T/outycfg-$who cfg=$T/cfg/ycfg-$who
+  # Two locals, not one: a variable assigned in a 'local' is not yet visible to
+  # the assignments beside it, so the paths below would all have been built from
+  # an empty $who and both readers would have shared one staging directory.
+  local who=$1
+  local st=$T/ycfg-$who dest=$T/outycfg-$who cfg=$T/cfg/ycfg-$who
   rm -rf "$st" "$dest"; mkdir -p "$dest"
   cp -a "$T/stage-go" "$st"; rm -rf "$st/restore"
   mkcfg "$cfg" "$st" "$SRC" "ASSUME_YES=1"
