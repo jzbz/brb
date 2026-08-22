@@ -191,8 +191,10 @@ func discOfImage(base string) int {
 }
 
 // killGrace is how long a child process gets to exit after a cancellation
-// before it is killed outright.
-const killGrace = 5 * time.Second
+// before it is killed outright. It is [tools.KillGrace]: the writer and the
+// reader start the same kinds of children and there is no reason for them to
+// wait different lengths of time, least of all by accident.
+const killGrace = tools.KillGrace
 
 // unmountGrace bounds an unmount that runs after the context was cancelled.
 const unmountGrace = 30 * time.Second
@@ -1070,8 +1072,11 @@ func (w *stepWriter) emit(line string) {
 	w.p.Step("%s", line)
 }
 
-// tailLimit bounds how much of a failed command's output an error carries.
-const tailLimit = 2 << 10
+// tailLimit bounds how much of a failed command's output an error carries. It
+// is [tools.TailLimit]; this used to be half of it, so the same failure
+// reported by a helper run from here and one run from tools came back
+// truncated to different lengths.
+const tailLimit = tools.TailLimit
 
 // runTool executes one short-lived helper program, returning its standard
 // output. The context is honoured: the child is interrupted and then killed.
@@ -1080,15 +1085,60 @@ func runTool(ctx context.Context, path string, args ...string) (string, error) {
 	cmd := exec.CommandContext(ctx, path, args...)
 	cmd.Cancel = func() error { return cmd.Process.Signal(os.Interrupt) }
 	cmd.WaitDelay = killGrace
-	var out, errb bytes.Buffer
-	cmd.Stdout = &out
-	cmd.Stderr = &errb
+	// Both streams are bounded. The only caller that reads the output at all
+	// takes firstLine of it, and the program it runs is ddrescue, which redraws
+	// a progress line with a bare CR for as long as a damaged disc takes to
+	// salvage — hours, on the machine already struggling. Keeping every redraw
+	// in order to read the first line was the one place here where a slow
+	// success cost memory without bound.
+	out := &boundedHead{limit: tailLimit}
+	errb := &boundedTail{limit: tailLimit}
+	cmd.Stdout = out
+	cmd.Stderr = errb
 	err := cmd.Run()
 	if err != nil {
 		return out.String(), fmt.Errorf("%s: %w%s", filepath.Base(path), err, tail(errb.String()))
 	}
 	return out.String(), nil
 }
+
+// boundedHead keeps the FIRST limit bytes written to it and drops the rest,
+// while still accepting every write so the child never blocks. runTool's stdout
+// is read with firstLine and by nothing else, so the beginning is the only part
+// any caller can use — and the head is what a tail would throw away.
+type boundedHead struct {
+	limit int
+	buf   []byte
+}
+
+func (b *boundedHead) Write(p []byte) (int, error) {
+	if room := b.limit - len(b.buf); room > 0 {
+		if room > len(p) {
+			room = len(p)
+		}
+		b.buf = append(b.buf, p[:room]...)
+	}
+	return len(p), nil
+}
+
+func (b *boundedHead) String() string { return string(b.buf) }
+
+// boundedTail keeps the LAST limit bytes, which is what an error message wants:
+// a program that fails says why on its way out.
+type boundedTail struct {
+	limit int
+	buf   []byte
+}
+
+func (b *boundedTail) Write(p []byte) (int, error) {
+	b.buf = append(b.buf, p...)
+	if len(b.buf) > b.limit {
+		b.buf = b.buf[len(b.buf)-b.limit:]
+	}
+	return len(p), nil
+}
+
+func (b *boundedTail) String() string { return string(b.buf) }
 
 // tail renders the last of a failed command's output for an error message.
 func tail(s string) string {

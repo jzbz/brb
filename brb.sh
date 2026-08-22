@@ -1645,28 +1645,35 @@ refuse_symlinks_at_dirs() {  # refuse_symlinks_at_dirs IMAGE DEST [ONLY]
 # so is the number of lines the parse recognised, and either one failing stops
 # the restore by name.
 #
-# The listing is read whole rather than streamed for one reason: its exit
-# status has to be taken before a single line of it is believed, and at the
-# head of a pipeline that status is the easiest thing in shell to drop.
+# The listing streams into the parse rather than being read whole first. Its
+# exit status still has to be taken before a single line of it is believed, and
+# at the head of a pipeline that status is the easiest thing in shell to drop —
+# so it is carried in the stream itself, as a final '!<rc>' line popped before
+# anything else. The pipeline runs under '|| prc=$?' rather than bare because
+# errexit would otherwise kill the subshell at the failure, before the line
+# saying so could be printed; pipefail, set at the top of this script, is what
+# makes that status unsquashfs's rather than awk's opinion of unsquashfs's
+# truncated output.
 #
-# So the whole listing sits in memory, as it already did, and the entries
-# parsed out of it sit beside it — a disc holding a million files costs a few
-# hundred megabytes here for as long as one image is being prepared. That is
-# the price of not reading the image a second time, and it is paid per image,
-# not per set.
+# It used to read the listing into a variable and then parse that variable into
+# the array, so the raw listing and the entries parsed out of it sat in memory
+# together and a disc holding a million files cost a few hundred megabytes
+# twice. Only the parsed entries are ever needed. This is the reader written for
+# a rescue machine fifteen years from now, which is the one place in this script
+# where a few hundred megabytes is worth a sentinel line: it runs where there
+# may not be any to spare.
 IMAGE_ENTRIES=()
 IMAGE_STRAY=0
 IMAGE_LISTED=""
 list_image() {  # list_image IMAGE
   [[ "$IMAGE_LISTED" == "$1" ]] && return 0
-  local img="$1" listing="" rc=0 summary last
+  local img="$1" rc=0 status="" summary last
   # unsquashfs's own stderr is deliberately NOT silenced: when this dies, the
   # reason it gives should be readable next to what the tool itself said.
-  listing="$(unsquashfs -ll "$img")" || rc=$?
-  (( rc == 0 )) || die "could not list the contents of $(esc_str "${img##*/}"): 'unsquashfs -ll' exited $rc. That listing is the only thing that says which paths this image holds as directories — without which a symlink planted in the destination cannot be told from one the backup itself carries — and which files it holds, which is what the index is cross-checked against. Both guards would have nothing to compare, so the restore stops here rather than extract past a check that compared nothing. Fix or re-ingest that image and retry, or restore it with the Go reader on the disc (brb-linux-amd64)."
-
   IMAGE_ENTRIES=()
-  mapfile -t IMAGE_ENTRIES < <(printf '%s\n' "$listing" | LC_ALL=C awk '
+  mapfile -t IMAGE_ENTRIES < <(
+    prc=0
+    unsquashfs -ll "$img" | LC_ALL=C awk '
     BEGIN { root = "squashfs-root" }
     {
       rest = $0; fields = 1
@@ -1695,7 +1702,21 @@ list_image() {  # list_image IMAGE
       print "f" rel
     }
     END { print "#" n + 0 " " stray + 0 }
-  ')
+    ' || prc=$?
+    printf '!%d\n' "$prc"
+  )
+  # The exit status of the pipeline, carried out of the subshell as its last
+  # line because errexit would have killed the subshell before any other way
+  # of reporting it could run. Popped before the summary, and before a single
+  # entry above it is believed.
+  if (( ${#IMAGE_ENTRIES[@]} > 0 )); then
+    last=$(( ${#IMAGE_ENTRIES[@]} - 1 ))
+    status="${IMAGE_ENTRIES[last]}"
+    unset "IMAGE_ENTRIES[last]"
+  fi
+  [[ "$status" =~ ^!([0-9]+)$ ]] || die "could not list the contents of $(esc_str "${img##*/}"): the listing pipeline did not report an exit status, so nothing it printed can be trusted. The guards below have nothing to compare and will not pass by default, so the restore stops here."
+  rc="${BASH_REMATCH[1]}"
+  (( rc == 0 )) || die "could not list the contents of $(esc_str "${img##*/}"): 'unsquashfs -ll' exited $rc. That listing is the only thing that says which paths this image holds as directories — without which a symlink planted in the destination cannot be told from one the backup itself carries — and which files it holds, which is what the index is cross-checked against. Both guards would have nothing to compare, so the restore stops here rather than extract past a check that compared nothing. Fix or re-ingest that image and retry, or restore it with the Go reader on the disc (brb-linux-amd64)."
   # END always runs, and always last, so the summary is the final line — unless
   # awk produced nothing at all, which the empty summary below turns into the
   # same refusal as a listing that did not parse.

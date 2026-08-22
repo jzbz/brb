@@ -14,12 +14,25 @@ import (
 	"time"
 )
 
-// tailLimit bounds how much of a subprocess's output an error message carries.
-const tailLimit = 4 << 10
+// TailLimit bounds how much of a subprocess's output an error message carries.
+//
+// Exported because restore runs helper programs of its own and had its own
+// copy of this number, set to half of it: two error messages about two failing
+// children, truncated differently for no reason anyone chose. One number, one
+// place.
+const TailLimit = 4 << 10
 
-// killGrace is how long a cancelled child gets to exit on its own before Go
-// kills it outright.
-const killGrace = 5 * time.Second
+// tailLimit is the in-package spelling of [TailLimit].
+const tailLimit = TailLimit
+
+// KillGrace is how long a cancelled child gets to exit on its own before Go
+// kills it outright. Exported for the same reason as [TailLimit]: restore had
+// an identical copy, and two identical constants are one constant and one
+// opportunity to change only the other.
+const KillGrace = 5 * time.Second
+
+// killGrace is the in-package spelling of [KillGrace].
+const killGrace = KillGrace
 
 // tailBuffer keeps the last limit bytes written to it.
 type tailBuffer struct {
