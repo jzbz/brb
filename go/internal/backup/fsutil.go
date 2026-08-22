@@ -4,48 +4,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
 
 	"github.com/jzbz/brb/internal/fsx"
 )
-
-// copyBufSize is the chunk size of the context-aware copy loop. It also sets
-// how often a long copy checks for cancellation.
-const copyBufSize = 1 << 20
-
-// copyCtx copies src to dst in bounded chunks, checking ctx between them.
-//
-// It is a hand-written loop rather than io.Copy so that no ReadFrom or WriteTo
-// shortcut can copy gigabytes without ever looking at the context.
-func copyCtx(ctx context.Context, dst io.Writer, src io.Reader) (int64, error) {
-	buf := make([]byte, copyBufSize)
-	var total int64
-	for {
-		if err := ctx.Err(); err != nil {
-			return total, err
-		}
-		n, rerr := src.Read(buf)
-		if n > 0 {
-			w, werr := dst.Write(buf[:n])
-			total += int64(w)
-			if werr != nil {
-				return total, werr
-			}
-			if w != n {
-				return total, io.ErrShortWrite
-			}
-		}
-		if rerr != nil {
-			if errors.Is(rerr, io.EOF) {
-				return total, nil
-			}
-			return total, rerr
-		}
-	}
-}
 
 // createPart opens dst+".part" for writing and returns the file together with a
 // finish function.
@@ -93,7 +57,7 @@ func createPart(dst string) (*os.File, func(error) error, error) {
 			_ = os.Remove(part)
 			return fmt.Errorf("backup: installing %s: %w", dst, err)
 		}
-		syncDir(filepath.Dir(dst))
+		fsx.SyncDir(filepath.Dir(dst))
 		return nil
 	}
 	return f, finish, nil
@@ -113,7 +77,7 @@ func copyFile(ctx context.Context, src, dst string, mode fs.FileMode) (err error
 	}
 	defer func() { err = finish(err) }()
 
-	if _, err := copyCtx(ctx, out, in); err != nil {
+	if _, err := fsx.CopyCtx(ctx, out, in); err != nil {
 		return fmt.Errorf("backup: copying %s to %s: %w", src, dst, err)
 	}
 	if err := out.Chmod(mode); err != nil {

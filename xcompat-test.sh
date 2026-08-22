@@ -1456,11 +1456,22 @@ if (( HAVE_SCRIPT )); then
   ESCSRC=$T/escsrc
   ESC_EVIL=$(printf 'esc\033]0;PWNED\007evil.txt')
   ESC_DEL=$(printf 'del\177bell\007.txt')
+  # C1 in both of its spellings, and the case that must NOT be escaped. A
+  # terminal decoding UTF-8 acts on U+009B as CSI; one that is not acts on the
+  # bare 0x9b byte the same way. The third name is U+4E9B, which encodes as
+  # E4 B8 9B: its last byte is a continuation, not a control, and a reader that
+  # escaped it would mangle every CJK name in a listing.
+  ESC_C1U8=$(printf 'csi\302\233u8.txt')
+  ESC_C1RAW=$(printf 'csi\233raw.txt')
+  ESC_KEEP=$(printf 'keep\344\270\233me.txt')
   mkdir -p "$ESCSRC/dir"
   printf 'x' > "$ESCSRC/$ESC_EVIL"
   printf 'y' > "$ESCSRC/dir/$ESC_DEL"
   printf 'z' > "$ESCSRC/plain.txt"
-  ESCSRC_FILES=3
+  printf 'a' > "$ESCSRC/$ESC_C1U8"
+  printf 'b' > "$ESCSRC/$ESC_C1RAW"
+  printf 'c' > "$ESCSRC/$ESC_KEEP"
+  ESCSRC_FILES=6
   mkdir -p "$T/stage-esc"; mkcfg "$T/cfg/esc" "$T/stage-esc" "$ESCSRC"
 
   # Count C0 controls and DEL, sparing tab, newline and carriage return: run_pty
@@ -1476,6 +1487,12 @@ if (( HAVE_SCRIPT )); then
       || { echo "no ESC ] 0 ; PWNED BEL in any filename on disk" >&2; return 1; }
     find "$ESCSRC" -type f -printf '%P\n' | LC_ALL=C grep -q $'\177' \
       || { echo "no DEL in any filename on disk" >&2; return 1; }
+    find "$ESCSRC" -type f -printf '%P\n' | LC_ALL=C grep -q $'\302\233' \
+      || { echo "no UTF-8-spelled C1 in any filename on disk" >&2; return 1; }
+    find "$ESCSRC" -type f -printf '%P\n' | LC_ALL=C grep -q $'csi\233raw' \
+      || { echo "no raw C1 byte in any filename on disk" >&2; return 1; }
+    find "$ESCSRC" -type f -printf '%P\n' | LC_ALL=C grep -q $'\344\270\233' \
+      || { echo "no rune with a C1-range tail byte in any filename on disk" >&2; return 1; }
   }
   assert0 "fixture: the source tree holds filenames with ESC, BEL and DEL in them" esc_fixture_is_hostile
   assert0 "go brb backs up a tree with control bytes in its filenames" \
@@ -1516,6 +1533,15 @@ if (( HAVE_SCRIPT )); then
     # Absence of raw bytes is also what dropping the row entirely looks like.
     grep -qF '\x1b]0;PWNED\x07' "$lf" || { echo "the hostile name was not printed in escaped form" >&2; return 1; }
     grep -qF '\x7fbell\x07' "$lf"     || { echo "DEL and BEL were not escaped" >&2; return 1; }
+    # C1 in both spellings. Escaping one and not the other leaves the attack
+    # working on whichever terminals decode the other way.
+    grep -qF 'csi\xc2\x9bu8.txt' "$lf" \
+      || { echo "the UTF-8-spelled C1 was not escaped" >&2; return 1; }
+    grep -qF 'csi\x9braw.txt' "$lf" \
+      || { echo "the raw C1 byte was not escaped" >&2; return 1; }
+    # ... and the byte that only looks like one is still there, unescaped.
+    LC_ALL=C grep -q $'keep\344\270\233me.txt' "$lf" \
+      || { echo "a rune whose tail byte is in the C1 range was mangled" >&2; return 1; }
     n=$(esc_rows "$lf" | wc -l)
     (( n == ESCSRC_FILES )) || { echo "$n index row(s) for $ESCSRC_FILES file(s)" >&2; return 1; }
     esc_rows "$lf" | awk -F'\t' 'NF!=2 { b=1 } END { exit b+0 }' \

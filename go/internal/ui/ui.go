@@ -200,13 +200,15 @@ func Visible(s string) string { return visible(s) }
 //
 // The rendering is C-style — \r for CR, \xNN for anything else, one escape per
 // byte — so an operator can feed it back through printf to reproduce the bytes.
-// It is the notation restore's escapeControls uses for index lines, but not yet
-// the same coverage: that escaper spells newline \n (it works on lines, where a
-// raw newline would forge a second entry) and passes C1 controls through in
-// both spellings, as does brb.sh's esc_controls. A name printed by `brb index`
-// can therefore still render differently from the same name in a Printer
-// message; widening those two together is the fix, and it has to happen in both
-// implementations at once or the readers stop agreeing.
+// It is the notation restore's escapeControls uses for index lines, and now the
+// same coverage: that escaper and brb.sh's esc_controls were widened together
+// to escape C1 in both spellings, as this does. They still differ in one place
+// on purpose — those two spell newline \n, because they work on lines, where a
+// raw newline would forge a second entry.
+//
+// The widening had to be simultaneous, and was: xcompat-test.sh compares the
+// two readers' escaped listings byte for byte, so a name rendered differently
+// by one of them fails the suite rather than reaching a disc.
 //
 // The colour codes the Printer wraps around a message are added after this runs
 // and are never touched.

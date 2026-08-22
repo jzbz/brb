@@ -998,6 +998,17 @@ Known and deliberate, but you should hear them before you rely on this:
   the confirmation that would otherwise have stopped it. A destination holding a
   symlink to a directory is refused outright, `--yes` or not. See
   [restore overwrites the destination](#restore-overwrites-the-destination).
+- **The destination must not be writable by others while a restore runs.** The
+  symlink refusal above is a check followed by an act: both readers walk the
+  destination, refuse what they find, and then hand the path to `unsquashfs`,
+  which resolves every name again itself. A local account that can write inside
+  the destination can plant a symlink in the gap between those two steps and
+  have files written through it, outside the destination, with the restoring
+  user's privileges. Nothing in either reader can close that window — no
+  descriptor survives into a subprocess that takes a path — so restore
+  somewhere only you can write. Staging is a different matter and is defended
+  by descriptor: it is opened with `O_NOFOLLOW` and checked through the handle
+  it opened, never by name a second time.
 - **A restore needs room for the extracted tree plus one decrypted image.** Each
   image is removed as soon as its contents are on disk, so only one exists at a
   time. `KEEP_IMAGES=1` (or `--keep-images` on the Go build) keeps them all for

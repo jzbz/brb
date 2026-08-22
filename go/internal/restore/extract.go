@@ -15,6 +15,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/jzbz/brb/internal/agecrypt"
 	"github.com/jzbz/brb/internal/fsx"
@@ -1226,7 +1227,11 @@ func filterIndex(ctx context.Context, r io.Reader, pattern string, w io.Writer, 
 		if len(line) == 0 {
 			continue
 		}
-		if needle != "" || escape {
+		// The case-folded match still materialises a string, deliberately:
+		// strings.ToLower folds by Unicode rules and an ASCII-only byte scan
+		// would quietly stop matching names it matches today. Only the escaping
+		// branch is skipped for clean rows, which is every row but a handful.
+		if needle != "" || (escape && needsEscaping(line)) {
 			s := string(line)
 			if needle != "" && !strings.Contains(strings.ToLower(s), needle) {
 				continue
@@ -1254,14 +1259,46 @@ func filterIndex(ctx context.Context, r io.Reader, pattern string, w io.Writer, 
 	return n, nil
 }
 
-// escapeControls renders C0 control bytes and DEL visibly, sparing the tab
-// that separates an index record's fields. The escapes are the C-style ones an
-// operator can feed back through printf; everything printable passes through
-// untouched, multi-byte characters included.
+// escapeControls renders C0 control bytes, DEL and the C1 controls visibly,
+// sparing the tab that separates an index record's fields. The escapes are the
+// C-style ones an operator can feed back through printf; everything printable
+// passes through untouched, multi-byte characters included.
+//
+// C1 is covered in both of its spellings, matching [ui.Visible]: a terminal
+// decoding UTF-8 acts on U+009B as CSI, and one that is not acts on the bare
+// 0x9b byte the same way, so escaping one and not the other leaves the attack
+// intact on half the terminals in use. A 0x80..0x9f byte that is a continuation
+// of a valid rune is NOT a C1 control and passes through — "些" is E4 B8 9B and
+// must survive intact.
+//
+// brb.sh's esc_controls is a byte-for-byte mirror of this and has to move with
+// it: the two readers' listings are compared for byte-identity, and a name that
+// escapes differently on one of them is a divergence, not a cosmetic
+// difference.
+// escapable reports whether c can begin something escapeControls rewrites.
+// 0xc2 leads the UTF-8 spelling of every C1 control; 0x80..0x9f is the raw
+// spelling and also, harmlessly, a continuation byte — a false positive there
+// costs one slow pass and changes no output.
+func escapable(c byte) bool {
+	return (c < 0x20 && c != '\t') || c == 0x7f || c == 0xc2 || (c >= 0x80 && c <= 0x9f)
+}
+
+// needsEscaping is escapeControls' own first pass, on bytes. A listing streams
+// a million rows and almost every one of them is clean, so this is what lets a
+// caller skip materialising a string it would only hand straight back.
+func needsEscaping(b []byte) bool {
+	for _, c := range b {
+		if escapable(c) {
+			return true
+		}
+	}
+	return false
+}
+
 func escapeControls(s string) string {
 	clean := true
 	for i := 0; i < len(s); i++ {
-		if c := s[i]; (c < 0x20 && c != '\t') || c == 0x7f {
+		if escapable(s[i]) {
 			clean = false
 			break
 		}
@@ -1271,18 +1308,41 @@ func escapeControls(s string) string {
 	}
 	var b strings.Builder
 	b.Grow(len(s) + 8)
-	for i := 0; i < len(s); i++ {
-		switch c := s[i]; {
+	for i := 0; i < len(s); {
+		c := s[i]
+		switch {
 		case c == '\t':
 			b.WriteByte(c)
+			i++
 		case c == '\r':
 			b.WriteString(`\r`)
+			i++
 		case c == '\n':
 			b.WriteString(`\n`)
+			i++
 		case c < 0x20 || c == 0x7f:
 			fmt.Fprintf(&b, `\x%02x`, c)
-		default:
+			i++
+		case c < utf8.RuneSelf:
 			b.WriteByte(c)
+			i++
+		default:
+			r, size := utf8.DecodeRuneInString(s[i:])
+			switch {
+			case r >= 0x80 && r <= 0x9f:
+				// UTF-8 encoded C1: spell out both bytes so the escape
+				// round-trips through printf like every other one.
+				for _, cb := range []byte(s[i : i+size]) {
+					fmt.Fprintf(&b, `\x%02x`, cb)
+				}
+			case r == utf8.RuneError && size == 1 && c <= 0x9f:
+				// A raw 0x80..0x9f byte, not valid UTF-8 here: CSI, OSC or
+				// another C1 to a terminal that is not decoding UTF-8.
+				fmt.Fprintf(&b, `\x%02x`, c)
+			default:
+				b.WriteString(s[i : i+size])
+			}
+			i += size
 		}
 	}
 	return b.String()
@@ -1318,9 +1378,16 @@ func (e *escapingWriter) Write(b []byte) (int, error) {
 		if i < 0 {
 			break
 		}
-		line := escapeControls(string(e.part[:i]))
+		raw := e.part[:i]
 		e.part = e.part[i+1:]
-		if _, err := e.w.WriteString(line); err != nil {
+		// A string only for the lines that need one: this runs once per entry
+		// in a listing that can hold a million of them, and the discipline the
+		// index path states at filterIndex applies here just as much.
+		if needsEscaping(raw) {
+			if _, err := e.w.WriteString(escapeControls(string(raw))); err != nil {
+				return len(b), err
+			}
+		} else if _, err := e.w.Write(raw); err != nil {
 			return len(b), err
 		}
 		if err := e.w.WriteByte('\n'); err != nil {
@@ -1337,6 +1404,12 @@ func (e *escapingWriter) Close() error {
 	if len(e.part) > 0 {
 		part := e.part
 		e.part = nil
+		if !needsEscaping(part) {
+			if _, err := e.w.Write(part); err != nil {
+				return err
+			}
+			return e.w.Flush()
+		}
 		if _, err := e.w.WriteString(escapeControls(string(part))); err != nil {
 			return err
 		}

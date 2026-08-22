@@ -29,7 +29,9 @@ package fsx
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 )
@@ -63,4 +65,72 @@ func DirBytes(ctx context.Context, dir string) (int64, error) {
 		return 0, fmt.Errorf("measuring %s: %w", dir, err)
 	}
 	return total, nil
+}
+
+// SyncDir flushes a directory entry so a completed rename survives a crash.
+//
+// Failures are deliberately ignored: not every filesystem supports fsync on a
+// directory, and at every call site the data itself is already durable — the
+// rename is what is being made visible, not the bytes. Callers that cared about
+// the error could not do anything useful with it.
+//
+// It lives here rather than in each caller because it was written twice,
+// identically, in two packages that both already depend on this one.
+func SyncDir(dir string) {
+	d, err := os.Open(dir)
+	if err != nil {
+		return
+	}
+	_ = d.Sync()
+	_ = d.Close()
+}
+
+// CopyBufSize is the chunk size of [CopyCtx].
+//
+// Large enough that the per-chunk context check and syscall overhead disappear
+// against the copy itself, small enough that a cancelled multi-gigabyte stream
+// stops within a chunk rather than within a file.
+const CopyBufSize = 1 << 20
+
+// CopyCtx copies src into dst in fixed-size chunks, checking ctx between chunks
+// so a multi-gigabyte stream aborts promptly on cancellation. It returns the
+// number of bytes written.
+//
+// It is a hand-written loop rather than io.Copy because io.Copy will take a
+// ReadFrom or WriteTo shortcut when either side offers one, and those copy the
+// whole stream inside a single call that never looks at the context. A backup
+// or a restore that ignored ^C for forty minutes is the bug this avoids.
+//
+// The short-write check is deliberate belt-and-braces. io.Writer's contract
+// says a Write returning fewer bytes than it was given must also return an
+// error, so a conforming writer cannot reach it — but a copy that silently
+// stopped early would write a truncated image or a truncated restored file, and
+// that is a failure this program must never express as success. Three separate
+// versions of this loop existed before it lived here and one of them had lost
+// the check, which is the argument for having one.
+func CopyCtx(ctx context.Context, dst io.Writer, src io.Reader) (int64, error) {
+	buf := make([]byte, CopyBufSize)
+	var total int64
+	for {
+		if err := ctx.Err(); err != nil {
+			return total, err
+		}
+		nr, rerr := src.Read(buf)
+		if nr > 0 {
+			nw, werr := dst.Write(buf[:nr])
+			total += int64(nw)
+			if werr != nil {
+				return total, werr
+			}
+			if nw != nr {
+				return total, io.ErrShortWrite
+			}
+		}
+		if rerr != nil {
+			if errors.Is(rerr, io.EOF) {
+				return total, nil
+			}
+			return total, rerr
+		}
+	}
 }

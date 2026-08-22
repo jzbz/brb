@@ -17,6 +17,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"strconv"
 	"strings"
 )
 
@@ -170,4 +171,33 @@ func Compute(capacity, reserve int64, par2Redundancy int) (Budget, error) {
 			"usable %d bytes, reserve %d bytes, par2 %d%%", usable, reserve, par2Redundancy)
 	}
 	return b, nil
+}
+
+// NumberOf extracts the disc number from a name of the form
+// "disc<digits><suffix>", e.g. NumberOf("disc07.squashfs.age", ".squashfs.age")
+// is 7. Any number of digits is accepted so that a set of more than 99 discs
+// still sorts and selects correctly.
+//
+// The grammar is part of the on-disc format, so it is parsed in one place: the
+// writer names the files and both readers pick them apart, and a parser that
+// drifted on one side would make a disc unreadable by the side that drifted.
+// It was written twice, identically, before it lived here.
+func NumberOf(name, suffix string) (int, bool) {
+	if !strings.HasPrefix(name, "disc") || !strings.HasSuffix(name, suffix) {
+		return 0, false
+	}
+	digits := name[len("disc") : len(name)-len(suffix)]
+	if digits == "" {
+		return 0, false
+	}
+	for _, r := range digits {
+		if r < '0' || r > '9' {
+			return 0, false
+		}
+	}
+	n, err := strconv.Atoi(digits)
+	if err != nil || n <= 0 {
+		return 0, false
+	}
+	return n, true
 }

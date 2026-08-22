@@ -21,35 +21,6 @@ func sha512Hex(t *testing.T, b []byte) string {
 	return hex.EncodeToString(sum[:])
 }
 
-func TestDiscNumberOf(t *testing.T) {
-	tests := []struct {
-		name, suffix string
-		want         int
-		ok           bool
-	}{
-		{"disc01.squashfs.age", ".squashfs.age", 1, true},
-		{"disc07.squashfs.age", ".squashfs.age", 7, true},
-		{"disc100.squashfs.age", ".squashfs.age", 100, true},
-		{"disc1.iso", ".iso", 1, true},
-		{"disc00.iso", ".iso", 0, false},
-		{"disc.iso", ".iso", 0, false},
-		{"discXX.iso", ".iso", 0, false},
-		{"disc01.iso", ".squashfs.age", 0, false},
-		{"index.tsv.gz.age", ".squashfs.age", 0, false},
-		{"disc 1.iso", ".iso", 0, false},
-		{"disc-1.iso", ".iso", 0, false},
-	}
-	for _, tc := range tests {
-		t.Run(tc.name+tc.suffix, func(t *testing.T) {
-			got, ok := discNumberOf(tc.name, tc.suffix)
-			if ok != tc.ok || got != tc.want {
-				t.Fatalf("discNumberOf(%q, %q) = (%d, %v), want (%d, %v)",
-					tc.name, tc.suffix, got, ok, tc.want, tc.ok)
-			}
-		})
-	}
-}
-
 func TestListNumberedSortsByDiscNumber(t *testing.T) {
 	dir := t.TempDir()
 	for _, n := range []string{"disc10.iso", "disc2.iso", "disc1.iso", "notes.txt", "disc03.iso"} {

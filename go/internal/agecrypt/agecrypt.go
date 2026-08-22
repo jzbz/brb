@@ -39,7 +39,11 @@ import (
 
 // copyBufSize is the chunk size of the streaming copies. Large enough that the
 // per-chunk context check costs nothing, small enough to abort promptly.
-const copyBufSize = 1 << 20
+// It is [fsx.CopyBufSize] rather than a second number: the tests here size
+// their fixtures in multiples of the chunk the copy actually uses, and a local
+// copy of the value would let those fixtures stop straddling a chunk boundary
+// without anything failing.
+const copyBufSize = fsx.CopyBufSize
 
 // ErrNoRecipients is returned when an encryption is attempted without any age
 // recipient, which would produce a file nobody can decrypt.
@@ -437,7 +441,7 @@ func Encrypt(ctx context.Context, src, dst string, recipients []age.Recipient, p
 	if prog != nil {
 		sinks = append(sinks, prog)
 	}
-	if _, err := copyCtx(ctx, io.MultiWriter(sinks...), in); err != nil {
+	if _, err := fsx.CopyCtx(ctx, io.MultiWriter(sinks...), in); err != nil {
 		return Sums{}, fmt.Errorf("agecrypt: encrypt %s: %w", src, err)
 	}
 	// Close flushes the final STREAM chunk; it is part of the ciphertext and
@@ -490,7 +494,7 @@ func Decrypt(ctx context.Context, src, dst string, ids []age.Identity, prog io.W
 	if prog != nil {
 		sinks = append(sinks, prog)
 	}
-	if _, err := copyCtx(ctx, io.MultiWriter(sinks...), r); err != nil {
+	if _, err := fsx.CopyCtx(ctx, io.MultiWriter(sinks...), r); err != nil {
 		return "", fmt.Errorf("agecrypt: decrypt %s: %w", src, err)
 	}
 	sum, err = plain.Sum()
@@ -516,7 +520,7 @@ func DecryptTo(ctx context.Context, src string, w io.Writer, ids []age.Identity)
 	if err != nil {
 		return fmt.Errorf("agecrypt: decrypt %s: %w", src, err)
 	}
-	if _, err := copyCtx(ctx, w, r); err != nil {
+	if _, err := fsx.CopyCtx(ctx, w, r); err != nil {
 		return fmt.Errorf("agecrypt: decrypt %s: %w", src, err)
 	}
 	return nil
@@ -539,39 +543,10 @@ func SumFile(ctx context.Context, path string) (string, error) {
 // hashReader reads r to EOF and returns its SHA-512 as lowercase hex.
 func hashReader(ctx context.Context, r io.Reader) (string, error) {
 	var h hash.Hash = sha512.New()
-	if _, err := copyCtx(ctx, h, r); err != nil {
+	if _, err := fsx.CopyCtx(ctx, h, r); err != nil {
 		return "", err
 	}
 	return hex.EncodeToString(h.Sum(nil)), nil
-}
-
-// copyCtx copies src into dst in fixed-size chunks, checking ctx between
-// chunks so a multi-gigabyte stream aborts promptly on cancellation.
-func copyCtx(ctx context.Context, dst io.Writer, src io.Reader) (int64, error) {
-	buf := make([]byte, copyBufSize)
-	var total int64
-	for {
-		if err := ctx.Err(); err != nil {
-			return total, err
-		}
-		nr, rerr := src.Read(buf)
-		if nr > 0 {
-			nw, werr := dst.Write(buf[:nr])
-			total += int64(nw)
-			if werr != nil {
-				return total, werr
-			}
-			if nw != nr {
-				return total, io.ErrShortWrite
-			}
-		}
-		if rerr != nil {
-			if errors.Is(rerr, io.EOF) {
-				return total, nil
-			}
-			return total, rerr
-		}
-	}
 }
 
 // Modes for createPart. Ciphertext, checksum files and par2 volumes are copied
@@ -625,20 +600,8 @@ func createPart(dst string, mode os.FileMode) (*os.File, func(error) error, erro
 			os.Remove(part)
 			return fmt.Errorf("agecrypt: rename %s: %w", part, err)
 		}
-		syncDir(filepath.Dir(dst))
+		fsx.SyncDir(filepath.Dir(dst))
 		return nil
 	}
 	return f, finish, nil
-}
-
-// syncDir flushes a directory entry so a completed rename survives a crash.
-// Failures are deliberately ignored: not every filesystem supports fsync on a
-// directory, and the data itself is already durable at this point.
-func syncDir(dir string) {
-	d, err := os.Open(dir)
-	if err != nil {
-		return
-	}
-	_ = d.Sync()
-	_ = d.Close()
 }

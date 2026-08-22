@@ -12,6 +12,8 @@ import (
 	"testing"
 
 	"filippo.io/age"
+
+	"github.com/jzbz/brb/internal/fsx"
 )
 
 // TestAsyncHashMatchesSynchronous is the whole contract in one line: the same
@@ -104,7 +106,7 @@ func encryptSynchronous(ctx context.Context, src, dst string, recipients []age.R
 	if err != nil {
 		return Sums{}, err
 	}
-	if _, err := copyCtx(ctx, io.MultiWriter(aw, plain), in); err != nil {
+	if _, err := fsx.CopyCtx(ctx, io.MultiWriter(aw, plain), in); err != nil {
 		return Sums{}, err
 	}
 	if err := aw.Close(); err != nil {

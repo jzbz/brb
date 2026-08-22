@@ -694,14 +694,30 @@ sidecar_repair_hint() {  # sidecar_repair_hint DISC-NUMBER
 # SHA512SUMS is usable but unverifiable, and says so (discSums in
 # go/internal/restore/ingest.go).
 declare -A DISC_SUMS=()
+# The ceiling mirrors agecrypt.maxSumLines, and for the same reason: this file
+# comes off a disc somebody else handed over, restore reads it with nothing in
+# between so much as looking at its size, and every parsed line is retained in
+# DISC_SUMS until the command ends. A "disc" that is a directory rather than
+# real media has no size limit at all, so a generated multi-gigabyte SHA512SUMS
+# turns into an OOM kill mid-ingest. A million is unreachable rather than tight:
+# a brb disc directory holds on the order of ten files. Lines READ are counted,
+# not entries stored, so a file of a million repeated names stops here too
+# rather than being scanned forever for free.
+MAX_SUM_LINES=1048576
+
 read_disc_sums() {  # read_disc_sums MOUNTPOINT
   DISC_SUMS=()
-  local h p
+  local h p n=0
   if [[ ! -f "$1/SHA512SUMS" ]]; then
     warn "no SHA512SUMS on this disc; copies cannot be checked as they are made"
     return 0
   fi
   while read -r h p; do
+    if (( ++n > MAX_SUM_LINES )); then
+      warn "SHA512SUMS on this disc has more than $MAX_SUM_LINES lines; reading stopped there"
+      step "a brb disc lists about ten files, so this one was not written by brb"
+      break
+    fi
     # A line SHA512SUMS's own rot has mangled is simply not a hash for anything;
     # the file it named is then copied unchecked, exactly as if it were absent.
     [[ "$h" =~ ^[0-9A-Fa-f]{128}$ && -n "$p" ]] || continue
@@ -2113,38 +2129,95 @@ cmd_mount() {
   step "unmount with: umount $mp"
 }
 
-# Render C0 control bytes and DEL visibly, sparing the tab that separates an
-# index record's fields. A byte-for-byte mirror of escapeControls in
+# Render C0 control bytes, DEL and the C1 controls visibly, sparing the tab that
+# separates an index record's fields. A byte-for-byte mirror of escapeControls in
 # go/internal/restore/extract.go: '\r' and '\n' get their C-style escapes, every
-# other control byte becomes \xHH, and anything printable passes through
-# untouched — multi-byte characters included, which is why this runs in the C
-# locale and works one BYTE at a time.
+# other control becomes \xHH, and anything printable passes through untouched —
+# multi-byte characters included, which is why this runs in the C locale.
 #
 # The names come out of an archive, so they are chosen by whoever could plant
 # one file in the backed-up tree; printed raw to a terminal, an ESC ] 0 ; ... BEL
 # in a filename retitles the operator's window, and worse where OSC 52 is on.
+#
+# C1 is covered in both spellings. A terminal decoding UTF-8 acts on U+009B as
+# CSI; one that is not acts on the bare 0x9b byte the same way, so escaping one
+# and not the other leaves the attack working on half the terminals in use. That
+# is why this can no longer work a byte at a time: 0x80..0x9F is also the
+# continuation range, and the last byte of a perfectly ordinary CJK filename
+# lands in it. Whether a byte is a control or a tail depends on what precedes
+# it, so the walk decodes.
 esc_controls() {
   LC_ALL=C awk '
+    # The length of the valid UTF-8 sequence starting at lead byte a with
+    # following bytes b, c, d (0 when past the end of the line), or 0 when what
+    # starts here is not a valid sequence. This mirrors Go utf8.DecodeRune down
+    # to its rejection of overlong forms and surrogates, because escapeControls
+    # escapes whatever that decoder rejects: a reader consuming a different
+    # number of bytes here would escape a different set of them, and the two
+    # listings would stop matching.
+    function seqlen(a, b, c, d) {
+      if (a < 194) return 0
+      if (a < 224) return (b >= 128 && b <= 191) ? 2 : 0
+      if (a < 240) {
+        if (b < 128 || b > 191) return 0
+        if (a == 224 && b < 160) return 0
+        if (a == 237 && b > 159) return 0
+        return (c >= 128 && c <= 191) ? 3 : 0
+      }
+      if (a < 245) {
+        if (b < 128 || b > 191) return 0
+        if (a == 240 && b < 144) return 0
+        if (a == 244 && b > 143) return 0
+        if (c < 128 || c > 191) return 0
+        return (d >= 128 && d <= 191) ? 4 : 0
+      }
+      return 0
+    }
     BEGIN {
       for (i = 1; i < 256; i++) ord[sprintf("%c", i)] = i
-      # Everything escaped, as raw bytes inside one bracket expression: C0
-      # except tab (9), plus DEL. None of them is a regex metacharacter.
+      # The trigger set, as raw bytes inside one bracket expression: C0 except
+      # tab (9), DEL, the 0xC2 that leads every UTF-8-spelled C1, and the raw
+      # 0x80..0x9F block. None of them is a regex metacharacter. A continuation
+      # byte in that last range trips this too, and the walk then passes it
+      # through: a false positive costs one slow pass and never a changed byte.
       ctl = ""
       for (i = 1; i < 32; i++) if (i != 9) ctl = ctl sprintf("%c", i)
-      re = "[" ctl sprintf("%c", 127) "]"
+      ctl = ctl sprintf("%c", 127) sprintf("%c", 194)
+      for (i = 128; i < 160; i++) ctl = ctl sprintf("%c", i)
+      re = "[" ctl "]"
     }
     # The clean line — every line, almost always — is passed through whole
     # rather than rebuilt a byte at a time.
     $0 !~ re { print; next }
     {
-      out = ""; n = length($0)
-      for (i = 1; i <= n; i++) {
+      out = ""; n = length($0); i = 1
+      while (i <= n) {
         c = substr($0, i, 1); v = ord[c]
-        if (c == "\t")            out = out c
-        else if (v == 13)         out = out "\\r"
-        else if (v == 10)         out = out "\\n"
-        else if (v < 32 || v == 127) out = out sprintf("\\x%02x", v)
-        else                      out = out c
+        if (c == "\t")               { out = out c; i++ }
+        else if (v == 13)            { out = out "\\r"; i++ }
+        else if (v == 10)            { out = out "\\n"; i++ }
+        else if (v < 32 || v == 127) { out = out sprintf("\\x%02x", v); i++ }
+        else if (v < 128)            { out = out c; i++ }
+        else {
+          b2 = (i + 1 <= n) ? ord[substr($0, i + 1, 1)] : 0
+          b3 = (i + 2 <= n) ? ord[substr($0, i + 2, 1)] : 0
+          b4 = (i + 3 <= n) ? ord[substr($0, i + 3, 1)] : 0
+          L = seqlen(v, b2, b3, b4)
+          if (L == 2 && v == 194 && b2 <= 159) {
+            # U+0080..U+009F: a C1 control spelled in UTF-8. Both bytes are
+            # spelled out so the escape round-trips through printf.
+            out = out sprintf("\\x%02x\\x%02x", v, b2); i += 2
+          } else if (L == 0) {
+            # Not a valid sequence here. A lone 0x80..0x9F byte is a C1 control
+            # to a terminal that is not decoding UTF-8; a higher byte is just a
+            # byte, and is left exactly as it was found.
+            if (v <= 159) out = out sprintf("\\x%02x", v)
+            else          out = out c
+            i++
+          } else {
+            out = out substr($0, i, L); i += L
+          }
+        }
       }
       print out
     }

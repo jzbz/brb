@@ -19,6 +19,7 @@ import (
 	"filippo.io/age"
 
 	"github.com/jzbz/brb/internal/agecrypt"
+	"github.com/jzbz/brb/internal/disc"
 	"github.com/jzbz/brb/internal/doc"
 	"github.com/jzbz/brb/internal/fsx"
 	"github.com/jzbz/brb/internal/tools"
@@ -325,7 +326,7 @@ func (o Options) discSums(mp string) map[string]string {
 // is the only case where a sidecars.par2 still has to be staged flat.
 func discOfDataFiles(names []string) int {
 	for _, nm := range names {
-		if n, ok := discNumberOf(nm, ".squashfs"+ageExt); ok {
+		if n, ok := disc.NumberOf(nm, ".squashfs"+ageExt); ok {
 			return n
 		}
 	}

@@ -29,6 +29,7 @@ import (
 	"strings"
 
 	"github.com/jzbz/brb/internal/config"
+	"github.com/jzbz/brb/internal/disc"
 	"github.com/jzbz/brb/internal/fsx"
 	"github.com/jzbz/brb/internal/tools"
 	"github.com/jzbz/brb/internal/ui"
@@ -404,7 +405,7 @@ func numbered(dir string, wantDir bool, suffix string) ([]int, error) {
 		if e.IsDir() != wantDir {
 			continue
 		}
-		n, ok := discNumberOf(e.Name(), suffix)
+		n, ok := disc.NumberOf(e.Name(), suffix)
 		if !ok || seen[n] {
 			continue
 		}
@@ -413,29 +414,6 @@ func numbered(dir string, wantDir bool, suffix string) ([]int, error) {
 	}
 	sort.Ints(out)
 	return out, nil
-}
-
-// discNumberOf extracts the disc number from a name of the form
-// "disc<digits><suffix>". Any number of digits is accepted so that a set of more
-// than 99 discs still sorts and selects correctly.
-func discNumberOf(name, suffix string) (int, bool) {
-	if !strings.HasPrefix(name, "disc") || !strings.HasSuffix(name, suffix) {
-		return 0, false
-	}
-	digits := name[len("disc") : len(name)-len(suffix)]
-	if digits == "" {
-		return 0, false
-	}
-	for _, r := range digits {
-		if r < '0' || r > '9' {
-			return 0, false
-		}
-	}
-	n, err := strconv.Atoi(digits)
-	if err != nil || n <= 0 {
-		return 0, false
-	}
-	return n, true
 }
 
 // manifestDiscs matches MANIFEST.txt's "discs : N" line.

@@ -11,6 +11,8 @@ import (
 	"strings"
 	"time"
 	"unicode/utf8"
+
+	"github.com/jzbz/brb/internal/fsx"
 )
 
 // StateVersion is the schema version written into state.json. LoadState
@@ -318,20 +320,8 @@ func SaveState(path string, s *State) (err error) {
 	if err = os.Rename(tmpName, path); err != nil {
 		return fmt.Errorf("backup: installing %s: %w", path, err)
 	}
-	syncDir(dir)
+	fsx.SyncDir(dir)
 	return nil
-}
-
-// syncDir flushes a directory entry. Not every filesystem permits it, and a
-// failure here does not make the rename any less durable in practice, so the
-// error is deliberately ignored.
-func syncDir(dir string) {
-	d, err := os.Open(dir)
-	if err != nil {
-		return
-	}
-	_ = d.Sync()
-	_ = d.Close()
 }
 
 // checkResume rejects a state file that belongs to a different backup. Skipping

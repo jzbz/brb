@@ -184,3 +184,32 @@ func TestComputeErrors(t *testing.T) {
 		})
 	}
 }
+
+func TestNumberOf(t *testing.T) {
+	tests := []struct {
+		name, suffix string
+		want         int
+		ok           bool
+	}{
+		{"disc01.squashfs.age", ".squashfs.age", 1, true},
+		{"disc07.squashfs.age", ".squashfs.age", 7, true},
+		{"disc100.squashfs.age", ".squashfs.age", 100, true},
+		{"disc1.iso", ".iso", 1, true},
+		{"disc00.iso", ".iso", 0, false},
+		{"disc.iso", ".iso", 0, false},
+		{"discXX.iso", ".iso", 0, false},
+		{"disc01.iso", ".squashfs.age", 0, false},
+		{"index.tsv.gz.age", ".squashfs.age", 0, false},
+		{"disc 1.iso", ".iso", 0, false},
+		{"disc-1.iso", ".iso", 0, false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name+tc.suffix, func(t *testing.T) {
+			got, ok := NumberOf(tc.name, tc.suffix)
+			if ok != tc.ok || got != tc.want {
+				t.Fatalf("NumberOf(%q, %q) = (%d, %v), want (%d, %v)",
+					tc.name, tc.suffix, got, ok, tc.want, tc.ok)
+			}
+		})
+	}
+}

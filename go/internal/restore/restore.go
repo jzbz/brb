@@ -37,7 +37,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sort"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -47,6 +46,7 @@ import (
 
 	"github.com/jzbz/brb/internal/agecrypt"
 	"github.com/jzbz/brb/internal/config"
+	"github.com/jzbz/brb/internal/disc"
 	"github.com/jzbz/brb/internal/doc"
 	"github.com/jzbz/brb/internal/fsx"
 	"github.com/jzbz/brb/internal/tools"
@@ -186,7 +186,7 @@ func (o Options) sidecarRepairHint(disc int) string {
 // belongs to. 0 means it could not be told, which only happens for a name this
 // program did not produce.
 func discOfImage(base string) int {
-	n, _ := discNumberOf(base, ".squashfs")
+	n, _ := disc.NumberOf(base, ".squashfs")
 	return n
 }
 
@@ -267,29 +267,6 @@ type discFile struct {
 // "disc07.squashfs.age". The format is shared with brb.sh.
 func encName(n int) string { return fmt.Sprintf("disc%02d.squashfs%s", n, ageExt) }
 
-// discNumberOf extracts the disc number from a name of the form
-// "disc<digits><suffix>". It accepts any number of digits so that a set with
-// more than 99 discs still sorts and selects correctly.
-func discNumberOf(name, suffix string) (int, bool) {
-	if !strings.HasPrefix(name, "disc") || !strings.HasSuffix(name, suffix) {
-		return 0, false
-	}
-	digits := name[len("disc") : len(name)-len(suffix)]
-	if digits == "" {
-		return 0, false
-	}
-	for _, r := range digits {
-		if r < '0' || r > '9' {
-			return 0, false
-		}
-	}
-	n, err := strconv.Atoi(digits)
-	if err != nil || n <= 0 {
-		return 0, false
-	}
-	return n, true
-}
-
 // listNumbered returns every regular file in dir whose name is "disc<n><suffix>",
 // sorted by disc number. A missing directory yields no entries and no error:
 // the caller reports "nothing ingested yet" more helpfully than a stat error
@@ -307,7 +284,7 @@ func listNumbered(dir, suffix string) ([]discFile, error) {
 		if e.IsDir() {
 			continue
 		}
-		n, ok := discNumberOf(e.Name(), suffix)
+		n, ok := disc.NumberOf(e.Name(), suffix)
 		if !ok {
 			continue
 		}
@@ -933,27 +910,12 @@ func (o Options) decryptVerifying(ctx context.Context, encPath, dst, wantCipher 
 	return hex.EncodeToString(plain.Sum(nil)), nil
 }
 
-// copyChunks copies src into dst in fixed-size chunks, checking ctx between
-// chunks so a multi-gigabyte stream aborts promptly on cancellation.
+// copyChunks copies src into dst, checking ctx between chunks. The byte count
+// is discarded here: every caller is streaming a whole file and treats a short
+// copy as the error [fsx.CopyCtx] reports, not as a number to inspect.
 func copyChunks(ctx context.Context, dst io.Writer, src io.Reader) error {
-	buf := make([]byte, copyBufSize)
-	for {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		n, rerr := src.Read(buf)
-		if n > 0 {
-			if _, werr := dst.Write(buf[:n]); werr != nil {
-				return werr
-			}
-		}
-		if rerr != nil {
-			if errors.Is(rerr, io.EOF) {
-				return nil
-			}
-			return rerr
-		}
-	}
+	_, err := fsx.CopyCtx(ctx, dst, src)
+	return err
 }
 
 // par2Repair runs par2 over one file's recovery set. par2 verifies before it

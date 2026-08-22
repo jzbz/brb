@@ -255,7 +255,7 @@ func gzipFile(ctx context.Context, src, dst string) (err error) {
 	if err != nil {
 		return fmt.Errorf("backup: gzip %s: %w", src, err)
 	}
-	if _, err := copyCtx(ctx, zw, in); err != nil {
+	if _, err := fsx.CopyCtx(ctx, zw, in); err != nil {
 		return fmt.Errorf("backup: compressing %s: %w", src, err)
 	}
 	if err := zw.Close(); err != nil {
