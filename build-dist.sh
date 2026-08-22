@@ -43,8 +43,8 @@ VERSION="$(sed -n 's/^VERSION="\([^"]*\)".*/\1/p' "$REPO/brb.sh" | head -1)"
 # cli's version is a *const* aliasing backup.Version, and -X can only set a
 # package-level string *var*, so the linker dropped the flag without a word and
 # the "keep this in step" note was decoration. Bumping brb.sh's VERSION alone
-# would have shipped a brb-0.1.1 tarball whose binaries, MANIFEST.txt and
-# on-disc READMEs all still said 0.1.0.
+# would have shipped a brb-0.1.2 tarball whose binaries, MANIFEST.txt and
+# on-disc READMEs all still said 0.1.1.
 #
 # So the source stays the source of truth and this script's job is to NOTICE
 # skew rather than paper over it: the version is read back out of the Go source
