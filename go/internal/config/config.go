@@ -115,6 +115,27 @@ type Config struct {
 	// KeepISOs keeps a burned disc's ISO in staging instead of deleting it
 	// once the bytes are on the medium (KEEP_ISOS).
 	KeepISOs bool
+	// KeepImages keeps each decrypted image in the staging restore directory
+	// instead of deleting it once its contents are extracted (KEEP_IMAGES).
+	// The flag --keep-images does the same for one command.
+	//
+	// This is a READER-side setting in a file both implementations read. It is
+	// here because brb.sh has always taken it from the config (brb.sh:95), so a
+	// config that drives one reader has to drive the other, and because the
+	// README's own sample prints it — a sample the Go build refused to load
+	// while this key was unknown.
+	KeepImages bool
+	// AssumeYes answers every confirmation without asking, as --yes does for
+	// one command (ASSUME_YES). Reader-side, and taken from the config for the
+	// same reason as KeepImages: brb.sh has always honoured it (brb.sh:113).
+	//
+	// It is a loaded setting to put in a file. `restore` overwrites its
+	// destination, and this is what answers the question that would otherwise
+	// have stopped it — so a config carrying ASSUME_YES=1 makes every later
+	// restore silent about that. It is honoured rather than merely tolerated
+	// because a key that means "do not ask" to one reader and nothing at all to
+	// the other is the worse of the two failures.
+	AssumeYes bool
 	// PruneDirs are directories, relative to SourceDir, not to descend into
 	// (PRUNE_DIRS). Setting it replaces the defaults.
 	PruneDirs []string
@@ -423,6 +444,7 @@ func Keys() []string {
 		"AGE_IDENTITY",
 		"AGE_RECIPIENTS_FILE",
 		"ARCHIVE_NAME",
+		"ASSUME_YES",
 		"BLOCK_SIZE",
 		"BURNER",
 		"BURN_SPEED",
@@ -434,6 +456,7 @@ func Keys() []string {
 		"EXCLUDE_MASKS",
 		"ISO_MODE",
 		"JOBS",
+		"KEEP_IMAGES",
 		"KEEP_ISOS",
 		"LABEL_PREFIX",
 		"MAX_SHRINK_ATTEMPTS",
@@ -564,8 +587,13 @@ func envValue(key, raw string) (Value, error) {
 // PRUNE_DIRS="" mean "prune nothing", because for them the defaults are a
 // list an operator may want to switch off, and a value that could not do so
 // would leave no spelling for it; see [Value.list]. An unknown key is still an
-// error even when it is empty: KEEP_IMAGES= in a shared file is the same typo
-// as KEEP_IMAGES=0, and the README promises it is reported.
+// error even when it is empty: NO_SUCH_KEY= in a shared file is the same typo
+// as NO_SUCH_KEY=1, and the README promises it is reported.
+//
+// KEEP_IMAGES used to be this comment's example, which was the wrong example:
+// it is a real key brb.sh has always read, printed in the README's own sample
+// config, and refusing it meant the Go build would not load a file the sample
+// told an operator to write. Reader-side keys are keys.
 func (c *Config) set(key string, v Value) error {
 	if !v.IsArray && v.Scalar == "" && !isArrayKey(key) && isKnownKey(key) {
 		return nil
@@ -647,6 +675,10 @@ func (c *Config) set(key string, v Value) error {
 		return nil
 	case "KEEP_ISOS":
 		return v.boolInt(key, &c.KeepISOs)
+	case "KEEP_IMAGES":
+		return v.boolInt(key, &c.KeepImages)
+	case "ASSUME_YES":
+		return v.boolInt(key, &c.AssumeYes)
 	case "JOBS":
 		return v.int(key, &c.Jobs)
 	case "DIST_DIR":

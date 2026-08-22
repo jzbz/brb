@@ -32,7 +32,16 @@ var backupTools = []string{tools.Mksquashfs, tools.Unsquashfs, tools.Par2, tools
 var restoreTools = []string{tools.Unsquashfs, tools.Par2}
 
 // optionalTools improve some paths but are never required.
-var optionalTools = []string{tools.Age, tools.Ddrescue, tools.Udisksctl, tools.Eject, tools.Findmnt, tools.Pv}
+//
+// Every name here is one something actually runs. pv was on this list and never
+// was: nothing in either implementation has ever invoked it, so doctor told an
+// operator preparing a rescue system to install a package that changes nothing.
+// flock takes its place because brb.sh's lock_staging does run it when it is
+// there and says so when it is not — this build locks staging with flock(2) and
+// needs no binary, but doctor advises on the machine a restore will happen on,
+// and the reader carried onto every disc is the one that needs the program.
+// brb.sh's own list made this correction first; see the note at its doctor.
+var optionalTools = []string{tools.Age, tools.Ddrescue, tools.Udisksctl, tools.Eject, tools.Findmnt, tools.Flock}
 
 // doctor checks everything that can be checked without building anything:
 // dependencies, the mksquashfs feature and compressor set brb relies on, the

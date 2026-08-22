@@ -865,19 +865,37 @@ func (r *runner) writeManifest(ctx context.Context, total int) error {
 	return nil
 }
 
+// maxNamedUnreadable bounds how many unreadable paths the manifest names before
+// it falls back to a count. A source tree can hold more of them than a document
+// anyone will read should list — an unreadable directory of a million files is
+// a million lines — and the count is the part that matters: it tells a restorer
+// the set is short and by how much, which no amount of truncation can take
+// away.
+const maxNamedUnreadable = 64
+
 // manifestPrunes is the "excluded from this backup" list the manifest prints
 // under "prune:": the configured PRUNE_DIRS, followed by every mount point the
-// scan refused to cross, each marked as such. A mount point is not a
-// configured prune, but the effect on the set is identical — the directory is
-// there and everything under it is not — and the manifest is the one document
-// that outlives the terminal the warning was printed to.
+// scan refused to cross and every path it could not read, each marked as such.
+// Neither is a configured prune, but the effect on the set is identical — the
+// entry is missing and nothing says so once the run ends — and the manifest is
+// the one document that outlives the terminal the warning was printed to.
+//
+// The distinction matters to whoever reads it: a mount point was left out on
+// purpose and its contents are somewhere else, while an unreadable path was
+// meant to be here and is not. Both are named as what they are.
 func (r *runner) manifestPrunes() []string {
-	if len(r.skippedMounts) == 0 {
+	if len(r.skippedMounts) == 0 && r.unreadableCount == 0 {
 		return r.cfg.PruneDirs
 	}
 	out := append([]string(nil), r.cfg.PruneDirs...)
 	for _, m := range r.skippedMounts {
 		out = append(out, m+"  (mount point: not crossed, its contents are not on this set)")
+	}
+	for _, u := range r.unreadable {
+		out = append(out, u+"  (could not be read: NOT on any disc)")
+	}
+	if extra := r.unreadableCount - len(r.unreadable); extra > 0 {
+		out = append(out, fmt.Sprintf("... and %d more path(s) that could not be read and are NOT on any disc", extra))
 	}
 	return out
 }

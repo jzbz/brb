@@ -212,6 +212,16 @@ type runner struct {
 	// read years later still says what was under the tree and not on the set.
 	skippedMounts []string
 
+	// unreadable holds the paths the scan could not open, relative to
+	// SOURCE_DIR, capped at maxNamedUnreadable; unreadableCount is the true
+	// total. They are warned about when the scan reports them and listed again
+	// in MANIFEST.txt for the same reason skippedMounts are: a file that could
+	// not be read is not on any disc, the terminal that said so is long gone by
+	// the time anyone reads the discs, and a restore that quietly lacks a file
+	// looks exactly like a backup that never had it.
+	unreadable      []string
+	unreadableCount int
+
 	// sidecarFailures lists the discs whose sidecars.par2 could not be written.
 	// That is a warning rather than an error (see protectSidecars), but it is a
 	// warning about a disc that will be burned and shelved, so it is repeated
@@ -384,6 +394,17 @@ func (r *runner) scan(ctx context.Context) (*scan.Result, error) {
 				break
 			}
 			r.p.Step("%s", e.Error())
+		}
+		// Carried into the manifest as well. A tree can hold more unreadable
+		// paths than a document should list, so the manifest names the first
+		// few and then says how many there were: the count is the part that
+		// tells a restorer to go looking, and it is never truncated away.
+		r.unreadableCount = n
+		for i, e := range res.Errors {
+			if i == maxNamedUnreadable {
+				break
+			}
+			r.unreadable = append(r.unreadable, e.Path)
 		}
 	}
 	// A mount point under SOURCE_DIR is kept as an empty directory and its whole

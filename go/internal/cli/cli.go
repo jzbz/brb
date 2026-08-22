@@ -120,6 +120,14 @@ func run(ctx context.Context, g globals, p *ui.Printer, stdout io.Writer) int {
 	if err != nil {
 		return fail(p, err)
 	}
+	// ASSUME_YES can only be read once the config is loaded, which is after the
+	// --yes flag was applied. It is OR'd in, never assigned: a config saying 0
+	// must not undo a --yes the operator typed on this command line, and only
+	// this direction can be right for a setting whose whole meaning is "do not
+	// stop and ask me".
+	if cfg.AssumeYes {
+		p.SetAssumeYes(true)
+	}
 
 	if err := dispatch(ctx, g, cfg, cfgPath, p, stdout); err != nil {
 		return fail(p, err)
@@ -362,6 +370,11 @@ func dispatch(ctx context.Context, g globals, cfg *config.Config, cfgPath string
 
 	case "restore":
 		var ro restore.RestoreOptions
+		// Seeded from the config so KEEP_IMAGES=1 works without the flag, as it
+		// has always worked for brb.sh. --keep-images then sets it again and
+		// cannot unset it, which matches the flag's own meaning: it is how one
+		// command asks to keep the images, never how it asks not to.
+		ro.KeepImages = cfg.KeepImages
 		f := newFlags("restore")
 		f.StringList(&ro.Only, "--only")
 		f.DiscNum(&ro.Disc, "--disc")

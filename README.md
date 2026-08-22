@@ -107,7 +107,7 @@ Optional, but worth having:
 | `ddrescue` | `ddrescue` | salvages partially readable discs; `cp` stops at the first I/O error, `ddrescue` does not — this is what makes par2 usable on a scratched disc |
 | `udisksctl` | `udisks2` | lets `verify-disc` and `ingest` mount the drive for you |
 | `eject`, `findmnt` | `eject`, `util-linux` | disc swapping during `ingest` |
-| `pv` | `pv` | progress on long pipes |
+| `flock` | `util-linux` | lets `brb.sh` tell whether another brb is already using the staging directory; the Go build uses `flock(2)` directly and needs no program |
 
 `age-keygen` is deliberately not on that list. `brb init-key` generates both the
 primary and the rescue keypair with the age library it already links, so neither
@@ -122,7 +122,7 @@ sudo dnf install age squashfs-tools par2cmdline xorriso findutils gawk coreutils
 ```
 
 ```bash
-sudo dnf install ddrescue udisks2 pv eject util-linux
+sudo dnf install ddrescue udisks2 eject util-linux
 ```
 
 **Debian / Ubuntu**
@@ -132,7 +132,7 @@ sudo apt install age squashfs-tools par2 xorriso findutils gawk coreutils gzip
 ```
 
 ```bash
-sudo apt install gddrescue udisks2 pv eject util-linux
+sudo apt install gddrescue udisks2 eject util-linux
 ```
 
 Note the package name differences from Fedora: par2cmdline is `par2`, and
@@ -146,7 +146,7 @@ sudo pacman -S age squashfs-tools par2cmdline libisoburn gawk coreutils gzip
 ```
 
 ```bash
-sudo pacman -S ddrescue udisks2 pv util-linux
+sudo pacman -S ddrescue udisks2 util-linux
 ```
 
 `xorriso` is provided by `libisoburn` on Arch.
@@ -321,13 +321,25 @@ here.
 | `brb iso <n\|n-m\|n-\|all>` | build ISO images without burning, for burning elsewhere |
 
 **Reading a set — either implementation.** Substitute `brb.sh` for `brb` below
-and the behaviour is the same; that equivalence is what `xcompat-test.sh` exists
-to prove. The few places they differ are called out where they come up: `--only`
-repetition and `--keep-images` below, `KEEP_IMAGES` in a shared config file under
-[Configuration](#configuration). One more worth knowing before you script
-anything: `brb.sh ingest` prompts on `/dev/tty` between discs even with a mount
-path and `--yes`, and fails outright with no terminal, where the Go build's
-`ingest` runs unattended.
+and a set restores identically: same files, same bytes, same refusals. That is
+what `xcompat-test.sh` proves, and it is the only equivalence claimed here.
+
+The two are separate programs, and they differ around the edges. Everything in
+this table has been checked by running both; it is what is known to differ, not
+a promise that nothing else does.
+
+| Where | `brb` (Go) | `brb.sh` |
+|---|---|---|
+| `version` | a command | not a command — exits 1, "unknown command" |
+| usage errors | exit **2**, including `<command> --help` | exit **1** |
+| `doctor` | checks backup readiness; exits 1 with an identity but no recipients file | checks restore readiness; exits 0 on the same config |
+| flags after `--` | left alone: `brb index -- -y` searches for `-y` | `-y` and `-c` are stripped from anywhere on the line, so the same command searches for something else |
+| `ingest` with no terminal | runs unattended | prompts on `/dev/tty` between discs even with a mount path and `--yes`, and fails outright without one |
+| a foreign disc | staged first, refused at restore, leaving the file behind | refused before anything is staged |
+| `--only` | repeat the flag per path | as documented below |
+
+`KEEP_IMAGES` and `ASSUME_YES` used to belong on that list and no longer do:
+both readers now take them from the config file, so one file drives both.
 
 | Command | What it does |
 |---|---|

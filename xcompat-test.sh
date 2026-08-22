@@ -1585,9 +1585,32 @@ go_reads_keep_images_from_config() {
   run_go "$LOG/keep-cfg-go.log" "$cfg" restore "$dest" || return 1
   (( $(find "$st/restore" -maxdepth 1 -name '*.squashfs' 2>/dev/null | wc -l) > 0 ))
 }
-xassert0 "go brb honours KEEP_IMAGES from the config file" \
-  "brb.sh takes KEEP_IMAGES from the config; the Go build exposes only a --keep-images flag, so one config file cannot drive both readers the same way" \
-  go_reads_keep_images_from_config
+assert0 "go brb honours KEEP_IMAGES from the config file" go_reads_keep_images_from_config
+
+# The other reader-side key, and the one with teeth: ASSUME_YES answers the
+# confirmation that stands between a restore and a destination it overwrites.
+# Both readers take it from the config, so a file that silences one silences
+# both — the alternative, a key that means "do not ask" to brb.sh and nothing at
+# all to the Go build, is the worse failure of the two.
+sh_and_go_take_assume_yes_from_config() { # ..._from_config sh|go
+  local who=$1 st=$T/ycfg-$who dest=$T/outycfg-$who cfg=$T/cfg/ycfg-$who
+  rm -rf "$st" "$dest"; mkdir -p "$dest"
+  cp -a "$T/stage-go" "$st"; rm -rf "$st/restore"
+  mkcfg "$cfg" "$st" "$SRC" "ASSUME_YES=1"
+  # No pty and no --yes: without ASSUME_YES from the file this cannot confirm
+  # and must fail, so a pass here is the config key and nothing else.
+  case $who in
+    sh) bash "$BRB_SH" -c "$cfg" restore "$dest" >"$LOG/yes-$who.log" 2>&1 ;;
+    go) "$BRB_GO" --no-color -c "$cfg" restore "$dest" >"$LOG/yes-$who.log" 2>&1 ;;
+  esac || return 1
+  [[ -e "$dest/lib/a.c" ]]
+}
+for who in sh go; do
+  name=$([[ $who == sh ]] && echo 'brb.sh' || echo 'go brb')
+  assert0 "$name restores non-interactively on ASSUME_YES=1 from the config" \
+    sh_and_go_take_assume_yes_from_config "$who"
+done
+unset name
 
 # ---------------------------------------------------------------------------
 head_s "15. a public archive: the set that keeps no secret"

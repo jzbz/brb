@@ -235,6 +235,8 @@ func TestApplyAllKeys(t *testing.T) {
 		"DIST_DIR":            {Scalar: "/srv/brb-dist", Line: 21},
 		"ISO_MODE":            {Scalar: "EAGER", Line: 22},
 		"KEEP_ISOS":           {Scalar: "1", Line: 23},
+		"KEEP_IMAGES":         {Scalar: "1", Line: 26},
+		"ASSUME_YES":          {Scalar: "1", Line: 27},
 		"PRUNE_DIRS":          {Array: []string{"a"}, IsArray: true, Line: 24},
 		"EXCLUDE_MASKS":       {Array: []string{"*.tmp"}, IsArray: true, Line: 25},
 	}
@@ -276,6 +278,8 @@ func TestApplyAllKeys(t *testing.T) {
 		ReserveBytes:      1048576,
 		ISOMode:           ISOEager,
 		KeepISOs:          true,
+		KeepImages:        true,
+		AssumeYes:         true,
 		PruneDirs:         []string{"a"},
 		ExcludeMasks:      []string{"*.tmp"},
 		Jobs:              3,
@@ -352,9 +356,13 @@ func TestEmptyScalarLeavesTheDefault(t *testing.T) {
 		t.Errorf("empty values changed the configuration:\n got %+v\nwant %+v", c, Default())
 	}
 
+	// An empty value does not excuse an unknown key: a typo in a shared file is
+	// a typo whether or not it was given anything. KEEP_IMAGES used to stand
+	// here and was the wrong example — it is a real key both readers take from
+	// the config — so this uses a name that cannot become one.
 	c = Default()
-	err = c.Apply(map[string]Value{"KEEP_IMAGES": {Scalar: "", Line: 4}})
-	if err == nil || !strings.Contains(err.Error(), `unknown configuration key "KEEP_IMAGES"`) {
+	err = c.Apply(map[string]Value{"KEEP_IMAGE": {Scalar: "", Line: 4}})
+	if err == nil || !strings.Contains(err.Error(), `unknown configuration key "KEEP_IMAGE"`) {
 		t.Errorf("an empty unknown key was not refused: %v", err)
 	}
 

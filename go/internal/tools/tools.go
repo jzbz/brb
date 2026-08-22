@@ -38,14 +38,19 @@ const (
 	Udisksctl  = "udisksctl"
 	Eject      = "eject"
 	Findmnt    = "findmnt"
-	Pv         = "pv"
+	// Flock is not run by this build, which locks staging with flock(2)
+	// directly. It is known because brb.sh's lock_staging runs the program, and
+	// doctor's job is to report on the machine a restore will happen on, where
+	// the reader may well be the script. pv used to sit here and was run by
+	// neither implementation.
+	Flock = "flock"
 )
 
 // Known returns every tool name Detect looks for, in report order.
 func Known() []string {
 	return []string{
 		Mksquashfs, Unsquashfs, Age, Par2, Xorriso,
-		Ddrescue, Udisksctl, Eject, Findmnt, Pv,
+		Ddrescue, Udisksctl, Eject, Findmnt, Flock,
 	}
 }
 
@@ -61,7 +66,7 @@ var hints = map[string]string{
 	Udisksctl:  "udisks2",
 	Eject:      "util-linux / eject",
 	Findmnt:    "util-linux",
-	Pv:         "pv",
+	Flock:      "util-linux",
 }
 
 // ErrMissing is the sentinel behind every missing-tool error, so callers can
@@ -141,7 +146,7 @@ var versionProbes = map[string]versionProbe{
 	Udisksctl:  {[]string{"--version"}, firstLine},
 	Eject:      {[]string{"--version"}, firstLine},
 	Findmnt:    {[]string{"--version"}, firstLine},
-	Pv:         {[]string{"--version"}, firstLine},
+	Flock:      {[]string{"--version"}, firstLine},
 }
 
 // firstLine returns the first non-blank line of s, trimmed.

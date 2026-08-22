@@ -248,6 +248,10 @@ func configLines(cfg *config.Config, show func(string) string) []string {
 		assign("AGE_IDENTITY", show(identity), identityNote),
 		assign("PUBLIC_ARCHIVE", boolInt(cfg.PublicArchive), "1 keeps no secret: a fresh key is written onto every disc (see backup --public-archive)"),
 		assign("DIST_DIR", show(cfg.DistDir), distNote(cfg, show)),
+		// Reader-side, and last because they matter on a restore rather than
+		// on the backup everything above describes.
+		assign("KEEP_IMAGES", boolInt(cfg.KeepImages), "reader: 1 keeps each decrypted image after extracting it"),
+		assign("ASSUME_YES", boolInt(cfg.AssumeYes), "reader: 1 answers every confirmation, including a restore that overwrites"),
 	}
 	out = append(out, arrayLines("PRUNE_DIRS", cfg.PruneDirs, show)...)
 	out = append(out, arrayLines("EXCLUDE_MASKS", cfg.ExcludeMasks, show)...)
