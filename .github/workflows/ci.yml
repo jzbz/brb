@@ -289,7 +289,11 @@ jobs:
       - name: The release assets must be versioned, verified, and the same bytes
         working-directory: ${{ runner.temp }}/home/brb-dist/release
         run: |
-          sha512sum -c SHA512SUMS
+          sha256sum -c SHA256SUMS
+          # The release page carries this file and a detached signature over it,
+          # and nothing else: no SHA512SUMS, no per-artifact .sha256. A second
+          # unsigned hash beside a signed one is a downgrade path.
+          test ! -e SHA512SUMS || { echo "release dir still writes SHA512SUMS" >&2; exit 1; }
           v="$(sed -n 's/^VERSION="\([^"]*\)".*/\1/p' "$GITHUB_WORKSPACE/brb.sh" | head -1)"
           test -n "$v" || { echo "could not read VERSION out of brb.sh" >&2; exit 1; }
           for f in "brb-v$v-linux-amd64" "brb-v$v-linux-aarch64" \

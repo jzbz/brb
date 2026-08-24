@@ -10,7 +10,7 @@
 #   brb-src.tar.gz      complete Go source, dependencies vendored
 #   SHA512SUMS          hashes of the four above
 #   release/            those same four under the names a release wears,
-#                       brb-vX.Y.Z-*, with their own SHA512SUMS beside them
+#                       brb-vX.Y.Z-*, with a SHA256SUMS beside them to sign
 #
 # That list is $PAYLOAD below, and it is the list every step here works from.
 #
@@ -234,9 +234,21 @@ mv -f -- "$STAGE_OUT/SHA512SUMS" "$OUT/SHA512SUMS"
 # exactly how a release ends up disagreeing with itself, and this script already
 # exists to notice that class of drift rather than allow it. The copies are made
 # from the bytes just published, not from the staging directory, so what the
-# release carries is what a disc would carry. SHA512SUMS is written last: a run
-# killed part way leaves a directory that is visibly unfinished rather than
-# plausibly complete.
+# release carries is what a disc would carry. The checksum file is written last:
+# a run killed part way leaves a directory that is visibly unfinished rather
+# than plausibly complete.
+#
+# SHA256 here, where the discs use SHA512. The two files answer to different
+# things. A disc's SHA512SUMS is part of the format and nothing signs it; it is
+# there so a set can check itself decades later with coreutils alone. This one
+# is the file that gets a detached PGP signature before it goes up, and it is
+# read by a stranger with a download and a terminal — sha256 is what GitHub
+# already records for every asset it serves, so those two numbers can be
+# compared without trusting either side, and `sha256sum -c` is the command that
+# reader already knows. One signed file covers the whole set: a .sha256 beside
+# each artifact would mean signing four files per release, or leaving unsigned
+# hashes next to signed ones, which is a downgrade path rather than a
+# convenience.
 release_name() { # release_name PAYLOAD-NAME
   case "$1" in
     brb.sh)         printf 'brb-v%s.sh' "$VERSION" ;;
@@ -258,14 +270,19 @@ for f in "${PAYLOAD[@]}"; do
     || { echo "release copy $rel does not match $f" >&2; exit 1; }
   rel_names+=( "$rel" )
 done
-( cd "$REL" && sha512sum -- "${rel_names[@]}" > SHA512SUMS )
-( cd "$REL" && sha512sum -c --quiet SHA512SUMS ) \
+( cd "$REL" && sha256sum -- "${rel_names[@]}" > SHA256SUMS )
+( cd "$REL" && sha256sum -c --quiet SHA256SUMS ) \
   || { echo "release checksums in $REL do not verify" >&2; exit 1; }
 
 say "done"
 ( cd "$OUT" && ls -l -- "${PAYLOAD[@]}" SHA512SUMS ) >&2
-( cd "$REL" && ls -l -- "${rel_names[@]}" SHA512SUMS ) >&2
+( cd "$REL" && ls -l -- "${rel_names[@]}" SHA256SUMS ) >&2
 printf '\n  Point brb at it:  export BRB_DIST_DIR=%s\n  or:               ln -sfn %s %s/dist\n' \
   "$OUT" "$OUT" "$REPO" >&2
-printf '\n  Publish v%s:      gh release upload v%s %s/*\n\n' \
-  "$VERSION" "$VERSION" "$REL" >&2
+# The signature is made by hand, off this machine's build path and outside this
+# script: a build script that can sign is a build script that can be made to
+# sign something else. It prints the command and stops there.
+printf '\n  Sign:             cd %s && gpg --detach-sign --armor SHA256SUMS\n' \
+  "$REL" >&2
+printf '  Then publish:     gh release upload v%s %s/*\n\n' \
+  "$VERSION" "$REL" >&2
