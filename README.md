@@ -193,6 +193,56 @@ Install it under a distinct name. Both name themselves after however they were
 invoked, so installing both as `brb` would make their help text and every
 suggested command ambiguous — and one of them cannot back up.
 
+### Verifying a download
+
+A [release](https://github.com/jzbz/brb/releases) carries the two static
+binaries, the bash script and the source tarball, a `SHA256SUMS` listing all
+four, and a `SHA256SUMS.asc` signing that list. Fetch the signing key once, from
+GitHub:
+
+```bash
+curl -sL https://github.com/jzbz.gpg | gpg --import
+```
+
+or from a keyserver, which is the better of the two — it does not come from the
+same host as the release:
+
+```bash
+gpg --locate-keys jz@jz.bz
+```
+
+Either way the fingerprint below is what to trust, not where you got it. Then
+check the signature before the files:
+
+```bash
+gpg --verify SHA256SUMS.asc SHA256SUMS && sha256sum -c --ignore-missing SHA256SUMS
+```
+
+`gpg --verify` has to report a *Good signature* from
+`252B 901C 8885 3CF9 F939  2559 2497 38C8 641C 3359`; any other key, or none,
+and the rest is meaningless. `--ignore-missing` checks whichever of the four you
+actually downloaded and stays quiet about the rest.
+
+A freshly imported key also draws *"WARNING: This key is not certified with a
+trusted signature"*. That is expected and is not a failed check: it says the key
+carries no web-of-trust path from anything you already trust, which a key you
+just fetched never does. The signature is still good. Compare the fingerprint
+gpg prints against the one above and move on, or sign the key locally
+(`gpg --lsign-key jz@jz.bz`) to silence it on later releases.
+
+The order is the whole point. `SHA256SUMS` sits in the same release as the files
+it describes, so on its own it catches a truncated download and nothing else —
+anyone able to replace a binary could replace the list beside it just as easily.
+The signature is what turns it into a check, and it is made by hand: the key
+never goes near CI, so a compromised workflow can publish a binary but cannot
+sign for one.
+
+None of this is the [`SHA512SUMS` a disc carries](#what-ends-up-on-each-disc).
+That file is written at backup time over the files of that one disc, is what
+`sha512sum -c` checks during a restore, and nothing signs it — a disc is in your
+hand, and the question it answers is whether the plastic still reads back, not
+who published it.
+
 ---
 
 ### Building the disc payload
