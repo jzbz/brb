@@ -662,7 +662,7 @@ staged_sidecar_sets() {  # staged_sidecar_sets DISC-NUMBER
     cands+=( "$(printf 'sidecars-disc%02d.par2' "$n")" )
   else
     for nm in "$ENC_DIR"/sidecars-disc*.par2; do
-      [[ -e "$nm" && "$nm" != *.vol* ]] || continue
+      [[ -e "$nm" && "${nm##*/}" != *.vol* ]] || continue
       cands+=( "${nm##*/}" ); break
     done
   fi

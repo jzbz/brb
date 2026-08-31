@@ -842,6 +842,15 @@ if (( HAVE_SCRIPT )); then
     assert0 "  ... byte-identical to the copy on the disc" \
       cmp -s "$GOD/data/disc01.squashfs.age" "$T/ing-$who/enc/disc01.squashfs.age"
     assert0 "  ... the encrypted index came across too" test -f "$T/ing-$who/enc/index.tsv.gz.age"
+    # Nothing else pins this. Each disc carries a sidecars.par2 of its own, so
+    # staging renames the set per disc or the N sets collide in one flat
+    # directory; staged_name and stagedSidecarName have to spell that name the
+    # same way for either reader's staging to be the other's, and the two are
+    # separate implementations with nothing but a comment holding them together.
+    # Each reader ingests into a staging area of its own above, so no test can
+    # catch the drift by having one read what the other wrote — only the name.
+    assert0 "  ... and the disc's sidecar parity was staged under its per-disc name" \
+      test -f "$T/ing-$who/enc/sidecars-disc01.par2"
     assert0 "  ... and MANIFEST.txt was copied into staging" test -f "$T/ing-$who/MANIFEST.txt"
     assert0 "  ... a second pass keeps the copy it already has" ingest_is_idempotent "$who"
     assert0 "  ... and the ingested set restores byte-identical to the source" restore_from_ingest "$who"
