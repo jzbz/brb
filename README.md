@@ -1049,11 +1049,14 @@ Known and deliberate, but you should hear them before you rely on this:
   they cannot read) and then match it (which they therefore cannot do). Be clear
   about the limits. This detects that the discs of a set **disagree with each
   other** — it cannot say which one is lying, and if the forgery is the first
-  disc you ingest, the genuine discs are what gets refused. It gives nothing
-  when a single self-consistent forged disc is all you have. And a filename
-  containing a newline cannot survive the line-based listing the check reads, so
-  for a set holding one the check says out loud that it could not be made exact,
-  and does not refuse. It is not a signature; the format has no signing key.
+  disc you ingest, the genuine discs are what gets refused. Nothing bounds how
+  many rows that pinned index may hold, either, so a forgery carrying a large
+  enough one exhausts memory on a later `restore` rather than being refused at
+  all. It gives nothing when a single self-consistent forged disc is all you
+  have. And a filename containing a newline cannot survive the line-based
+  listing the check reads, so for a set holding one the check says out loud
+  that it could not be made exact, and does not refuse. It is not a signature;
+  the format has no signing key.
 
 - **A restore overwrites its destination.** `unsquashfs -f` replaces existing
   files with the backup's versions, mode and mtime included, and `--yes` answers
@@ -1068,9 +1071,16 @@ Known and deliberate, but you should hear them before you rely on this:
   have files written through it, outside the destination, with the restoring
   user's privileges. Nothing in either reader can close that window — no
   descriptor survives into a subprocess that takes a path — so restore
-  somewhere only you can write. Staging is a different matter and is defended
-  by descriptor: it is opened with `O_NOFOLLOW` and checked through the handle
-  it opened, never by name a second time.
+  somewhere only you can write. Staging is better defended, though not
+  unconditionally, and the two readers differ in how far they can go: the Go
+  build opens `$STAGING` with `O_NOFOLLOW` and applies the mode and ownership
+  checks through the handle it opened, never by name a second time, while
+  `brb.sh` has no way to hold a descriptor and tests the name with `[[ -L ]]`
+  before creating the directory. Neither reader examines the path *above*
+  `$STAGING`: the parents are created with `mkdir -p` and trusted. So point
+  staging somewhere whose parent directories are yours or root's — the default
+  `/var/tmp/brb` qualifies, because `/var/tmp` is root-owned and sticky and no
+  other account can put anything in `brb`'s way.
 - **A restore needs room for the extracted tree plus one decrypted image.** Each
   image is removed as soon as its contents are on disk, so only one exists at a
   time. `KEEP_IMAGES=1` (or `--keep-images` on the Go build) keeps them all for
