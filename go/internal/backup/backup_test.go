@@ -28,6 +28,14 @@ import (
 // quiet is a printer that throws its output away.
 func quiet() *ui.Printer { return ui.New(io.Discard, false) }
 
+// recordingPrinter is a printer whose output can be read back, for the checks
+// that assert on what the operator was actually told rather than only on what
+// the function returned.
+func recordingPrinter() (*ui.Printer, func() string) {
+	var b bytes.Buffer
+	return ui.New(&b, false), b.String
+}
+
 func TestRequiredSpace(t *testing.T) {
 	t.Parallel()
 	tests := []struct {
@@ -1167,5 +1175,93 @@ func TestFilesMatchingInADirectoryNamedLikeAGlob(t *testing.T) {
 	// And the thing this replaced really does fail there.
 	if m, _ := filepath.Glob(filepath.Join(dir, "sidecars*.par2")); len(m) != 0 {
 		t.Logf("filepath.Glob matched %v in a directory named like a glob; the helper is belt and braces here", m)
+	}
+}
+
+// TestResumeFilterWarnsWhenANewLinkJoinsWrittenData pins the report for the
+// case pack cannot fix: a hard link added to an already-written inode between
+// an interrupted run and its resume.
+//
+// The new name cannot join its group, because the disc holding the group is
+// finished, so pack charges it a second full copy on a later disc and the
+// restored tree gets two independent files where the source had one inode. It
+// was silent: RawBytes counts a group once per inode, so the tree-size warning
+// cannot fire for a new link, and the vanished-names warning counts only names
+// that went away.
+func TestResumeFilterWarnsWhenANewLinkJoinsWrittenData(t *testing.T) {
+	res := &scan.Result{
+		RawBytes: 300,
+		Entries: []scan.Entry{
+			// One inode, three names. a and b were written to disc 1; c is new.
+			{Rel: "a.bin", Kind: scan.KindFile, Size: 100, Dev: 7, Inode: 42, Nlink: 3},
+			{Rel: "b.bin", Kind: scan.KindFile, Size: 100, Dev: 7, Inode: 42, Nlink: 3},
+			{Rel: "c.bin", Kind: scan.KindFile, Size: 100, Dev: 7, Inode: 42, Nlink: 3},
+			{Rel: "plain.bin", Kind: scan.KindFile, Size: 100, Dev: 7, Inode: 99, Nlink: 1},
+		},
+	}
+	p, log := recordingPrinter()
+	r := &runner{p: p, st: &State{
+		Version: StateVersion, DiscsDone: 1, ScanRawSize: 300,
+		Assigned: []string{"a.bin", "b.bin"},
+	}}
+
+	out, err := r.resumeFilter(res)
+	if err != nil {
+		t.Fatalf("resumeFilter refused a resume it should only warn about: %v", err)
+	}
+	// The new link is still packed: warning, not refusal, and no byte is dropped.
+	var kept []string
+	for _, e := range out {
+		kept = append(kept, e.Rel)
+	}
+	if len(kept) != 2 || kept[0] != "c.bin" || kept[1] != "plain.bin" {
+		t.Fatalf("kept %v, want [c.bin plain.bin]", kept)
+	}
+	got := log()
+	if !strings.Contains(got, "c.bin") {
+		t.Errorf("the warning does not name the new link:\n%s", got)
+	}
+	// It has to say what c.bin duplicates, because the repair is to remove that
+	// link and resume again, and nothing else in the run points at the pair.
+	if !strings.Contains(got, "a.bin") && !strings.Contains(got, "b.bin") {
+		t.Errorf("the warning does not name what the link duplicates:\n%s", got)
+	}
+	if strings.Contains(got, "plain.bin") {
+		t.Errorf("an ordinary new file was reported as a relink:\n%s", got)
+	}
+}
+
+// TestResumeFilterIsQuietAboutAnUnchangedLinkGroup is the companion that stops
+// the check above from firing on every hard link it sees. A group wholly
+// outstanding, or wholly assigned, is the ordinary case and says nothing.
+func TestResumeFilterIsQuietAboutAnUnchangedLinkGroup(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		assigned []string
+	}{
+		{"group wholly outstanding", []string{"other.bin"}},
+		{"group wholly assigned", []string{"a.bin", "b.bin", "other.bin"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			res := &scan.Result{
+				RawBytes: 300,
+				Entries: []scan.Entry{
+					{Rel: "a.bin", Kind: scan.KindFile, Size: 100, Dev: 7, Inode: 42, Nlink: 2},
+					{Rel: "b.bin", Kind: scan.KindFile, Size: 100, Dev: 7, Inode: 42, Nlink: 2},
+					{Rel: "other.bin", Kind: scan.KindFile, Size: 100, Dev: 7, Inode: 99, Nlink: 1},
+				},
+			}
+			p, log := recordingPrinter()
+			r := &runner{p: p, st: &State{
+				Version: StateVersion, DiscsDone: 1, ScanRawSize: 300,
+				Assigned: tc.assigned,
+			}}
+			if _, err := r.resumeFilter(res); err != nil {
+				t.Fatalf("resumeFilter: %v", err)
+			}
+			if got := log(); strings.Contains(got, "hard link") {
+				t.Errorf("warned about an unchanged link group:\n%s", got)
+			}
+		})
 	}
 }

@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -136,19 +137,40 @@ func Run(ctx context.Context, o Options) error {
 // hard link group travels to the same disc, so a group is either wholly
 // assigned or wholly outstanding.
 //
-// It refuses when a path a finished disc holds as a regular file is now a
-// directory, a symlink or a device node. A finished disc cannot be rewritten
-// and every later disc carries the whole skeleton, so such a set holds that
-// path as a file on one disc and as a non-file on all the rest, and unsquashfs
-// refuses the second of them ("failed to lstat ..., because Not a directory")
-// with the restore abandoned part way through the set.
+// Two ways the tree can change between the runs break that equivalence, and
+// they get different answers because their consequences differ.
 //
-// The refusal is here because the alternative was silence. The assigned lookup
-// used to sit inside the KindFile branch, so a path that had changed kind never
-// matched the set at all: it was packed into the skeleton as if new, the run
-// finished and reported a complete set, and the only warning fired was the one
-// below saying the file was "no longer in the source tree" — which reads as
-// reassurance. Nothing said anything was wrong until somebody read the set back.
+// A path a finished disc holds as a regular file, and which is now a directory,
+// a symlink or a device node, is REFUSED. A finished disc cannot be rewritten
+// and every later disc carries the whole skeleton, so such a set holds that
+// path as a file on one disc and as a non-file on all the rest; unsquashfs
+// refuses the second of them ("failed to lstat ..., because Not a directory")
+// and abandons the restore part way through the set. The refusal is here
+// because the alternative was silence: the assigned lookup used to sit inside
+// the KindFile branch, so a path that had changed kind never matched the set at
+// all, the run finished reporting a complete set, and the only warning fired
+// was the one below saying the file was "no longer in the source tree" — which
+// reads as reassurance.
+//
+// A hard link added to an already-written inode is WARNED about and packed. It
+// cannot join the rest of its group — the disc holding the group is finished,
+// and nothing can add a name to a written disc — so pack.New sees the new name
+// alone and charges it a second full copy on a later disc. The set grows, and
+// the restored tree holds two independent files where the source had one inode
+// with several names. That is a fidelity loss and a size surprise, not a broken
+// set: every byte still restores. Adding a name to a tree between runs is what
+// --resume is documented to cope with, so refusing would break the supported
+// case to prevent a duplicate.
+//
+// That one was silent too. RawBytes counts a hard-link group once per inode
+// (scan.Result), so a new link does not change the measured tree size and the
+// warning above cannot fire; the one below counts only names that vanished.
+// Detecting it needs nothing new in the state file: the scan carries Dev, Inode
+// and Nlink for every entry, the already-assigned ones included, so one pass
+// over the same result says which inodes a finished disc already holds. The one
+// case that escapes is a group whose every previously-written name has since
+// been deleted — its inode is then nowhere in the scan, so there is nothing to
+// match, and those names are reported by the vanished-names warning instead.
 func (r *runner) resumeFilter(res *scan.Result) ([]scan.Entry, error) {
 	if r.st.ScanRawSize == 0 {
 		r.st.ScanRawSize = res.RawBytes
@@ -162,8 +184,23 @@ func (r *runner) resumeFilter(res *scan.Result) ([]scan.Entry, error) {
 	}
 
 	assigned := r.st.assignedSet()
+
+	// Which inodes a finished disc already holds, and under which name, so the
+	// warning can say what the new link duplicates. Keyed on the pair, never on
+	// the inode alone, for the reason scan.Entry.Dev gives.
+	written := make(map[inodeKey]string)
+	for _, e := range res.Entries {
+		if e.Kind != scan.KindFile || e.Nlink <= 1 || e.Inode == 0 {
+			continue
+		}
+		if _, ok := assigned[e.Rel]; ok {
+			written[inodeKey{dev: e.Dev, ino: e.Inode}] = e.Rel
+		}
+	}
+
 	out := make([]scan.Entry, 0, len(res.Entries))
-	var changed []scan.Entry
+	var changed, relinked []scan.Entry
+	firstName := map[string]string{}
 	done, todo := 0, 0
 	for _, e := range res.Entries {
 		_, wasAssigned := assigned[e.Rel]
@@ -176,6 +213,12 @@ func (r *runner) resumeFilter(res *scan.Result) ([]scan.Entry, error) {
 				done++
 				continue
 			}
+			if e.Nlink > 1 && e.Inode != 0 {
+				if name, ok := written[inodeKey{dev: e.Dev, ino: e.Inode}]; ok {
+					relinked = append(relinked, e)
+					firstName[e.Rel] = name
+				}
+			}
 			todo++
 		}
 		out = append(out, e)
@@ -183,12 +226,50 @@ func (r *runner) resumeFilter(res *scan.Result) ([]scan.Entry, error) {
 	if len(changed) > 0 {
 		return nil, changedKindError(changed, r.st.DiscsDone)
 	}
+	if len(relinked) > 0 {
+		r.p.Warn("%s", relinkedDetail(relinked, firstName))
+	}
 	if missing := len(assigned) - done; missing > 0 {
 		r.p.Warn("%d file(s) recorded on an earlier disc are no longer in the source tree; "+
 			"they remain on the discs already written", missing)
 	}
 	r.p.Step("resume: %d file(s) already on disc, %d still to write", done, todo)
 	return out, nil
+}
+
+// inodeKey identifies one file within one filesystem. It is the pair, never the
+// inode alone, for the reason [scan.Entry].Dev gives: two unrelated files on two
+// filesystems can carry the same inode number, and a scan can hold more than one
+// device. pack.New groups hard links on the same pair.
+type inodeKey struct {
+	dev, ino uint64
+}
+
+// relinkedDetail is the warning for names that were hard-linked to
+// already-written data between an interrupted run and its resume, largest
+// first. It names what each duplicates, because the repair is to remove the new
+// link and resume again, and the operator cannot do that without knowing which
+// name is new.
+func relinkedDetail(relinked []scan.Entry, firstName map[string]string) string {
+	sort.Slice(relinked, func(i, j int) bool { return relinked[i].Size > relinked[j].Size })
+	var extra int64
+	for _, e := range relinked {
+		extra += e.Size
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "%d new hard link(s) point at data an earlier disc already holds; the disc holding "+
+		"their other names is written and cannot gain one, so each is packed again as a full copy "+
+		"(%s more on later discs, and each restores as a separate file rather than as a link):",
+		len(relinked), ui.HumanBytes(extra))
+	for i, e := range relinked {
+		if i == 20 {
+			fmt.Fprintf(&b, "\n  ... and %d more", len(relinked)-20)
+			break
+		}
+		fmt.Fprintf(&b, "\n  %14d  %s (already on a disc as %s)", e.Size, e.Rel, firstName[e.Rel])
+	}
+	b.WriteString("\n  remove the new link(s) and resume again to avoid the copies, or start the set over")
+	return b.String()
 }
 
 // changedKindError refuses a resume whose source tree has replaced an
