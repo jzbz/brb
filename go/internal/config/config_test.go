@@ -847,6 +847,31 @@ func TestValidateAcceptsEveryCompressor(t *testing.T) {
 	}
 }
 
+// TestBlockSizeOverflowDoesNotPassValidation is the half that matters
+// operationally: BlockSizeBytes is only ever reached through validateBlockSize,
+// and a wrapped value is dangerous precisely because it lands INSIDE the range
+// that check enforces. validateBlockSize's own comment says catching a bad
+// BLOCK_SIZE here "saves discovering it hours into a run"; before the overflow
+// check it did the opposite, passing the config and leaving mksquashfs to
+// refuse the raw string much later with "-b invalid block size".
+func TestBlockSizeOverflowDoesNotPassValidation(t *testing.T) {
+	const wrapsTo4096 = "18014398509481988K"
+	if n, err := BlockSizeBytes(wrapsTo4096); err == nil {
+		t.Fatalf("BlockSizeBytes(%q) = %d, want an error: the multiply wrapped", wrapsTo4096, n)
+	}
+	if err := validateBlockSize(wrapsTo4096); err == nil {
+		t.Fatalf("validateBlockSize(%q) = nil; the wrapped value landed inside 4K..1M "+
+			"and the run would have started with a BLOCK_SIZE that means nothing", wrapsTo4096)
+	}
+	// The companion: the guard must not refuse the sizes an operator really
+	// writes, or it would pass by rejecting everything.
+	for _, ok := range []string{"4K", "128K", "1M", "131072"} {
+		if err := validateBlockSize(ok); err != nil {
+			t.Errorf("validateBlockSize(%q) = %v, want nil", ok, err)
+		}
+	}
+}
+
 func TestBlockSizeBytes(t *testing.T) {
 	tests := []struct {
 		in      string
@@ -864,6 +889,19 @@ func TestBlockSizeBytes(t *testing.T) {
 		{"0", 0, true},
 		{"-4K", 0, true},
 		{"1G", 0, true},
+		// The suffix multiply wraps. (4+2^54)*1024 is 4096 + 2^64, which in
+		// int64 is exactly 4096 — a valid power of two inside the 4K..1M range,
+		// so this used to be accepted as a 4 KiB block size and the check that
+		// exists to catch a bad BLOCK_SIZE before the run reported it fine.
+		{"18014398509481988K", 0, true},
+		// The boundary either side, so the guard is not just "refuse anything
+		// large". 2^53 K is 2^63, one past the top of an int64, so the multiply
+		// is refused here; (2^53 - 1) K is the largest that still fits, so it
+		// converts cleanly and it is validateBlockSize's range check, not this
+		// function, that turns it away.
+		{"9007199254740992K", 0, true},
+		{"9007199254740991K", 9223372036854774784, false},
+		{"9007199254740992M", 0, true},
 	}
 	for _, tc := range tests {
 		got, err := BlockSizeBytes(tc.in)

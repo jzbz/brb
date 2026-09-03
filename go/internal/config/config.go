@@ -991,6 +991,15 @@ func BlockSizeBytes(s string) (int64, error) {
 	if err != nil || n <= 0 {
 		return 0, fmt.Errorf("BLOCK_SIZE %q is not a size like 4K, 128K or 1M", s)
 	}
+	// The suffix multiply has to be checked, not just the digits. Go's int64
+	// multiplication wraps silently, so "18014398509481988K" — (4+2^54)*1024,
+	// which is 4096 + 2^64 — came back as exactly 4096 and sailed through
+	// validateBlockSize's power-of-two range below. A number that means nothing
+	// was accepted as the default block size, and the check that exists to
+	// catch a bad BLOCK_SIZE before the run said the value was fine.
+	if n > math.MaxInt64/mult {
+		return 0, fmt.Errorf("BLOCK_SIZE %q is not a size like 4K, 128K or 1M", s)
+	}
 	return n * mult, nil
 }
 
