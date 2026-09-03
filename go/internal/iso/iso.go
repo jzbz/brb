@@ -310,13 +310,23 @@ func Build(ctx context.Context, o Options, spec string) error {
 		return fmt.Errorf("iso: no disc directories in %s — run 'brb backup' first", o.Cfg.Dirs().Discs)
 	}
 	// Secure before locking, because the lock file is created inside the tree
-	// and [fsx.LockStaging] says so in its own contract: it opens .brb.lock
-	// with a plain O_RDWR|O_CREATE and then truncates it, so a symlink planted
-	// at that name is followed and its target is destroyed. Nothing stops that
-	// but [fsx.SecureDir] having already refused a staging root that is a
-	// symlink or belongs to another account — and the README's default STAGING
-	// lives under a world-writable /var/tmp, where any local account can create
-	// the tree ahead of the operator.
+	// and [fsx.SecureDir] is what settles the root the lock path resolves
+	// under: a staging root that is a symlink, or that belongs to another
+	// account, is refused here rather than written into. The README's default
+	// STAGING lives under a world-writable /var/tmp, where any local account
+	// can lay the tree ahead of the operator.
+	//
+	// The ordering is defence in depth, not the only defence. The comment that
+	// stood here had that backwards: it said [fsx.LockStaging] opens .brb.lock
+	// with a plain O_RDWR|O_CREATE and that nothing but the securing above
+	// stops a planted symlink from being followed and its target destroyed.
+	// LockStaging opens it O_NOFOLLOW, refuses a link with an error of its own,
+	// and says in its contract that the guarantee holds whatever order the
+	// caller does things in (see fsx/lock.go). brb.sh tests the same name with
+	// [[ -L ]] before its redirection, a shell having no such flag. Both
+	// readers therefore refuse a symlinked lock unaided; what securing first
+	// buys is that the operator is told about the staging ROOT, which is the
+	// thing they have to fix, instead of about the lock file inside it.
 	//
 	// `brb iso` was the one staging-writing command that skipped this; backup
 	// secures in preflight and burn/restore secure in their own lockStaging, so

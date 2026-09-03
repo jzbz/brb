@@ -316,14 +316,23 @@ func TestEnsureRebuildsATruncatedISO(t *testing.T) {
 // TestBuildRefusesASymlinkedStagingRootBeforeTakingTheLock is the `iso`
 // command's half of the staging rules, and it is about ORDER as much as about
 // the refusal. Build used to go straight from "are there disc directories?" to
-// fsx.LockStaging, which is the one thing fsx.LockStaging's own contract says
-// not to do: it creates .brb.lock with a plain O_RDWR|O_CREATE and truncates it,
-// so a symlink planted at that name is followed and the target destroyed. On
-// the README's default STAGING under a world-writable /var/tmp, a local account
-// can lay the whole tree — root and lock file both — before the operator's first
-// run. Backup secures in preflight and burn/restore secure in their own
-// lockStaging; `brb iso` was the one staging-writing command that did not, and
-// the file below is what that cost.
+// fsx.LockStaging without securing the tree first; backup secures in preflight
+// and burn/restore secure in their own lockStaging, and `brb iso` was the one
+// staging-writing command that did not.
+//
+// Order is not observable in whether Build fails, which is what this test used
+// to check and why it passed with the securing call deleted. LockStaging opens
+// the lock O_NOFOLLOW and refuses a planted symlink on its own (fsx/lock.go),
+// so a Build that reaches it still errors, still says "symlink", and still
+// leaves the target whole. An earlier version of the comment here claimed the
+// opposite — that LockStaging follows the link and only the securing above
+// prevents it — and asserting on that belief tested nothing.
+//
+// What order does decide is WHICH refusal the operator gets. Secured first, the
+// error names the staging root, which is the thing they have to fix. Unsecured,
+// it names the lock file inside a root that should never have been used at all.
+// So the assertion is on the wording of the two, and it fails if the securing
+// call goes away.
 func TestBuildRefusesASymlinkedStagingRootBeforeTakingTheLock(t *testing.T) {
 	o := testOptions(t)
 	stageDiscs(t, o, 1)
@@ -352,6 +361,17 @@ func TestBuildRefusesASymlinkedStagingRootBeforeTakingTheLock(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "symlink") {
 		t.Errorf("Build over a symlinked STAGING = %v, want an error naming the symlink", err)
+	}
+	// The ordering assertion. SecureDir's refusal is the staging-root one;
+	// LockStaging's names the lock file. Getting the second means the lock was
+	// opened inside a root nothing had vetted, which is the defect this test is
+	// named for.
+	if !strings.Contains(err.Error(), "a staging directory must be a real directory") {
+		t.Errorf("Build refused, but not as the staging root: %v", err)
+	}
+	if strings.Contains(err.Error(), "the staging lock") {
+		t.Errorf("the lock was opened before the tree was secured; the refusal came from "+
+			"LockStaging rather than from SecureDir: %v", err)
 	}
 	got, readErr := os.ReadFile(victim)
 	if readErr != nil {
