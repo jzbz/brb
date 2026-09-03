@@ -2181,6 +2181,59 @@ else
        "script(1) is not installed; ingest reads its disc prompts from /dev/tty and cannot be driven from a pipe"
 fi
 
+# ---------------------------------------------------------------------------
+head_s "17. a disc that carries symbolic links at its own names"
+# ---------------------------------------------------------------------------
+# A disc brb wrote holds data/ as a real directory and its three root files as
+# real files. A hostile or hand-mastered one can hold a link at any of those
+# names, and following it reads a file that is not on the disc: data -> a
+# directory of the operator's stages its contents as if they were images, and
+# MANIFEST.txt -> /dev/zero streams until the filesystem fills, because the hash
+# that would judge the file is taken as the bytes go past and /dev/zero does not
+# end.
+#
+# Neither reader has to mount anything to be shown this: both take a directory
+# where a mount point goes, which is the whole reason a dir-as-disc is what the
+# hostile cases in this file are built from.
+#
+# The assertion is not merely "it refuses". It is that NOTHING was staged: a
+# reader that copied the linked-to bytes and then reported a hash mismatch would
+# satisfy an exit code while leaving the operator's own files sitting in enc/
+# under an image's name.
+hostile_disc() { # hostile_disc DIR
+  local d=$1
+  mkdir -p "$d/disc" "$d/outside"
+  printf 'not from any disc\n' > "$d/outside/secret.txt"
+  ln -s "$d/outside"  "$d/disc/data"
+  ln -s /dev/zero     "$d/disc/MANIFEST.txt"
+}
+
+# staged_names DIR -- every file under a staging tree, bar the lock, one per line
+staged_names() { find "$1" -type f ! -name '.brb.lock' 2>/dev/null | sort; }
+
+HOS=$T/hostile
+hostile_disc "$HOS"
+for who in sh go; do
+  case $who in sh) name="brb.sh" ;; go) name="go brb" ;; esac
+  st=$T/hostile-stage-$who
+  mkdir -p "$st"
+  mkcfg "$T/cfg/hostile-$who" "$st" "$SRC"
+  if [[ $who = go ]]; then
+    run_go "$LOG/hostile-$who.log" "$T/cfg/hostile-$who" ingest "$HOS/disc" || true
+  elif ((HAVE_SCRIPT)); then
+    run_pty "$LOG/hostile-$who.log" $'\nq\n' \
+      "bash $BRB_SH --yes -c $T/cfg/hostile-$who ingest $HOS/disc" || true
+  else
+    skip "$name refuses a disc whose data/ is a symlink" "script(1) is not installed"
+    continue
+  fi
+  assert0 "$name stages nothing from a disc whose data/ is a symlink and whose MANIFEST.txt is a device" \
+    test -z "$(staged_names "$st")"
+  assert0 "  ... and says the link is why, rather than calling the disc empty" \
+    grep -qi 'symbolic link' "$LOG/hostile-$who.log"
+done
+unset name st
+
 printf '\n%d passed, %d failed, %d xfail (known divergences), %d skipped\n' \
   "$pass_n" "$fail_n" "$xfail_n" "$skip_n"
 if ((fail_n)); then printf '\nfailures:\n'; printf '  - %s\n' "${FAILURES[@]}"; exit 1; fi

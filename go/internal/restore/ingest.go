@@ -188,14 +188,25 @@ func (ig *ingester) ingestDisc(ctx context.Context) (staged bool, err error) {
 	unmount := func() { once.Do(release) }
 	defer unmount()
 
+	// Everything below reads a disc somebody else may have mastered, so the
+	// names are resolved through a root confined to the mount point. See
+	// [discEntry] for what that buys and what it does not.
+	discRoot, err := os.OpenRoot(mp)
+	if err != nil {
+		return false, fmt.Errorf("restore: opening %s: %w", mp, err)
+	}
+	defer discRoot.Close()
+
 	data := filepath.Join(mp, dataDir)
-	fi, err := os.Stat(data)
-	if err != nil || !fi.IsDir() {
+	switch fi, derr := discEntry(discRoot, dataDir); {
+	case derr != nil && !errors.Is(derr, fs.ErrNotExist):
+		return false, fmt.Errorf("restore: %s: %w", mp, derr)
+	case derr != nil || !fi.IsDir():
 		return false, fmt.Errorf("restore: %s has no %s/ directory — is this one of ours?", mp, dataDir)
 	}
 	o.UI.Log("ingesting %s", mp)
 
-	sums := o.discSums(mp)
+	sums := o.discSums(discRoot, mp)
 	names, err := dataFiles(data)
 	if err != nil {
 		return false, err
@@ -240,7 +251,7 @@ func (ig *ingester) ingestDisc(ctx context.Context) (staged bool, err error) {
 	// staging is refused whole, before any of its images land beside the other
 	// set's.
 	encDir := o.dirs().Enc
-	switch st, err := o.ingestPublicIdentity(mp, sums[doc.PublicIdentityName]); {
+	switch st, err := o.ingestPublicIdentity(discRoot, mp, sums[doc.PublicIdentityName]); {
 	case err == nil:
 		staged = staged || st
 	case errors.Is(err, ErrIncompleteCopy):
@@ -266,7 +277,7 @@ func (ig *ingester) ingestDisc(ctx context.Context) (staged bool, err error) {
 		}
 	}
 
-	if err := o.copyManifest(ctx, mp); err != nil {
+	if err := o.copyManifest(ctx, discRoot, mp); err != nil {
 		o.UI.Warn("%v", err)
 	}
 	unmount()
@@ -291,8 +302,20 @@ func (ig *ingester) ingestDisc(ctx context.Context) (staged bool, err error) {
 // same disc, which reads like failing hardware; the ambiguous name is dropped
 // instead, so that copy is reported as unverifiable and every other name on
 // the disc is still checked.
-func (o Options) discSums(mp string) map[string]string {
+func (o Options) discSums(root *os.Root, mp string) map[string]string {
 	path := filepath.Join(mp, agecrypt.SumsName)
+	switch fi, err := discEntry(root, agecrypt.SumsName); {
+	case errors.Is(err, fs.ErrNotExist):
+		o.UI.Warn("no %s on this disc; copies cannot be checked as they are made", agecrypt.SumsName)
+		return nil
+	case err != nil:
+		o.UI.Warn("could not read %s: %v", path, err)
+		return nil
+	case !fi.Mode().IsRegular():
+		o.UI.Warn("%s on this disc is not a regular file (%s); copies cannot be checked as they are made",
+			agecrypt.SumsName, fi.Mode().Type())
+		return nil
+	}
 	sums, err := agecrypt.ReadSumFile(path)
 	if err != nil {
 		if !errors.Is(err, fs.ErrNotExist) {
@@ -345,7 +368,46 @@ func ingestName(src, dst string) string {
 	return s + " (staged as " + d + ")"
 }
 
-// dataFiles lists the regular files in a disc's data directory, sorted.
+// discEntry looks at one name at the root of a mounted disc before anything
+// reads it, and is the one place the rule about a disc's own names lives: brb
+// wrote them, so none of them is ever a symbolic link, and following one reads
+// a file that is not on the disc at all.
+//
+// The two halves do different jobs. [os.Root] confines the name to the mount,
+// so no component resolves outside it; but a Root deliberately still follows a
+// link whose target stays inside, and permits a device file, so Lstat here
+// refuses the link at the final component and the callers require a regular
+// file. Together they are what brb.sh gets from `find -P` declining to descend
+// a symlinked start point and from `[[ -f ]]` declining anything that is not a
+// regular file, which is the point: the two readers refuse the same discs.
+//
+// Like brb.sh's, this is a check followed by an open, and the window between
+// them is not closed. It buys nothing against an attacker who can rewrite the
+// mount while the ingest runs — one who can do that can simply put a real file
+// there — and everything against the case that actually occurs, a disc that
+// already carries a link at one of these names when it is handed over.
+func discEntry(root *os.Root, name string) (fs.FileInfo, error) {
+	fi, err := root.Lstat(name)
+	if err != nil {
+		return nil, err
+	}
+	if fi.Mode()&fs.ModeSymlink != 0 {
+		target, rerr := root.Readlink(name)
+		if rerr != nil {
+			target = "unreadable"
+		}
+		return nil, fmt.Errorf("%s on this disc is a symbolic link (-> %s); a disc brb wrote "+
+			"carries no links at its own names, so this one was mastered by hand or by somebody "+
+			"else, and reading through it would take a file that is not on the disc", name, target)
+	}
+	return fi, nil
+}
+
+// dataFiles lists the regular files in a disc's data directory, sorted. The
+// directory itself is proven not to be a link before this runs (see
+// [discEntry]); within it, os.ReadDir reports the type of each dirent rather
+// than of what it points at, so a symlinked entry is not regular and is skipped
+// here — the same answer `find -type f` gives brb.sh, which tests the link too.
 func dataFiles(dir string) ([]string, error) {
 	ents, err := os.ReadDir(dir)
 	if err != nil {
@@ -705,13 +767,19 @@ func (o Options) resumeSalvage(ctx context.Context, src, dst, want string, missi
 // copyManifest refreshes the staging copy of MANIFEST.txt from the disc. It
 // describes the whole set, so any disc's copy will do; a failure is reported
 // but does not fail the ingest, since nothing in a restore depends on it.
-func (o Options) copyManifest(ctx context.Context, mp string) error {
+func (o Options) copyManifest(ctx context.Context, root *os.Root, mp string) error {
 	src := filepath.Join(mp, manifestName)
-	if _, err := os.Stat(src); err != nil {
-		if errors.Is(err, fs.ErrNotExist) {
-			return nil
-		}
+	switch fi, err := discEntry(root, manifestName); {
+	case errors.Is(err, fs.ErrNotExist):
+		return nil
+	case err != nil:
 		return fmt.Errorf("restore: %s: %w", src, err)
+	case !fi.Mode().IsRegular():
+		// A device node here used to be copied, which meant streaming it: the
+		// hash is taken as the bytes go past, so nothing judged the file until
+		// it ended, and /dev/zero does not end.
+		return fmt.Errorf("restore: %s on this disc is not a regular file (%s), so it was not copied",
+			manifestName, fi.Mode().Type())
 	}
 	// No removal first: copyStream writes dst+".part" and renames over dst
 	// atomically, so a disc whose manifest cannot be read leaves the previous
@@ -755,9 +823,26 @@ func (o Options) copyManifest(ctx context.Context, mp string) error {
 // A disc without an identity.txt is a private set, and nothing happens. want
 // is the digest the disc's SHA512SUMS records for the file, or "" when the
 // disc carries no sums.
-func (o Options) ingestPublicIdentity(mp, want string) (staged bool, err error) {
+func (o Options) ingestPublicIdentity(root *os.Root, mp, want string) (staged bool, err error) {
 	src := filepath.Join(mp, doc.PublicIdentityName)
 	name := doc.PublicIdentityName
+	// Before the open, and before the size gate below: that gate reads
+	// fi.Size(), which is 0 for a device node, so a character device here slid
+	// under it and io.ReadAll took the process out through the allocator —
+	// exactly the death the gate was written to prevent.
+	switch fi, derr := discEntry(root, name); {
+	case errors.Is(derr, fs.ErrNotExist):
+		return false, nil
+	case derr != nil:
+		return false, fmt.Errorf("restore: reading %s: %w", src, derr)
+	case !fi.Mode().IsRegular():
+		return false, &CopyProblem{
+			Name:    name,
+			Missing: -1,
+			Reason: fmt.Sprintf("is not a regular file on this disc (%s); a public archive's key is a "+
+				"few hundred bytes of text, so this is not one and it was not read or staged", fi.Mode().Type()),
+		}
+	}
 	f, err := os.Open(src)
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {

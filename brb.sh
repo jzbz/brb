@@ -708,6 +708,14 @@ MAX_SUM_LINES=1048576
 read_disc_sums() {  # read_disc_sums MOUNTPOINT
   DISC_SUMS=()
   local h p n=0
+  # -L before -f: a disc brb wrote carries no links at its own names, and -f
+  # alone follows one, so a SHA512SUMS symlinked to a file off the disc would be
+  # read as this disc's record of itself. The Go reader refuses the same names
+  # through an os.Root plus an Lstat (restore/ingest.go, discEntry).
+  if [[ -L "$1/SHA512SUMS" ]]; then
+    warn "SHA512SUMS on this disc is a symbolic link, which no disc brb wrote carries; copies cannot be checked as they are made"
+    return 0
+  fi
   if [[ ! -f "$1/SHA512SUMS" ]]; then
     warn "no SHA512SUMS on this disc; copies cannot be checked as they are made"
     return 0
@@ -927,6 +935,10 @@ ingest_one() {
 # caller counts like any other bad file; the same key is on every other disc.
 ingest_public_identity() {  # ingest_public_identity MOUNTPOINT
   local mp="$1" src="$1/identity.txt" dst="$ENC_DIR/identity.txt" want got key have
+  if [[ -L "$src" ]]; then
+    warn "identity.txt on this disc is a symbolic link, which no disc brb wrote carries — not staging it"
+    return 1
+  fi
   [[ -f "$src" ]] || return 0
   want="${DISC_SUMS[identity.txt]:-}"
   if [[ -n "$want" ]]; then
@@ -1201,6 +1213,13 @@ cmd_ingest() {
     mount_disc "${1:-}"; mp="$MOUNT_POINT"
     # udisks mounts a disc at a path named after its volume label, which is
     # media-derived like every other name printed here.
+    # -L first: -d follows a link, so data -> a directory of the operator's
+    # would pass this check and `find -P` would then decline to descend it and
+    # list nothing, which reads as an empty disc rather than a hostile one. A
+    # disc brb wrote holds data/ as a real directory, so refuse and say why —
+    # the Go reader refuses the same name for the same reason through an
+    # os.Root plus an Lstat (restore/ingest.go, discEntry).
+    [[ -L "$mp/data" ]] && die "$(esc_str "$mp"): data on this disc is a symbolic link, which no disc brb wrote carries — nothing was read from it (the trap above has unmounted it, so the tray will open)"
     [[ -d "$mp/data" ]] || die "$(esc_str "$mp") has no data/ directory — is this one of ours? (the trap above has unmounted it, so the tray will open)"
     # eject is silently a no-op on a disc the user cannot unmount, and findmnt
     # then keeps reporting the old mount point. Nothing else in the loop notices.
@@ -1238,7 +1257,10 @@ cmd_ingest() {
     done < <(find "$mp/data" -type f | sort -V)
     # The manifest is the same on every disc, so a rotted copy is simply not
     # taken: the next disc's will do, and check_complete copes without one.
-    if [[ -f "$mp/MANIFEST.txt" ]]; then
+    if [[ -L "$mp/MANIFEST.txt" ]]; then
+      warn "MANIFEST.txt on this disc is a symbolic link, which no disc brb wrote carries — not copying it"
+      bad=$(( bad + 1 ))
+    elif [[ -f "$mp/MANIFEST.txt" ]]; then
       want="${DISC_SUMS[MANIFEST.txt]:-}"
       if [[ -n "$want" && "$(sha512_of "$mp/MANIFEST.txt")" != "$want" ]]; then
         warn "MANIFEST.txt on this disc does not match the hash the disc records for it — not copying it"

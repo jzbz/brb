@@ -3,12 +3,14 @@ package restore
 import (
 	"context"
 	"errors"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/jzbz/brb/internal/agecrypt"
+	"github.com/jzbz/brb/internal/doc"
 )
 
 // TestIngestTerminationRules pins down the behaviour brb.sh gets wrong: its
@@ -342,6 +344,18 @@ func TestIngestFileTrustsAVerifiedCopyOverAStaleMapfile(t *testing.T) {
 	}
 }
 
+// discRoot opens mp the way ingestDisc does, so these tests read a disc through
+// the same confinement the reader uses rather than by plain path.
+func discRoot(t *testing.T, mp string) *os.Root {
+	t.Helper()
+	root, err := os.OpenRoot(mp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { root.Close() })
+	return root
+}
+
 func TestDiscSumsKeysByBaseName(t *testing.T) {
 	e := newEnv(t)
 	mp := t.TempDir()
@@ -351,7 +365,7 @@ func TestDiscSumsKeysByBaseName(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(mp, agecrypt.SumsName), []byte(lines), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	sums := e.opts().discSums(mp)
+	sums := e.opts().discSums(discRoot(t, mp), mp)
 	if got := sums["disc01.squashfs.age"]; got != strings.Repeat("a", 128) {
 		t.Fatalf("disc01.squashfs.age = %q", got)
 	}
@@ -379,7 +393,7 @@ func TestDiscSumsDropsANameRecordedTwiceWithDifferentHashes(t *testing.T) {
 		if err := os.WriteFile(filepath.Join(mp, agecrypt.SumsName), []byte(lines), 0o600); err != nil {
 			t.Fatal(err)
 		}
-		sums := e.opts().discSums(mp)
+		sums := e.opts().discSums(discRoot(t, mp), mp)
 		if got, ok := sums["disc01.squashfs.age"]; ok {
 			t.Fatalf("run %d: the contradicted name answered %q; it must answer nothing", i, got)
 		}
@@ -404,14 +418,15 @@ func TestDiscSumsKeepsANameRecordedTwiceWithOneHash(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(mp, agecrypt.SumsName), []byte(lines), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if got := e.opts().discSums(mp)["disc01.squashfs.age"]; !strings.EqualFold(got, strings.Repeat("a", 128)) {
+	if got := e.opts().discSums(discRoot(t, mp), mp)["disc01.squashfs.age"]; !strings.EqualFold(got, strings.Repeat("a", 128)) {
 		t.Fatalf("disc01.squashfs.age = %q, want the hash both entries agree on", got)
 	}
 }
 
 func TestDiscSumsWithoutASumsFile(t *testing.T) {
 	e := newEnv(t)
-	if sums := e.opts().discSums(t.TempDir()); sums != nil {
+	dir := t.TempDir()
+	if sums := e.opts().discSums(discRoot(t, dir), dir); sums != nil {
 		t.Fatalf("expected no sums, got %v", sums)
 	}
 	if !strings.Contains(e.log(), "cannot be checked") {
@@ -426,13 +441,13 @@ func TestCopyManifest(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Absent manifest: not an error.
-	if err := e.opts().copyManifest(context.Background(), mp); err != nil {
+	if err := e.opts().copyManifest(context.Background(), discRoot(t, mp), mp); err != nil {
 		t.Fatalf("copyManifest with no manifest: %v", err)
 	}
 	if err := os.WriteFile(filepath.Join(mp, manifestName), []byte("manifest\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := e.opts().copyManifest(context.Background(), mp); err != nil {
+	if err := e.opts().copyManifest(context.Background(), discRoot(t, mp), mp); err != nil {
 		t.Fatalf("copyManifest: %v", err)
 	}
 	got, err := os.ReadFile(filepath.Join(e.cfg.Staging, manifestName))
@@ -441,5 +456,79 @@ func TestCopyManifest(t *testing.T) {
 	}
 	if string(got) != "manifest\n" {
 		t.Fatalf("manifest = %q", got)
+	}
+}
+
+// TestDiscEntryRefusesLinksAtADiscsOwnNames pins the rule that ingest reads a
+// disc's own names only when the disc really carries them.
+//
+// A disc brb wrote holds data/ as a real directory and SHA512SUMS, MANIFEST.txt
+// and identity.txt as real files, so a link at any of those names was put there
+// by hand or by somebody else. Following one reads a file that is not on the
+// disc: an os.Root alone would still follow a link whose target stays inside the
+// mount, and would open a device node, which is why discEntry lstats.
+func TestDiscEntryRefusesLinksAtADiscsOwnNames(t *testing.T) {
+	t.Parallel()
+	mp := t.TempDir()
+	outside := t.TempDir()
+	if err := os.WriteFile(filepath.Join(outside, "target.txt"), []byte("not on the disc\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(mp, "real.txt"), []byte("on the disc\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// Absolute, inside-the-mount, and relative-escaping: an os.Root refuses the
+	// first and third on its own and follows the second, so the second is the
+	// one that proves the Lstat is doing work.
+	if err := os.Symlink(filepath.Join(outside, "target.txt"), filepath.Join(mp, "abs.txt")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("real.txt", filepath.Join(mp, "inside.txt")); err != nil {
+		t.Fatal(err)
+	}
+	root := discRoot(t, mp)
+
+	for _, name := range []string{"abs.txt", "inside.txt"} {
+		if _, err := discEntry(root, name); err == nil {
+			t.Errorf("discEntry(%q) accepted a symbolic link", name)
+		} else if !strings.Contains(err.Error(), "symbolic link") {
+			t.Errorf("discEntry(%q) refused for the wrong reason: %v", name, err)
+		}
+	}
+	// The companion: a real file must still be accepted, or the check above
+	// would pass by refusing everything.
+	fi, err := discEntry(root, "real.txt")
+	if err != nil {
+		t.Fatalf("discEntry refused a real file: %v", err)
+	}
+	if !fi.Mode().IsRegular() {
+		t.Errorf("real.txt reported mode %v, want a regular file", fi.Mode())
+	}
+	if _, err := discEntry(root, "absent.txt"); !errors.Is(err, fs.ErrNotExist) {
+		t.Errorf("a missing name gave %v, want fs.ErrNotExist so callers can skip it", err)
+	}
+}
+
+// TestIngestPublicIdentityRefusesADeviceNode pins the gap the size gate had.
+// maxPublicIdentityBytes is judged from fi.Size(), which is 0 for a character
+// device, so identity.txt -> /dev/zero passed the gate and io.ReadAll then took
+// the process out through the allocator — the exact death the gate exists to
+// prevent.
+func TestIngestPublicIdentityRefusesADeviceNode(t *testing.T) {
+	e := newEnv(t)
+	mp := t.TempDir()
+	if err := os.Symlink("/dev/zero", filepath.Join(mp, doc.PublicIdentityName)); err != nil {
+		t.Skipf("cannot symlink /dev/zero here: %v", err)
+	}
+	staged, err := e.opts().ingestPublicIdentity(discRoot(t, mp), mp, "")
+	if err == nil {
+		t.Fatal("ingestPublicIdentity accepted a device node as a public archive's key")
+	}
+	if staged {
+		t.Error("a refused identity was reported as staged")
+	}
+	var cp *CopyProblem
+	if !errors.As(err, &cp) && !strings.Contains(err.Error(), "symbolic link") {
+		t.Errorf("refusal was neither a CopyProblem nor a link refusal: %v", err)
 	}
 }
