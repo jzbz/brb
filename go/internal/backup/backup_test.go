@@ -560,7 +560,10 @@ func TestResumeFilterDropsAssignedFiles(t *testing.T) {
 		Assigned: []string{"sub/a", "sub/c"},
 	}}
 
-	got := r.resumeFilter(res)
+	got, err := r.resumeFilter(res)
+	if err != nil {
+		t.Fatalf("resumeFilter: %v", err)
+	}
 	want := []string{"sub", "sub/b"}
 	if len(got) != len(want) {
 		t.Fatalf("kept %d entries, want %d: %+v", len(got), len(want), got)
@@ -579,12 +582,96 @@ func TestResumeFilterKeepsEverythingOnAFreshRun(t *testing.T) {
 		Entries:  []scan.Entry{{Rel: "a", Kind: scan.KindFile, Size: 100}},
 	}
 	r := &runner{p: quiet(), st: newState("arch", "/src", 1.0, time.Now())}
-	got := r.resumeFilter(res)
+	got, err := r.resumeFilter(res)
+	if err != nil {
+		t.Fatalf("resumeFilter: %v", err)
+	}
 	if len(got) != 1 {
 		t.Fatalf("kept %d entries, want 1", len(got))
 	}
 	if r.st.ScanRawSize != 100 {
 		t.Errorf("ScanRawSize = %d, want 100", r.st.ScanRawSize)
+	}
+}
+
+// TestResumeFilterRefusesAnAssignedFileThatBecameSomethingElse pins the refusal
+// that stands between a resume and a set that cannot be restored.
+//
+// A path on a finished disc is a regular file there for good; the disc is
+// written and may already be burned. If the source tree has since replaced it
+// with a directory, the skeleton every later disc carries holds it as a
+// directory, and unsquashfs refuses the mismatch part way through the restore
+// with "failed to lstat ..., because Not a directory". Before this check, the
+// assigned lookup happened only for KindFile entries, so the changed path was
+// treated as new, the run exited 0 saying "backup complete", and the set was
+// discovered to be unreadable only by someone restoring it.
+func TestResumeFilterRefusesAnAssignedFileThatBecameSomethingElse(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name string
+		kind scan.Kind
+	}{
+		{"directory", scan.KindDir},
+		{"symlink", scan.KindSymlink},
+		{"device node", scan.KindOther},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			res := &scan.Result{
+				RawBytes: 200,
+				Entries: []scan.Entry{
+					{Rel: "keep", Kind: scan.KindFile, Size: 100},
+					{Rel: "swapped", Kind: tc.kind},
+					{Rel: "swapped/inner", Kind: scan.KindFile, Size: 100},
+				},
+			}
+			r := &runner{p: quiet(), st: &State{
+				Version: StateVersion, DiscsDone: 1, ScanRawSize: 200,
+				Assigned: []string{"swapped"},
+			}}
+
+			got, err := r.resumeFilter(res)
+			if err == nil {
+				t.Fatalf("resumeFilter accepted a resume whose %s replaced an assigned file; kept %+v", tc.name, got)
+			}
+			if got != nil {
+				t.Errorf("entries = %+v, want nil alongside the refusal", got)
+			}
+			// The operator has to find the path to put it back, so the message
+			// has to name it and say what it is now.
+			if !strings.Contains(err.Error(), "swapped") {
+				t.Errorf("error does not name the offending path: %v", err)
+			}
+			if !strings.Contains(err.Error(), tc.kind.String()) {
+				t.Errorf("error does not say what %q is now (%s): %v", "swapped", tc.kind, err)
+			}
+		})
+	}
+}
+
+// TestResumeFilterAcceptsAnUnchangedKind is the companion that stops the check
+// above from passing by refusing everything: a directory that was always a
+// directory is not in the assigned set and must still travel in the skeleton.
+func TestResumeFilterAcceptsAnUnchangedKind(t *testing.T) {
+	t.Parallel()
+	res := &scan.Result{
+		RawBytes: 100,
+		Entries: []scan.Entry{
+			{Rel: "sub", Kind: scan.KindDir},
+			{Rel: "sub/a", Kind: scan.KindFile, Size: 100},
+		},
+	}
+	r := &runner{p: quiet(), st: &State{
+		Version: StateVersion, DiscsDone: 1, ScanRawSize: 100,
+		Assigned: []string{"sub/a"},
+	}}
+
+	got, err := r.resumeFilter(res)
+	if err != nil {
+		t.Fatalf("resumeFilter refused an unchanged tree: %v", err)
+	}
+	if len(got) != 1 || got[0].Rel != "sub" {
+		t.Errorf("kept %+v, want just the skeleton entry sub", got)
 	}
 }
 

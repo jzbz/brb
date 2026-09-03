@@ -87,7 +87,10 @@ func Run(ctx context.Context, o Options) error {
 	if err != nil {
 		return err
 	}
-	entries := r.resumeFilter(res)
+	entries, err := r.resumeFilter(res)
+	if err != nil {
+		return err
+	}
 	if err := r.checkIndexCovers(entries); err != nil {
 		return err
 	}
@@ -128,10 +131,25 @@ func Run(ctx context.Context, o Options) error {
 }
 
 // resumeFilter drops the files a previous run already wrote to a disc, which
-// re-seeds the packer with what is left. Filtering the scan is equivalent to
-// seeding an assigned set: every name of a hard link group travels to the same
-// disc, so a group is either wholly assigned or wholly outstanding.
-func (r *runner) resumeFilter(res *scan.Result) []scan.Entry {
+// re-seeds the packer with what is left. For a tree that has not changed since,
+// filtering the scan is equivalent to seeding an assigned set: every name of a
+// hard link group travels to the same disc, so a group is either wholly
+// assigned or wholly outstanding.
+//
+// It refuses when a path a finished disc holds as a regular file is now a
+// directory, a symlink or a device node. A finished disc cannot be rewritten
+// and every later disc carries the whole skeleton, so such a set holds that
+// path as a file on one disc and as a non-file on all the rest, and unsquashfs
+// refuses the second of them ("failed to lstat ..., because Not a directory")
+// with the restore abandoned part way through the set.
+//
+// The refusal is here because the alternative was silence. The assigned lookup
+// used to sit inside the KindFile branch, so a path that had changed kind never
+// matched the set at all: it was packed into the skeleton as if new, the run
+// finished and reported a complete set, and the only warning fired was the one
+// below saying the file was "no longer in the source tree" — which reads as
+// reassurance. Nothing said anything was wrong until somebody read the set back.
+func (r *runner) resumeFilter(res *scan.Result) ([]scan.Entry, error) {
 	if r.st.ScanRawSize == 0 {
 		r.st.ScanRawSize = res.RawBytes
 	} else if r.st.ScanRawSize != res.RawBytes {
@@ -140,15 +158,21 @@ func (r *runner) resumeFilter(res *scan.Result) []scan.Entry {
 			ui.HumanBytes(r.st.ScanRawSize), ui.HumanBytes(res.RawBytes))
 	}
 	if r.st.DiscsDone == 0 {
-		return res.Entries
+		return res.Entries, nil
 	}
 
 	assigned := r.st.assignedSet()
 	out := make([]scan.Entry, 0, len(res.Entries))
+	var changed []scan.Entry
 	done, todo := 0, 0
 	for _, e := range res.Entries {
+		_, wasAssigned := assigned[e.Rel]
+		if wasAssigned && e.Kind != scan.KindFile {
+			changed = append(changed, e)
+			continue
+		}
 		if e.Kind == scan.KindFile {
-			if _, ok := assigned[e.Rel]; ok {
+			if wasAssigned {
 				done++
 				continue
 			}
@@ -156,12 +180,37 @@ func (r *runner) resumeFilter(res *scan.Result) []scan.Entry {
 		}
 		out = append(out, e)
 	}
+	if len(changed) > 0 {
+		return nil, changedKindError(changed, r.st.DiscsDone)
+	}
 	if missing := len(assigned) - done; missing > 0 {
 		r.p.Warn("%d file(s) recorded on an earlier disc are no longer in the source tree; "+
 			"they remain on the discs already written", missing)
 	}
 	r.p.Step("resume: %d file(s) already on disc, %d still to write", done, todo)
-	return out
+	return out, nil
+}
+
+// changedKindError refuses a resume whose source tree has replaced an
+// already-written file with something that is not a file. Naming the paths is
+// the whole value of the message: putting them back is the one repair that does
+// not throw the finished discs away, and nothing else in the run points at them.
+func changedKindError(changed []scan.Entry, discsDone int) error {
+	var b strings.Builder
+	fmt.Fprintf(&b, "backup: --resume: %d path(s) already written to the %d finished disc(s) as regular "+
+		"files are no longer regular files in the source tree:", len(changed), discsDone)
+	for i, e := range changed {
+		if i == 20 {
+			fmt.Fprintf(&b, "\n  ... and %d more", len(changed)-20)
+			break
+		}
+		fmt.Fprintf(&b, "\n  now a %-7s %s", e.Kind, e.Rel)
+	}
+	b.WriteString("\n  a finished disc cannot be rewritten, and every later disc carries the whole " +
+		"directory skeleton, so continuing would put each of these on one disc as a file and on the " +
+		"rest as something else — a set that unsquashfs abandons part way through restoring; " +
+		"put them back as they were, or start the set over")
+	return errors.New(b.String())
 }
 
 // checkIndexCovers refuses a resume that would build discs the encrypted index
