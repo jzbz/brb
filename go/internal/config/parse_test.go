@@ -384,3 +384,73 @@ func TestExpandHomePath(t *testing.T) {
 		}
 	}
 }
+
+// TestBashExpansionsThisParserWouldHaveKeptAsText pins the four forms that used
+// to fall through readDollar's default branch and come out as literal text.
+//
+// brb.sh sources the same file, so a form bash expands and this parser kept was
+// not a parse difference: it was one configuration file naming two different
+// things. Measured against bash 5 on the same input before the fix:
+//
+//	ARCHIVE_NAME=A$'x'B    bash AxB        parser A$xB
+//	ARCHIVE_NAME=A$"x"B    bash AxB        parser A$xB
+//	ARCHIVE_NAME=A$-B      bash AhmtBcB    parser A$-B
+//	ARCHIVE_NAME=A$[1+1]B  bash A2B        parser A$[1+1]B
+//
+// $- cannot be expanded faithfully by anything that is not the shell, so
+// refusing is the only answer that cannot be silently wrong.
+func TestBashExpansionsThisParserWouldHaveKeptAsText(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		in   string
+	}{
+		{"ANSI-C quoting", `ARCHIVE_NAME=A$'x'B`},
+		{"ANSI-C quoting with an escape", `ARCHIVE_NAME=A$'\t'B`},
+		{"locale translation", `ARCHIVE_NAME=A$"x"B`},
+		{"option flags", `ARCHIVE_NAME=A$-B`},
+		{"option flags in double quotes", `ARCHIVE_NAME="A$-B"`},
+		{"deprecated arithmetic", `ARCHIVE_NAME=A$[1+1]B`},
+		{"deprecated arithmetic in double quotes", `ARCHIVE_NAME="A$[1+1]B"`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			v, err := Parse(tc.in, "test")
+			if err == nil {
+				t.Fatalf("Parse(%q) accepted it as %q; bash would expand it", tc.in, v["ARCHIVE_NAME"].Scalar)
+			}
+			if !errors.Is(err, ErrSyntax) {
+				t.Errorf("error does not wrap ErrSyntax: %v", err)
+			}
+		})
+	}
+}
+
+// TestDollarFormsBashLeavesAloneAreStillAccepted is the companion that stops the
+// refusals above from passing by rejecting every dollar sign.
+//
+// The quoting cases are the ones that matter: inside double or single quotes
+// bash does NOT read $'...' as ANSI-C quoting, so both readers already agreed
+// there, and refusing them would reject a file brb.sh accepts — trading one
+// divergence for another. Each expectation below is what bash 5 produces.
+func TestDollarFormsBashLeavesAloneAreStillAccepted(t *testing.T) {
+	for _, tc := range []struct {
+		name, in, want string
+	}{
+		{"dollar quote inside double quotes", `ARCHIVE_NAME="A$'x'B"`, `A$'x'B`},
+		{"dollar quote inside single quotes", `ARCHIVE_NAME='A$'"'"'x'"'"'B'`, `A$'x'B`},
+		{"dollar dash inside single quotes", `ARCHIVE_NAME='A$-B'`, `A$-B`},
+		{"dollar bracket inside single quotes", `ARCHIVE_NAME='A$[1+1]B'`, `A$[1+1]B`},
+		{"dollar before an ordinary byte", `ARCHIVE_NAME=A$.B`, `A$.B`},
+		{"dollar before a comma", `ARCHIVE_NAME=A$,B`, `A$,B`},
+		{"trailing dollar", `ARCHIVE_NAME=AB$`, `AB$`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			v, err := Parse(tc.in, "test")
+			if err != nil {
+				t.Fatalf("Parse(%q) refused a form bash leaves alone: %v", tc.in, err)
+			}
+			if got := v["ARCHIVE_NAME"].Scalar; got != tc.want {
+				t.Errorf("ARCHIVE_NAME = %q, want %q (what bash gives)", got, tc.want)
+			}
+		})
+	}
+}

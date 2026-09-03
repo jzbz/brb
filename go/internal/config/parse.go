@@ -40,9 +40,13 @@ var ErrSyntax = errors.New("config syntax error")
 //	expansion of $HOME, ${HOME} and a leading ~.
 //
 // Everything else is rejected rather than guessed at: command substitution
-// ($( ) or backticks), any variable other than HOME, and shell syntax such as
-// pipelines, redirections, conditionals or function definitions. Every error
-// names the file, the line number and the offending line, and wraps ErrSyntax.
+// ($( ) or backticks), arithmetic ($((...)) and the deprecated $[...]), any
+// variable other than HOME, bash's $'...' and $"..." quoting forms, and shell
+// syntax such as pipelines, redirections, conditionals or function definitions.
+// Rejecting rather than keeping as literal text is the point: brb.sh sources
+// this same file, so any form bash expands and this parser did not would make
+// one file mean two different things to the two readers. Every error names the
+// file, the line number and the offending line, and wraps ErrSyntax.
 func ParseFile(path string) (map[string]Value, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -316,7 +320,7 @@ func (p *parser) readWord(term byte, start int) (string, bool, error) {
 
 		case c == '$':
 			started = true
-			s, err := p.readDollar()
+			s, err := p.readDollar(false)
 			if err != nil {
 				return "", false, err
 			}
@@ -402,7 +406,7 @@ func (p *parser) readDoubleQuoted(start int) (string, error) {
 		case '`':
 			return "", p.errf(p.li+1, "command substitution is not supported")
 		case '$':
-			s, err := p.readDollar()
+			s, err := p.readDollar(true)
 			if err != nil {
 				return "", err
 			}
@@ -417,7 +421,25 @@ func (p *parser) readDoubleQuoted(start int) (string, error) {
 // readDollar expands the one variable reference brb supports, $HOME, in either
 // its bare or braced form. Everything else that can follow a '$' is rejected,
 // because silently dropping an expansion would produce a wrong path.
-func (p *parser) readDollar() (string, error) {
+//
+// "Rejected" has to mean every form bash gives a meaning to, not the ones that
+// look like variables. brb.sh sources this same file, so a form this parser
+// kept as literal text and bash expanded is not a parse difference, it is one
+// configuration file naming two different directories — and STAGING is one of
+// the settings it can name, which decides where a set's plaintext is written.
+// Four forms were literal here and are not to bash:
+//
+//	$'...'   ANSI-C quoting, so $'\t' is a tab to bash and four characters here
+//	$"..."   locale translation, which strips the quotes
+//	$-       the shell's current option flags
+//	$[...]   arithmetic, deprecated but still evaluated
+//
+// inDouble says whether this '$' was found inside double quotes, because bash's
+// answer differs there: $'...' and $"..." are ordinary text inside them, and
+// both readers already agree on that, so refusing them would reject a file
+// brb.sh accepts. $- and $[...] expand in either context and are refused in
+// both.
+func (p *parser) readDollar(inDouble bool) (string, error) {
 	line := p.li + 1
 	p.col++ // consume '$'
 	if p.eol() {
@@ -426,6 +448,14 @@ func (p *parser) readDollar() (string, error) {
 	switch c := p.peek(); {
 	case c == '(':
 		return "", p.errf(line, "command substitution is not supported")
+	case c == '[':
+		return "", p.errf(line, "arithmetic expansion is not supported: $[...] "+
+			"(bash still evaluates it, so the two readers would not agree on this line)")
+	case !inDouble && (c == '\'' || c == '"'):
+		return "", p.errf(line, "$%c starts a bash quoting form this parser does not implement "+
+			"($'...' expands escapes, $\"...\" translates); brb.sh sources this file and would apply it, "+
+			"so the line would mean two different things — write the characters themselves, "+
+			"or escape the dollar as \\$", c)
 	case c == '{':
 		p.col++
 		begin := p.col
@@ -447,7 +477,7 @@ func (p *parser) readDollar() (string, error) {
 			return "", p.errf(line, "variable expansion is not supported: $%s (only $HOME is)", name)
 		}
 		return p.homeOrErr(line)
-	case c >= '0' && c <= '9', c == '@', c == '*', c == '#', c == '?', c == '!', c == '$':
+	case c >= '0' && c <= '9', c == '@', c == '*', c == '#', c == '?', c == '!', c == '$', c == '-':
 		return "", p.errf(line, "variable expansion is not supported: $%s", string(c))
 	default:
 		return "$", nil // '$' followed by something ordinary is a literal

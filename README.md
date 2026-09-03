@@ -384,6 +384,7 @@ a promise that nothing else does.
 | usage errors | exit **2**, including `<command> --help` | exit **1** |
 | `doctor` | checks backup readiness; exits 1 with an identity but no recipients file | checks restore readiness; exits 0 on the same config |
 | flags after `--` | left alone: `brb index -- -y` searches for `-y` | `-y` and `-c` are stripped from anywhere on the line, so the same command searches for something else |
+| `$'...'`, `$"..."`, `$-`, `$[...]` in a config | refused, naming the line: they cannot be expanded faithfully outside a shell, and `$-` not at all | expanded, because the file is `source`d — so a config using any of them is one the Go build will not load |
 | `ingest` with no terminal | runs unattended | prompts on `/dev/tty` between discs even with a mount path and `--yes`, and fails outright without one |
 | a foreign disc | staged first, refused at restore, leaving the file behind | refused before anything is staged |
 | `--only` | repeat the flag per path | as documented below |
