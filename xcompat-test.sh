@@ -19,10 +19,15 @@
 # Writing discs — packing, mksquashfs, ISOs, burning, resume — is covered by
 # go-e2e-test.sh, which is the only suite that exercises a writer.
 #
-# Where the two readers genuinely differ, the check is written the way it ought
-# to pass and marked XFAIL with the divergence named. An XFAIL that starts
-# passing is reported as XPASS and counted as a FAILURE, because this file is
-# then out of date. Nothing known-broken is quietly omitted.
+# Where the two readers differ in a way that ought to be fixed, the check is
+# written the way it ought to pass and marked XFAIL with the divergence named.
+# An XFAIL that starts passing is reported as XPASS and counted as a FAILURE,
+# because this file is then out of date. Nothing known-broken is quietly
+# omitted.
+#
+# The ledger is not the same thing as the README's table of command-line
+# differences, and section 18 says which belongs where: that table records
+# differences nobody intends to close, this records the ones somebody does.
 #
 # Usage
 # -----
@@ -2262,6 +2267,44 @@ for who in sh go; do
     grep -qi 'symbolic link' "$LOG/hostile-$who.log"
 done
 unset name st
+
+# ---------------------------------------------------------------------------
+head_s "18. the divergence ledger"
+# ---------------------------------------------------------------------------
+# Every section above asserts a property both readers already share. This one
+# is the other half of the promise: where they genuinely differ, the check is
+# written the way it OUGHT to pass and marked XFAIL with the divergence named,
+# so that fixing it turns the check into an XPASS — counted as a failure — and
+# forces it to be promoted to a real assertion instead of sitting here forever.
+#
+# Nothing used xassert0/xassertN until this section existed. The suite reported
+# "0 known divergence(s) remain" with the machinery never once executed, which
+# read as "the two readers agree on everything" when what it meant was "nothing
+# has been written down here". A ledger nobody files in is not an empty ledger.
+#
+# What belongs here is a DEFECT, not a design difference. The README's table of
+# command-line differences records several deliberate ones — `version` is a
+# command in one reader and not the other, doctor answers a writer's question
+# and a reader's — and those will never converge, so writing them the way they
+# "ought to pass" would be writing a test for something nobody intends to do.
+# The entry below is the other kind: the Go parser stops at a bare "--" and
+# takes what follows as data, cli.go's own comment calls the bash behaviour
+# "the bug this parser exists to avoid", and TestIndexPatternIsNotAFlag pins
+# the Go half. brb.sh ought to do the same and does not.
+sh_honours_end_of_flags() {
+  # `list -- -y` asks for the disc numbered "-y". Both readers refuse it, and
+  # WHICH argument the refusal names is the divergence: the Go reader names -y,
+  # brb.sh names -- because main() ate the -y as a flag on the way past — and
+  # set CLI_ASSUME_YES while it was there, which is the half with teeth, since
+  # that is the answer to the prompt before a restore overwrites its
+  # destination. Only the visible half is asserted; the two travel together.
+  local out
+  out=$(bash "$BRB_SH" -c "$T/cfg/go" list -- -y 2>&1) || true
+  grep -qF "got '-y'" <<<"$out"
+}
+xassert0 "brb.sh takes everything after a bare -- as data, as the Go reader does" \
+  "brb.sh main() strips -y and -c from any position including out of user data, so the disc number becomes '--' and ASSUME_YES is silently turned on (README's command-line table, 'flags after --')" \
+  sh_honours_end_of_flags
 
 printf '\n%d passed, %d failed, %d xfail (known divergences), %d skipped\n' \
   "$pass_n" "$fail_n" "$xfail_n" "$skip_n"

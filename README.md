@@ -1136,11 +1136,22 @@ given the archive's directory mode, owner and times. Each refusal is checked
 alongside the cases that must still restore, so neither guard can pass by
 refusing everything.
 
-Where the two genuinely differ, the check is written the way it ought to pass
-and marked `XFAIL` with the divergence named. An `XFAIL` that starts passing is
-reported as `XPASS` and **counted as a failure**, so a fixed divergence gets
-promoted to a real assertion instead of sitting in the ledger forever. Nothing
-known-broken is quietly omitted.
+Where the two differ in a way that ought to be fixed, the check is written the
+way it ought to pass and marked `XFAIL` with the divergence named. An `XFAIL`
+that starts passing is reported as `XPASS` and **counted as a failure**, so a
+fixed divergence gets promoted to a real assertion instead of sitting in the
+ledger forever. Nothing known-broken is quietly omitted.
+
+That ledger and the [command-line table](#commands) above are separate records
+and mean different things. The table holds differences that are deliberate and
+are not going to converge: `version` is a command in one reader and not the
+other because only one of them writes discs, `doctor` answers a writer's
+question in the Go build and a reader's in the script. Writing those the way
+they "ought to pass" would be writing a test for something nobody intends to
+do. The `XFAIL` ledger holds the other kind — a difference the project means to
+close — and it is deliberately small. It was empty for a long time, and the
+suite reported "0 known divergence(s) remain" with the machinery never once
+executed, which read as agreement rather than as an unused ledger.
 
 Plus the Go unit tests:
 
