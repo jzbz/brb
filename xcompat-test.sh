@@ -724,6 +724,35 @@ if (( HAVE_FLOCK )); then
   }
   assert0 "brb.sh refuses a staging directory another brb is using" busy_staging_refused sh
   assert0 "go brb refuses a staging directory another brb is using" busy_staging_refused go
+
+  # A symlink left at the lock's name. bash has no O_NOFOLLOW to give a
+  # redirection, so `exec {fd}>` followed the link and truncated whatever it
+  # pointed at, with the run's privileges — under the sudo restore the README
+  # recommends, any file on the machine. fsx.LockStaging opens the same path
+  # O_NOFOLLOW and has always refused it; brb.sh now tests the name first.
+  #
+  # The assertion that matters is that the TARGET SURVIVES, not that the run
+  # failed. A reader that truncated the file and then failed for some later
+  # reason would satisfy an exit code with the operator's file already gone.
+  symlinked_lock_refused() { # symlinked_lock_refused sh|go
+    local who=$1 rc=0
+    local st=$T/lock-link-$who victim=$T/lock-victim-$who lf=$LOG/locklink-$who.log
+    local cfg=$T/cfg/locklink-$who
+    rm -rf "$st"; mkdir -p "$st"; chmod 700 "$st"
+    printf 'the operator file, which is none of this run\047s business\n' > "$victim"
+    ln -s "$victim" "$st/.brb.lock"
+    mkcfg "$cfg" "$st" "$SRC"
+    case $who in
+      sh) bash "$BRB_SH" --yes -c "$cfg" index > "$lf" 2>&1 || rc=$? ;;
+      go) "$BRB_GO" --yes --no-color -c "$cfg" index > "$lf" 2>&1 || rc=$? ;;
+    esac
+    (( rc != 0 )) || { echo "accepted a symlinked staging lock" >&2; return 1; }
+    grep -qi 'symlink' "$lf" \
+      || { echo "refused, but not for the link: $(_tail "$(cat "$lf")")" >&2; return 1; }
+    [[ -s "$victim" ]] || { echo "the link target was truncated to nothing" >&2; return 1; }
+  }
+  assert0 "brb.sh refuses a symlinked staging lock, and leaves its target whole" symlinked_lock_refused sh
+  assert0 "go brb refuses a symlinked staging lock, and leaves its target whole" symlinked_lock_refused go
 else
   # brb.sh's lock is opportunistic for the same reason this check is gated:
   # flock(1) is util-linux, and a machine without it still has to be able to

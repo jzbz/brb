@@ -304,6 +304,22 @@ lock_staging() {
     step "flock is not installed, so this run cannot tell whether another brb is already using $STAGING — run one brb at a time"
     return 0
   fi
+  # Before the redirect, because bash has no O_NOFOLLOW to give it. `>` follows
+  # a symlink and truncates what it finds, so a link left at this name empties
+  # the file it points at with this run's privileges — under the sudo restore
+  # the README recommends, any file on the machine. LockStaging opens the same
+  # path with O_NOFOLLOW for exactly this reason (go/internal/fsx/lock.go) and
+  # refuses with the same advice, so refuse here too rather than leaving the
+  # Go build the only one that does.
+  #
+  # This is a name test and then an open, which is weaker than the flag: a
+  # symlink planted in the gap is still followed. secure_dir has already proven
+  # $STAGING is a real directory this account owns, so anything that could win
+  # that race can write in there anyway; the case this catches is the link that
+  # is already sitting at the name, which is the one that occurs.
+  if [[ -L "$STAGING/.brb.lock" ]]; then
+    die "the staging lock $(esc_str "$STAGING/.brb.lock") is a symlink (-> $(esc_str "$(readlink -- "$STAGING/.brb.lock" 2>/dev/null || true)")); opening it truncates whatever it points at, so following the link would empty a file that is none of this run's business — remove the link, or point STAGING at a directory you own"
+  fi
   exec {BRB_LOCK_FD}>"$STAGING/.brb.lock" \
     || die "could not open the staging lock $(esc_str "$STAGING/.brb.lock") — fix its permissions, or point STAGING at a directory you own"
   flock -n "$BRB_LOCK_FD" \
