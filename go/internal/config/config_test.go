@@ -971,3 +971,44 @@ func TestPackRatioAdaptationFromFileAndEnvironment(t *testing.T) {
 		t.Errorf("Load error = %v, want PACK_RATIO_ADAPT=maybe refused", err)
 	}
 }
+
+// TestArchiveNameLength pins the length limit at the byte where xorriso stops
+// accepting it, and the reason it is worth checking at config time at all.
+//
+// ARCHIVE_NAME becomes the ISO's publisher field (-p), which ISO 9660 holds in
+// 128 bytes; xorriso refuses a longer one rather than truncating, and counts
+// bytes, so 65 two-byte characters is already over. ISO_MODE defaults to
+// ondemand, so nothing builds an ISO during a backup: without this check the
+// whole set was written, encrypted, protected and reported finished, and every
+// later burn failed.
+func TestArchiveNameLength(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		archive string
+		wantErr bool
+	}{
+		{"an ordinary name", "photos-2026", false},
+		{"exactly the limit", strings.Repeat("a", maxArchiveName), false},
+		{"one byte over", strings.Repeat("a", maxArchiveName+1), true},
+		// The limit is bytes, not characters: 64 two-byte runes fit exactly and
+		// 65 do not, which is what xorriso does with the same input.
+		{"64 two-byte characters is exactly the limit", strings.Repeat("é", 64), false},
+		{"65 two-byte characters is over it", strings.Repeat("é", 65), true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := checkArchiveName(tc.archive)
+			if tc.wantErr && err == nil {
+				t.Fatalf("checkArchiveName accepted %d bytes; xorriso refuses past %d",
+					len(tc.archive), maxArchiveName)
+			}
+			if !tc.wantErr && err != nil {
+				t.Fatalf("checkArchiveName(%d bytes) = %v, want nil", len(tc.archive), err)
+			}
+		})
+	}
+	// The control-byte rule the function already had must still fire, so the
+	// new check cannot have replaced it.
+	if err := checkArchiveName("has\na newline"); err == nil {
+		t.Error("checkArchiveName accepted a newline")
+	}
+}

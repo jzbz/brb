@@ -937,16 +937,37 @@ func compressionLevelRange(comp string) (lo, hi int, used bool) {
 	return 0, 0, false
 }
 
+// maxArchiveName is the longest ARCHIVE_NAME that can reach an ISO.
+//
+// The name is handed to xorriso as the publisher string (-p, see
+// tools.ISOOptions.Publish), and ISO 9660 holds that field in 128 bytes.
+// xorriso refuses a longer one outright — "Name too long with option
+// -preparer_id (130 > 128)" — rather than truncating, and it counts bytes, so
+// 65 two-byte characters is already too many.
+const maxArchiveName = 128
+
 // checkArchiveName rejects an ARCHIVE_NAME that cannot be written into a
 // document and read back as itself: any C0 control byte (newline, tab, CR,
 // ESC), DEL, and '/' — the last is not used as a path component today, but a
 // name that could not become one is cheap insurance.
+//
+// Length is checked for a different reason, and it is checked here because
+// this is the only moment it costs nothing. ISO_MODE is "ondemand" by default,
+// so nothing builds an ISO during a backup: a name too long for the publisher
+// field let the whole set be packed, encrypted, protected and reported
+// finished, and then failed every `burn` and `iso` afterwards, with the run
+// that could have been stopped in its first second already hours gone.
 func checkArchiveName(name string) error {
 	for _, r := range name {
 		if r < 0x20 || r == 0x7f || r == '/' {
 			return fmt.Errorf("ARCHIVE_NAME must not contain %q: it is copied verbatim "+
 				"into MANIFEST.txt and README.md on every disc", r)
 		}
+	}
+	if n := len(name); n > maxArchiveName {
+		return fmt.Errorf("ARCHIVE_NAME is %d bytes; it becomes the ISO's publisher field, which "+
+			"holds %d, so every disc's ISO would fail to build long after the set was written — "+
+			"shorten it (unset, it is derived from the last element of SOURCE_DIR)", n, maxArchiveName)
 	}
 	return nil
 }
