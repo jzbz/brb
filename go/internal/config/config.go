@@ -756,30 +756,35 @@ func (v Value) int(key string, dst *int) error {
 
 // boolInt applies a setting written as 0 or 1.
 //
-// The accepted spellings are exactly brb.sh's bool_setting (brb.sh:391-398):
-// 1/true/yes/on and 0/false/no/off, in any case. One config file drives both
-// implementations, and the README promises a boolean written for one reader is
-// not misread by the other — so the grammar has to be the same grammar, not a
-// stricter one that stops every Go command dead on a KEEP_ISOS=true brb.sh
-// would have taken. Anything outside it is still an error rather than a
-// silent false: a typo read as "off" would quietly turn off the thing the
-// operator asked for. A number other than 0 or 1 is accepted as a number,
-// because shell arithmetic would too.
+// The accepted spellings are exactly brb.sh's bool_setting: 1/true/yes/on and
+// 0/false/no/off, in any case, and nothing else. One config file drives both
+// implementations, and the README promises that a boolean written for one
+// reader is not misread by the other, and that "a spelling neither of them can
+// read as a boolean stops the Go build at load".
+//
+// It did not. Two clauses used to widen this grammar past bash's and break both
+// halves of that promise. An Atoi fallback took any integer as a number, so
+// KEEP_IMAGES=2 loaded here as TRUE while bool_setting killed brb.sh outright;
+// its stated reason, "because shell arithmetic would too", was wrong about the
+// shell, which matches the eight words with a case statement and dies before
+// any arithmetic sees the value. And TrimSpace ran before the match, so a
+// quoted " 1" was accepted here and refused there. On ASSUME_YES the loose side
+// was the dangerous one: a stray 2 turned off the confirmation that stands in
+// front of a restore overwriting its destination.
+//
+// Anything outside the grammar is an error rather than a silent false: a typo
+// read as "off" would quietly turn off the thing the operator asked for.
 func (v Value) boolInt(key string, dst *bool) error {
 	s, err := v.scalar(key)
 	if err != nil {
 		return err
 	}
-	switch strings.ToLower(strings.TrimSpace(s)) {
+	switch strings.ToLower(s) {
 	case "1", "true", "yes", "on":
 		*dst = true
 		return nil
 	case "0", "false", "no", "off":
 		*dst = false
-		return nil
-	}
-	if n, err := strconv.Atoi(strings.TrimSpace(s)); err == nil {
-		*dst = n != 0
 		return nil
 	}
 	return fmt.Errorf("%s%s: expected 0 or 1 (also true/false, yes/no, on/off), got %q",

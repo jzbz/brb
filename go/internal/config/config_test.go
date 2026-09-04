@@ -681,13 +681,19 @@ func TestNoHomeIsRefusedNotReRooted(t *testing.T) {
 	}
 }
 
-// TestBoolSettingSpellings pins the grammar brb.sh's bool_setting accepts
-// (brb.sh:391-398), which the README promises both readers share. A KEEP_ISOS
-// written as "true" used to stop every Go command at config load, the
-// restore-side ones included, while brb.sh read the same file happily.
+// TestBoolSettingSpellings pins the grammar brb.sh's bool_setting accepts,
+// which the README promises both readers share. A KEEP_ISOS written as "true"
+// used to stop every Go command at config load, the restore-side ones included,
+// while brb.sh read the same file happily.
+//
+// It is a parity test, so every entry below was run against brb.sh rather than
+// assumed. That caught two of its own: " on " was in the accepted list here and
+// bool_setting refuses it, because the shell matches the eight words with a
+// case statement and a leading space is not one of them; and the citation was
+// to brb.sh:391-398, which is inside secure_dir.
 func TestBoolSettingSpellings(t *testing.T) {
 	setHome(t, "/home/tester")
-	for _, v := range []string{"1", "true", "TRUE", "yes", "Yes", "on", " on "} {
+	for _, v := range []string{"1", "true", "TRUE", "yes", "Yes", "on"} {
 		c := Default()
 		if err := c.Apply(map[string]Value{"KEEP_ISOS": {Scalar: v, Line: 1}}); err != nil {
 			t.Errorf("KEEP_ISOS=%q: %v", v, err)
@@ -710,7 +716,14 @@ func TestBoolSettingSpellings(t *testing.T) {
 	}
 	// A word neither reader understands is still refused: read as "off" it
 	// would quietly switch off the thing the operator asked for.
-	for _, v := range []string{"maybe", "y", "n", "sure"} {
+	//
+	// The numbers are here because they were not refused. An Atoi fallback took
+	// any integer, so KEEP_IMAGES=2 loaded as TRUE while brb.sh died on the same
+	// file, and README's promise that an unreadable spelling "stops the Go build
+	// at load" was false. On ASSUME_YES that silently answered the confirmation
+	// in front of a restore that overwrites. Padding is here for the same
+	// reason: TrimSpace ran before the match, and the shell does not.
+	for _, v := range []string{"maybe", "y", "n", "sure", "2", "-1", "007", "+1", " 1", "on "} {
 		c := Default()
 		err := c.Apply(map[string]Value{"PUBLIC_ARCHIVE": {Scalar: v, Line: 7}})
 		if err == nil {
