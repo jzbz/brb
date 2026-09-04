@@ -75,11 +75,25 @@ CLI_ASSUME_YES=""                                    # --yes, applied after the 
 # export the user made deliberately. Remember which names arrived from the
 # environment so load_config can put them back. This has to happen BEFORE the
 # ${VAR:-default} lines below, which would otherwise make every name look set.
+# ASSUME_YES belongs on this list and was missing from it. It and KEEP_IMAGES
+# are the pair this script reads from the config file, and the Go build applies
+# every key from the environment after the file, so the two readers ordered the
+# same two settings differently: an exported ASSUME_YES=0 lost to a config
+# saying 1 here and won there. That is the setting that answers the
+# confirmation in front of a restore overwriting its destination, so the reader
+# that ignored the environment was ignoring it in the dangerous direction.
 BRB_ENV_OVERRIDES=()
-for _v in STAGING AGE_RECIPIENTS_FILE AGE_IDENTITY BURNER KEEP_IMAGES; do
+for _v in STAGING AGE_RECIPIENTS_FILE AGE_IDENTITY BURNER KEEP_IMAGES ASSUME_YES; do
+  # ${!_v:+x}, not ${!_v+x}: the second is true for a variable that is exported
+  # but EMPTY, which made `KEEP_IMAGES= brb.sh restore ...` push an empty string
+  # over whatever the config said, and bool_setting reads empty as 0. The Go
+  # build skips an empty environment variable and says it does so "exactly as
+  # brb.sh's ${VAR:-default} treats it" — which is the rule this line is meant
+  # to implement, and ${VAR:-default} ignores an empty value too.
+  #
   # An if, not `&&`: on the last iteration a false test would become the for
   # loop's status and errexit would end the script before it started.
-  if [[ -n "${!_v+x}" ]]; then BRB_ENV_OVERRIDES+=( "$_v=${!_v}" ); fi
+  if [[ -n "${!_v:+x}" ]]; then BRB_ENV_OVERRIDES+=( "$_v=${!_v}" ); fi
 done
 unset _v
 
