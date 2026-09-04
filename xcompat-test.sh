@@ -26,7 +26,7 @@
 # omitted.
 #
 # The ledger is not the same thing as the README's table of command-line
-# differences, and section 18 says which belongs where: that table records
+# differences, and section 19 says which belongs where: that table records
 # differences nobody intends to close, this records the ones somebody does.
 #
 # Usage
@@ -2269,7 +2269,56 @@ done
 unset name st
 
 # ---------------------------------------------------------------------------
-head_s "18. the divergence ledger"
+head_s "18. the disc count a manifest claims"
+# ---------------------------------------------------------------------------
+# check_complete is the one thing standing between a partial set and a restore
+# that looks complete: every disc carries the full skeleton, so a missing disc
+# shows up as files silently absent rather than as an error. MANIFEST.txt is
+# read off a disc, so the number it claims is an attacker's to choose, and
+# brb.sh put it through (( )) after checking only that it was digits.
+#
+# In bash arithmetic a leading zero is OCTAL, so "010" was 8 and eight staged
+# images satisfied a ten-disc set; and anything past 2^64 wraps, so
+# "18446744073709551616" was 0 and any number of images satisfied any set. The
+# Go reader reads the same field with strconv.Atoi -- decimal, and an error
+# past int64 -- which TestExpectedDiscs pins on that side.
+#
+# Asserted through brb.sh's doctor, which is where the bash reader runs the
+# check without needing a whole set staged first.
+manifest_count_says() { # manifest_count_says CLAIMED EXPECTED-RX
+  local claimed=$1 rx=$2 st=$T/mcount out
+  rm -rf "$st"; mkdir -p "$st/enc"
+  local i; for i in 01 02 03 04 05 06 07 08; do : > "$st/enc/disc$i.squashfs.age"; done
+  printf 'discs           : %s
+' "$claimed" > "$st/MANIFEST.txt"
+  mkcfg "$T/cfg/mcount" "$st" "$SRC"
+  out=$(bash "$BRB_SH" --yes -c "$T/cfg/mcount" doctor 2>&1) || true
+  grep -qE "$rx" <<<"$out" || { printf '%s\n' "$out" | tail -3 >&2; return 1; }
+}
+assert0 "brb.sh reads a manifest's 010 as ten discs, not as octal eight" \
+  manifest_count_says 010 'MANIFEST says 10 discs; 8 present'
+assert0 "  ... and still names the plain spelling the same way" \
+  manifest_count_says 10 'MANIFEST says 10 discs; 8 present'
+assert0 "brb.sh refuses a disc count larger than the arithmetic can hold" \
+  manifest_count_says 18446744073709551616 'cannot tell how many discs'
+assert0 "  ... and one that is all zeros" \
+  manifest_count_says 000 'cannot tell how many discs'
+# The companion that stops the two above from passing by refusing everything:
+# a set whose manifest matches what is staged must still read as complete.
+manifest_complete() {
+  local st=$T/mcount2 out
+  rm -rf "$st"; mkdir -p "$st/enc"
+  local i; for i in 01 02; do : > "$st/enc/disc$i.squashfs.age"; done
+  printf 'discs           : 2
+' > "$st/MANIFEST.txt"
+  mkcfg "$T/cfg/mcount2" "$st" "$SRC"
+  out=$(bash "$BRB_SH" --yes -c "$T/cfg/mcount2" doctor 2>&1) || true
+  grep -q 'all 2 disc image(s) present' <<<"$out" || { printf '%s\n' "$out" | tail -3 >&2; return 1; }
+}
+assert0 "brb.sh still reports a genuinely complete set as complete" manifest_complete
+
+# ---------------------------------------------------------------------------
+head_s "19. the divergence ledger"
 # ---------------------------------------------------------------------------
 # Every section above asserts a property both readers already share. This one
 # is the other half of the promise: where they genuinely differ, the check is

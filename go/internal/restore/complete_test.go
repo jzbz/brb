@@ -62,6 +62,18 @@ func TestExpectedDiscs(t *testing.T) {
 		{"a longer field that starts the same way", "disc type       : BD-R\n", 0, false},
 		{"the first discs line decides", "discs           : bad\ndiscs           : 4\n", 0, false},
 		{"no newline at the end", "discs           : 5", 5, true},
+		// Leading zeros and an unrepresentable count. These are here because
+		// brb.sh reads the same field, and it read them differently: its
+		// check_complete put the digits through (( )), where a leading zero is
+		// OCTAL and anything past 2^64 wraps to nothing, so "010" made 8 staged
+		// images satisfy a ten-disc set and the huge one made any number of
+		// images satisfy any set. Atoi is decimal and refuses what will not fit,
+		// and brb.sh now strips and range-checks to match. A manifest comes off
+		// a disc, so both spellings are an attacker's to choose.
+		{"a leading zero is decimal, not octal", "discs           : 010\n", 10, true},
+		{"several leading zeros", "discs           : 0010\n", 10, true},
+		{"larger than an int64", "discs           : 18446744073709551616\n", 0, false},
+		{"all zeros", "discs           : 000\n", 0, false},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {

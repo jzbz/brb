@@ -721,6 +721,12 @@ declare -A DISC_SUMS=()
 # rather than being scanned forever for free.
 MAX_SUM_LINES=1048576
 
+# How many missing disc numbers check_complete will spell out. The same bound
+# as maxNamedMissing in go/internal/restore/complete.go, and for the reason
+# given there: MANIFEST.txt is read off a disc that may have rotted or been
+# edited, and "discs : 3" is one flipped byte from "discs : 30000000".
+MAX_NAMED_MISSING=64
+
 read_disc_sums() {  # read_disc_sums MOUNTPOINT
   DISC_SUMS=()
   local h p n=0
@@ -1180,7 +1186,23 @@ copy_file_robustly() {
 expected_discs() {
   local v=""
   [[ -f "$STAGING/MANIFEST.txt" ]] && v="$(sed -n 's/^discs[[:space:]]*:[[:space:]]*//p' "$STAGING/MANIFEST.txt" | head -1 || true)"
-  [[ "$v" =~ ^[0-9]+$ ]] && printf '%s' "$v"
+  [[ "$v" =~ ^[0-9]+$ ]] || return 1
+  # A string of digits is not yet a number. check_complete puts this through
+  # (( )), where a leading zero means OCTAL and anything past 2^64 wraps: a
+  # manifest reading "discs : 010" let 8 staged images satisfy a ten-disc set,
+  # and "discs : 18446744073709551616" let any number of images satisfy any
+  # set — the completeness check announcing "all present" for a partial one,
+  # which is the single thing it exists to prevent. MANIFEST.txt is read off a
+  # disc, so those spellings are an attacker's to choose.
+  #
+  # The Go reader takes the same field with strconv.Atoi, which is decimal and
+  # refuses what will not fit, so strip the zeros and refuse the rest here.
+  # Past 18 digits this answers "cannot tell" where Atoi still parses to
+  # 2^63-1; both readers then decline to act on the number, and no manifest
+  # either of them writes can hold one.
+  v="${v#"${v%%[!0]*}"}"
+  [[ -n "$v" && ${#v} -le 18 ]] || return 1
+  printf '%s' "$v"
 }
 
 # Every disc carries the full directory skeleton, so a partial set restores a
@@ -1193,10 +1215,20 @@ check_complete() {
   have=$(find "$ENC_DIR" -maxdepth 1 -name 'disc*.squashfs.age' | wc -l)
   [[ -n "$want" ]] || { warn "no MANIFEST.txt in $STAGING — cannot tell how many discs this set has"; return 0; }
   (( have >= want )) && { ok "all $want disc image(s) present"; return 0; }
-  for (( i = 1; i <= want; i++ )); do
+  # Named at most MAX_NAMED_MISSING of them, and the count carries the rest.
+  # This loop used to run to $want, which is a number off a disc: a manifest
+  # claiming two billion discs spent the restore building a two-billion-entry
+  # array and a warning line to match. fsx's side bounds the same list at 64
+  # (maxNamedMissing in go/internal/restore/complete.go) and prices the
+  # unbounded version at 1.6 GB and a 168 MB line; this is that bound. It stops
+  # early in every real case too, since it can only run past the last staged
+  # image by the number of names it is still allowed to print.
+  for (( i = 1; i <= want && ${#missing[@]} < MAX_NAMED_MISSING; i++ )); do
     [[ -f "$(printf '%s/disc%02d.squashfs.age' "$ENC_DIR" "$i")" ]] || missing+=("$i")
   done
-  warn "MANIFEST says $want discs; $have present. MISSING: ${missing[*]}"
+  local shown="${missing[*]}" rest=$(( want - have - ${#missing[@]} ))
+  (( rest > 0 )) && shown="$shown ... and $rest more"
+  warn "MANIFEST says $want discs; $have present. MISSING: $shown"
   warn "files on those discs will NOT be restored"
   return 1
 }
