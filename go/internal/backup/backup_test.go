@@ -1271,3 +1271,43 @@ func TestResumeFilterIsQuietAboutAnUnchangedLinkGroup(t *testing.T) {
 		})
 	}
 }
+
+// TestWarnIfImageMayNotFit pins the notice that stands between an adaptive pack
+// ratio and mksquashfs running the filesystem out mid-image.
+//
+// preflight sizes its refusal from the IMAGE budget, which is the right floor
+// for content that compresses the way the ratio predicts and is not a bound on
+// the plaintext mksquashfs writes. With adaptation on by default, one disc of
+// compressible content can teach a ratio of 0.088, the raw budget becomes
+// eleven times the image budget, and a following disc of incompressible content
+// grows the image toward that raw size — past a free-space figure preflight
+// called sufficient.
+//
+// It warns rather than refusing: requiring avail >= RawBytes of every disc
+// refuses runs that complete today, because mksquashfs compresses as it writes.
+func TestWarnIfImageMayNotFit(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		rawBytes int64
+		wantWarn bool
+	}{
+		// t.TempDir is on a filesystem with far more than a kilobyte free, so
+		// this is the ordinary case and must stay silent.
+		{"a bin that comfortably fits", 1024, false},
+		// Larger than any filesystem this can run on, so the check must fire.
+		{"a bin larger than the filesystem", 1 << 62, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			p, log := recordingPrinter()
+			r := &runner{p: p, cfg: &config.Config{Staging: t.TempDir()}, packRatio: 0.088}
+			r.warnIfImageMayNotFit(&pack.Bin{RawBytes: tc.rawBytes}, 2)
+			got := log()
+			if tc.wantWarn && !strings.Contains(got, "disc 2 packs") {
+				t.Errorf("no warning for a bin of %d bytes:\n%s", tc.rawBytes, got)
+			}
+			if !tc.wantWarn && strings.Contains(got, "disc 2 packs") {
+				t.Errorf("warned about a bin that fits:\n%s", got)
+			}
+		})
+	}
+}

@@ -327,6 +327,41 @@ func (r *runner) checkIndexCovers(entries []scan.Entry) error {
 		"extended — start over", r.st.DiscsDone, pending)
 }
 
+// warnIfImageMayNotFit says so before a disc is built when staging could not
+// hold the image even in the worst case, rather than leaving mksquashfs to run
+// the filesystem out part way through.
+//
+// preflight sizes its refusal from the IMAGE budget: one plaintext image plus
+// one ciphertext with parity. That is the right floor for a disc whose content
+// compresses the way the ratio predicts, and it is not a bound on the plaintext
+// mksquashfs actually writes. With PACK_RATIO_ADAPT on by default, a disc of
+// compressible content can teach the estimator a ratio of, say, 0.088; the raw
+// budget is then imageBudget/0.088, eleven times the image budget, and if the
+// NEXT disc's content turns out not to compress — text then photographs, the
+// case the adaptation window exists for — the image grows toward that raw size
+// and the run dies on "No space left on device" after preflight said the space
+// was sufficient.
+//
+// This warns and does not refuse, deliberately. The bound it would have to
+// enforce is avail >= bin.RawBytes, and requiring that of every disc refuses
+// runs that complete today: mksquashfs compresses as it writes, so the
+// plaintext only approaches the raw size when the estimate was wrong, and on
+// bd25 at that ratio the demand would be about 240 GB of staging for a 21 GB
+// image budget. Clamping the raw budget to the space available instead would
+// complete, but by putting less on each disc — which is a decision about how
+// many physical discs someone burns, and not one to make silently.
+func (r *runner) warnIfImageMayNotFit(bin *pack.Bin, n int) {
+	avail, err := freeSpace(r.cfg.Staging)
+	if err != nil || avail >= bin.RawBytes {
+		return
+	}
+	r.p.Warn("disc %d packs %s of raw content and %s has %s free; that is enough only because "+
+		"the content is expected to compress to about %.3f of its size. If it does not, the image "+
+		"grows past the free space and mksquashfs stops the run here — clear staging, or set "+
+		"PACK_RATIO nearer 1.0 to pack less per disc",
+		n, ui.HumanBytes(bin.RawBytes), r.cfg.Staging, ui.HumanBytes(avail), r.packRatio)
+}
+
 // buildDiscs runs the per-disc loop until every file is on a disc.
 func (r *runner) buildDiscs(ctx context.Context, entries []scan.Entry) (int, error) {
 	p := pack.New(entries)
@@ -345,6 +380,7 @@ func (r *runner) buildDiscs(ctx context.Context, entries []scan.Entry) (int, err
 		if !ok {
 			break
 		}
+		r.warnIfImageMayNotFit(bin, base+p.Committed()+1)
 		if err := r.oneDisc(ctx, p, bin, base+p.Committed()+1); err != nil {
 			return 0, err
 		}
