@@ -632,7 +632,18 @@ func (c *Config) set(key string, v Value) error {
 	case "COMPRESSION_LEVEL":
 		return v.int(key, &c.CompressionLevel)
 	case "BLOCK_SIZE":
-		return v.str(key, &c.BlockSize)
+		// Trimmed here, like COMPRESSION above, because validateBlockSize trims
+		// before parsing and the value itself is handed to mksquashfs -b as
+		// written. BLOCK_SIZE="1M " therefore validated clean and then aborted
+		// the run at the first image with mksquashfs's own "invalid block size",
+		// after preflight and a full walk of the source tree. Validating one
+		// string and using another is the whole of that bug.
+		s, err := v.scalar(key)
+		if err != nil {
+			return err
+		}
+		c.BlockSize = strings.TrimSpace(s)
+		return nil
 	case "PACK_RATIO":
 		return v.f64(key, &c.PackRatio)
 	case "PACK_RATIO_ADAPT":
@@ -883,7 +894,14 @@ func (c *Config) Validate() error {
 	}
 	// Below 1.0 the margin plans every disc to come out over budget, and each
 	// overshoot costs a full mksquashfs pass over multiple gigabytes.
-	if !(c.PackRatioMargin >= 1) || math.IsInf(c.PackRatioMargin, 0) {
+	// The upper bound matters as much as the lower one. round3 multiplies by
+	// 1000 before rounding, so a margin past about 1.8e305 makes the learned
+	// ratio +Inf; that reaches State.PackRatio, encoding/json refuses to marshal
+	// it, and SaveState returns an error AFTER disc 1 is built, encrypted and
+	// protected — the run dies with "json: unsupported value: +Inf" and leaves
+	// no state to resume from. Ten is far past any safety factor with a use.
+	// The range test also subsumes the IsInf call it replaces.
+	if !(c.PackRatioMargin >= 1 && c.PackRatioMargin <= packRatioMarginMax) {
 		errs = append(errs, fmt.Errorf("PACK_RATIO_MARGIN is a safety factor over the measured "+
 			"ratio and must be at least 1.0, got %g", c.PackRatioMargin))
 	}
@@ -914,6 +932,11 @@ func (c *Config) Validate() error {
 	if c.MaxShrinkAttempts < 0 {
 		errs = append(errs, fmt.Errorf("MAX_SHRINK_ATTEMPTS must not be negative, got %d", c.MaxShrinkAttempts))
 	}
+	if c.Jobs > jobsMax {
+		errs = append(errs, fmt.Errorf("JOBS must be at most %d, got %d (mksquashfs sizes its "+
+			"reader and block buffers from -processors and aborts when they will not fit)",
+			jobsMax, c.Jobs))
+	}
 	if c.Jobs < 0 {
 		errs = append(errs, fmt.Errorf("JOBS must not be negative, got %d", c.Jobs))
 	}
@@ -941,6 +964,21 @@ func compressionLevelRange(comp string) (lo, hi int, used bool) {
 	}
 	return 0, 0, false
 }
+
+// packRatioMarginMax bounds PACK_RATIO_MARGIN from above. It is a safety factor
+// multiplied into a measured ratio, so anything past a few is meaningless; ten
+// is generous. The bound exists because round3 multiplies by 1000 before
+// rounding, so a margin past about 1.8e305 makes the learned ratio +Inf, which
+// State.PackRatio then cannot be marshalled to JSON — a run that dies saving
+// state after a disc is already built and leaves nothing to resume from.
+const packRatioMarginMax = 10
+
+// jobsMax is a sanity ceiling on JOBS, not a hardware limit. mksquashfs sizes
+// its reader and block buffers from -processors and aborts when they will not
+// fit, so an absurd value fails at the first image, after preflight and a full
+// walk of the source tree. Refusing it at load costs nothing and turns a
+// mksquashfs error into a message naming the setting.
+const jobsMax = 1024
 
 // maxArchiveName is the longest ARCHIVE_NAME that can reach an ISO.
 //

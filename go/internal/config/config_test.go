@@ -1,6 +1,7 @@
 package config
 
 import (
+	"math"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -1024,4 +1025,75 @@ func TestArchiveNameLength(t *testing.T) {
 	if err := checkArchiveName("has\na newline"); err == nil {
 		t.Error("checkArchiveName accepted a newline")
 	}
+}
+
+// TestSettingsBoundedAgainstTheToolTheyReach pins three settings that Validate
+// let through and a later stage refused, each of them hours into a run.
+//
+// The pattern is the same in all three: the config loaded clean, doctor and
+// plan reported no problem, and the failure arrived from mksquashfs or from
+// encoding/json long after the operator could act on it cheaply.
+func TestSettingsBoundedAgainstTheToolTheyReach(t *testing.T) {
+	setHome(t, "/home/tester")
+	dir := t.TempDir()
+	base := func() *Config {
+		c := Default()
+		c.SourceDir = dir
+		c.ResolveDefaults()
+		return c
+	}
+	// The baseline must validate, or the accept cases below prove nothing.
+	if err := base().Validate(); err != nil {
+		t.Fatalf("the unmodified fixture does not validate: %v", err)
+	}
+	t.Run("PACK_RATIO_MARGIN has an upper bound", func(t *testing.T) {
+		// round3 multiplies by 1000, so this becomes +Inf, reaches
+		// State.PackRatio, and SaveState fails with "json: unsupported value"
+		// after disc 1 is already built.
+		c := base()
+		c.PackRatioMargin = 1e306
+		if err := c.Validate(); err == nil {
+			t.Error("Validate accepted PACK_RATIO_MARGIN=1e306")
+		}
+		for _, ok := range []float64{1, 1.05, 2, packRatioMarginMax} {
+			c := base()
+			c.PackRatioMargin = ok
+			if err := c.Validate(); err != nil {
+				t.Errorf("Validate(PACK_RATIO_MARGIN=%v) = %v, want nil", ok, err)
+			}
+		}
+		// The lower bound and the Inf/NaN cases the range test subsumes.
+		for _, bad := range []float64{0.5, math.Inf(1), math.NaN()} {
+			c := base()
+			c.PackRatioMargin = bad
+			if err := c.Validate(); err == nil {
+				t.Errorf("Validate accepted PACK_RATIO_MARGIN=%v", bad)
+			}
+		}
+	})
+	t.Run("JOBS has an upper bound", func(t *testing.T) {
+		c := base()
+		c.Jobs = 1000000
+		if err := c.Validate(); err == nil {
+			t.Error("Validate accepted JOBS=1000000, which mksquashfs aborts on")
+		}
+		for _, ok := range []int{0, 1, 32, jobsMax} {
+			c := base()
+			c.Jobs = ok
+			if err := c.Validate(); err != nil {
+				t.Errorf("Validate(JOBS=%d) = %v, want nil", ok, err)
+			}
+		}
+	})
+	t.Run("BLOCK_SIZE is used as it was validated", func(t *testing.T) {
+		// validateBlockSize trimmed before parsing and the raw string went to
+		// mksquashfs -b, so "1M " validated and then failed at the first image.
+		c := Default()
+		if err := c.Apply(map[string]Value{"BLOCK_SIZE": {Scalar: "1M ", Line: 1}}); err != nil {
+			t.Fatalf("Apply(BLOCK_SIZE=%q): %v", "1M ", err)
+		}
+		if c.BlockSize != "1M" {
+			t.Errorf("BlockSize = %q, want the trimmed %q that validateBlockSize judged", c.BlockSize, "1M")
+		}
+	})
 }
