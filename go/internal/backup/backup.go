@@ -136,11 +136,20 @@ func RequiredSpace(imageBudget int64, par2Redundancy int) int64 {
 	return imageBudget + scaled
 }
 
-// rawBudget converts a compressed-size budget into the raw-content budget the
+// RawBudget converts a compressed-size budget into the raw-content budget the
 // packer works in: integer truncation of budget/ratio, with a non-positive or
 // non-finite ratio treated as 1.0. Truncating rather than rounding is the safe
 // direction — it plans slightly less content per disc, never slightly more.
-func rawBudget(imageBudget int64, ratio float64) int64 {
+//
+// Exported because `doctor` prints this number before a run and had its own
+// copy of the arithmetic, whose comment said it was "the same arithmetic
+// internal/backup plans with — doctor's number has to be the number the run
+// will use, or it is worse than none". It was not the same: the copy guarded
+// only a non-positive ratio, so it neither rejected an infinity nor applied
+// the floor below, and PACK_RATIO=1e-10 made doctor report a per-disc budget
+// of -9223372036854775808 B while plan reported 1 B for the same config. One
+// function is the only way that claim stays true.
+func RawBudget(imageBudget int64, ratio float64) int64 {
 	if !(ratio > 0) || math.IsInf(ratio, 0) || math.IsNaN(ratio) {
 		ratio = 1.0
 	}
@@ -300,7 +309,7 @@ func Plan(ctx context.Context, o Options) (*PlanResult, error) {
 // layout packs an already-scanned tree into bins, reporting each one.
 func (r *runner) layout(ctx context.Context, res *scan.Result) (*PlanResult, error) {
 	p := pack.New(res.Entries)
-	rb := rawBudget(r.budget.Image, r.packRatio)
+	rb := RawBudget(r.budget.Image, r.packRatio)
 
 	// Same reason, one level up: preflight is the only caller of Validate, so
 	// without this a plan is happily produced under settings backup refuses —

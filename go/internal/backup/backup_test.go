@@ -290,6 +290,12 @@ func TestRawBudget(t *testing.T) {
 		{name: "NaN falls back to 1.0", image: 1000, ratio: math.NaN(), want: 1000},
 		{name: "Inf falls back to 1.0", image: 1000, ratio: math.Inf(1), want: 1000},
 		{name: "never returns zero", image: 1, ratio: 1000, want: 1},
+		// A ratio small enough that budget/ratio leaves the int64 range. The
+		// conversion is implementation-defined there — amd64 yields MinInt64 —
+		// so without the floor this came back negative. doctor printed exactly
+		// that, -9223372036854775808 B, until it stopped carrying its own copy
+		// of this function.
+		{name: "a ratio too small to convert", image: 21999955782, ratio: 1e-10, want: 1},
 		{
 			name: "bd25 default budget", image: 21999955782, ratio: 1.0, want: 21999955782,
 		},
@@ -297,8 +303,8 @@ func TestRawBudget(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			if got := rawBudget(tc.image, tc.ratio); got != tc.want {
-				t.Errorf("rawBudget(%d, %v) = %d, want %d", tc.image, tc.ratio, got, tc.want)
+			if got := RawBudget(tc.image, tc.ratio); got != tc.want {
+				t.Errorf("RawBudget(%d, %v) = %d, want %d", tc.image, tc.ratio, got, tc.want)
 			}
 		})
 	}
@@ -368,7 +374,7 @@ func TestShrinkRetryShrinksTheBudget(t *testing.T) {
 	}
 	for _, c := range cases {
 		ratio := shrinkRatio(c.imageSize, c.rawBytes)
-		got := rawBudget(imageBudget, ratio)
+		got := RawBudget(imageBudget, ratio)
 		if got >= c.rawBytes {
 			t.Errorf("image %d from %d raw: new raw budget %d is not below %d (ratio %v)",
 				c.imageSize, c.rawBytes, got, c.rawBytes, ratio)

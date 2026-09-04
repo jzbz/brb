@@ -337,7 +337,7 @@ func (r *runner) buildDiscs(ctx context.Context, entries []scan.Entry) (int, err
 		if err := ctx.Err(); err != nil {
 			return 0, fmt.Errorf("backup: aborted: %w", err)
 		}
-		rb := rawBudget(r.budget.Image, r.packRatio)
+		rb := RawBudget(r.budget.Image, r.packRatio)
 		if over := p.Oversized(rb); len(over) > 0 {
 			return 0, oversizedError(over, rb)
 		}
@@ -450,7 +450,7 @@ func (r *runner) buildImage(ctx context.Context, p *pack.Packer, bin *pack.Bin, 
 
 		// The measured ratio is the truth; re-plan this bin with it, plus margin.
 		r.packRatio = shrinkRatio(size, bin.RawBytes)
-		rb := rawBudget(r.budget.Image, r.packRatio)
+		rb := RawBudget(r.budget.Image, r.packRatio)
 		r.p.Step("re-packing disc %d with measured ratio %.3f (raw budget %s)",
 			n, r.packRatio, ui.HumanBytes(rb))
 

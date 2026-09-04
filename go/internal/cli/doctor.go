@@ -174,7 +174,7 @@ func doctor(ctx context.Context, cfg *config.Config, cfgPath string, p *ui.Print
 		p.Step("usable per disc %s  (98%% of the media, ISO 9660 overhead)", ui.HumanBytes(b.Usable))
 		p.Step("reserve         %s  (README, MANIFEST, SHA512SUMS, index, brb)", ui.HumanBytes(b.Reserve))
 		p.Step("max image size  %s  (after %d%% par2 recovery data)", ui.HumanBytes(b.Image), cfg.Par2Redundancy)
-		p.Step("raw per disc    %s  at PACK_RATIO %.2f", ui.HumanBytes(rawPerDisc(b.Image, cfg.PackRatio)), cfg.PackRatio)
+		p.Step("raw per disc    %s  at PACK_RATIO %.2f", ui.HumanBytes(backup.RawBudget(b.Image, cfg.PackRatio)), cfg.PackRatio)
 		p.Step("ratio adapts    %s", packRatioAdaptNote(cfg))
 	}
 	p.Step("compression     %s level %d, block %s", cfg.Compression, cfg.CompressionLevel, cfg.BlockSize)
@@ -405,16 +405,6 @@ func defaultIdentityPath(cfg *config.Config) string {
 		return cfg.AgeIdentity
 	}
 	return filepath.Join(filepath.Dir(cfg.AgeRecipientsFile), "identity.txt")
-}
-
-// rawPerDisc converts a compressed-image budget into the raw-content budget the
-// packer works in, the same arithmetic internal/backup plans with — doctor's
-// number has to be the number the run will use, or it is worse than none.
-func rawPerDisc(imageBudget int64, ratio float64) int64 {
-	if !(ratio > 0) {
-		ratio = 1
-	}
-	return int64(float64(imageBudget) / ratio)
 }
 
 // packRatioAdaptNote says in one line whether the pack ratio will be re-learned

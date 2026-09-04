@@ -249,9 +249,9 @@ func TestAdaptLogsTheTransitionAndTheNewBudget(t *testing.T) {
 // packer: a lower ratio must widen the raw budget the next bin is planned to.
 func TestAdaptRecomputesTheRawBudget(t *testing.T) {
 	r := runnerFor(t, func(c *config.Config) { c.PackRatio = 1.0 })
-	before := rawBudget(r.budget.Image, r.packRatio)
+	before := RawBudget(r.budget.Image, r.packRatio)
 	r.adapt(0.25)
-	after := rawBudget(r.budget.Image, r.packRatio)
+	after := RawBudget(r.budget.Image, r.packRatio)
 	if r.packRatio != 0.263 {
 		t.Fatalf("pack ratio = %v, want 0.263 (0.25 x 1.05, to three decimals)", r.packRatio)
 	}

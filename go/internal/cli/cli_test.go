@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"io"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
@@ -12,6 +13,7 @@ import (
 	"filippo.io/age"
 
 	"github.com/jzbz/brb/internal/agecrypt"
+	"github.com/jzbz/brb/internal/backup"
 	"github.com/jzbz/brb/internal/config"
 	"github.com/jzbz/brb/internal/tools"
 	"github.com/jzbz/brb/internal/ui"
@@ -889,6 +891,29 @@ func TestHelpDocumentsWhatRestoreAndTheRescueKeyDo(t *testing.T) {
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("help does not mention %q", want)
+		}
+	}
+}
+
+// TestDoctorReportsTheBudgetTheRunWillUse pins doctor's per-disc figure to the
+// packer's own function rather than to a second copy of the arithmetic.
+//
+// doctor used to carry its own rawPerDisc, whose comment claimed it was "the
+// same arithmetic internal/backup plans with — doctor's number has to be the
+// number the run will use, or it is worse than none". It guarded only a
+// non-positive ratio, with no infinity check and no floor, so PACK_RATIO=1e-10
+// printed "raw per disc -9223372036854775808 B" while plan reported 1 B from
+// the same config and the same budget.
+func TestDoctorReportsTheBudgetTheRunWillUse(t *testing.T) {
+	cfg := config.Default()
+	b, err := cfg.Budget()
+	if err != nil {
+		t.Fatalf("Budget: %v", err)
+	}
+	for _, ratio := range []float64{1.0, 0.5, 1e-10, 0, math.NaN(), math.Inf(1)} {
+		if got := backup.RawBudget(b.Image, ratio); got < 1 {
+			t.Errorf("RawBudget(%v) = %d; doctor prints this number, and it must never "+
+				"be one an operator cannot act on", ratio, got)
 		}
 	}
 }

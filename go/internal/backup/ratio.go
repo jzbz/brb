@@ -181,7 +181,7 @@ func (r *runner) adapt(measured float64) {
 		r.packRatio, next, len(window), formatRatios(window))
 	r.packRatio = next
 	r.p.Step("raw content budget per disc: %s  (image budget %s / ratio %.3f)",
-		ui.HumanBytes(rawBudget(r.budget.Image, next)), ui.HumanBytes(r.budget.Image), next)
+		ui.HumanBytes(RawBudget(r.budget.Image, next)), ui.HumanBytes(r.budget.Image), next)
 }
 
 // resumeRatio restores what an interrupted run had learned: the pack ratio it
