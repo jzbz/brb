@@ -2269,7 +2269,7 @@ done
 unset name st
 
 # ---------------------------------------------------------------------------
-head_s "18. the disc count a manifest claims"
+head_s "18. numbers that reach the shell's arithmetic"
 # ---------------------------------------------------------------------------
 # check_complete is the one thing standing between a partial set and a restore
 # that looks complete: every disc carries the full skeleton, so a missing disc
@@ -2316,6 +2316,33 @@ manifest_complete() {
   grep -q 'all 2 disc image(s) present' <<<"$out" || { printf '%s\n' "$out" | tail -3 >&2; return 1; }
 }
 assert0 "brb.sh still reports a genuinely complete set as complete" manifest_complete
+
+# The same hazard one argument along. num_arg forces base 10 but did not bound
+# the value, and bash arithmetic wraps at 2^64 silently: "18446744073709551618"
+# arrived as 2, so `restore DEST --disc 18446744073709551618` extracted disc 2
+# over the destination with unsquashfs -f and exited 0, for a disc the operator
+# never asked for. The Go reader refuses the same argument as a usage error.
+disc_arg_refused() { # disc_arg_refused sh|go NUMBER
+  local who=$1 n=$2 rc=0 out
+  case $who in
+    sh) out=$(bash "$BRB_SH" --yes -c "$T/cfg/go" list "$n" 2>&1) || rc=$? ;;
+    go) out=$("$BRB_GO" --yes --no-color -c "$T/cfg/go" list "$n" 2>&1) || rc=$? ;;
+  esac
+  (( rc != 0 )) || { echo "accepted the number" >&2; return 1; }
+  # It must be refused AS A NUMBER, not merely fail later for some other reason:
+  # a reader that took it and then tripped over a missing image would satisfy
+  # the exit code while having chosen a disc nobody named.
+  grep -qiE 'not a disc number|must be a number|is not a number' <<<"$out" \
+    || { printf '%s\n' "$out" | tail -2 >&2; return 1; }
+}
+for who in sh go; do
+  case $who in sh) name="brb.sh" ;; go) name="go brb" ;; esac
+  assert0 "$name refuses a disc number too large for its own arithmetic" \
+    disc_arg_refused "$who" 18446744073709551618
+  assert0 "  ... and one just past the wrap, which came through as 1" \
+    disc_arg_refused "$who" 18446744073709551617
+done
+unset name
 
 # ---------------------------------------------------------------------------
 head_s "19. the divergence ledger"

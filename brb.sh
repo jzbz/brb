@@ -187,7 +187,15 @@ need() { command -v "$1" >/dev/null 2>&1 || die "missing required tool: $1${2:+ 
 # arithmetic. Callers must assign on a line of their own (`local n; n="$(...)"`)
 # or the `local` builtin's own exit status hides the failure.
 num_arg() {  # num_arg <value> <what-it-is>
-  [[ "${1:-}" =~ ^[0-9]+$ ]] || die "${2:-argument} must be a number, got '${1:-}'"
+  # {1,9}, not +. 10# forces base 10 but not range, and bash arithmetic wraps
+  # at 2^64 without a word: "18446744073709551618" came through this as 2, so
+  # `restore DEST --disc 18446744073709551618` extracted disc 2 over the
+  # destination with unsquashfs -f and exited 0, having been asked for a disc
+  # that does not exist. Nine digits is past any disc count a set can have --
+  # the number here only ever names a disc -- and it makes the wrap
+  # unreachable by construction rather than by a range test of its own. The Go
+  # reader refuses the same argument as a usage error.
+  [[ "${1:-}" =~ ^[0-9]{1,9}$ ]] || die "${2:-argument} must be a number, got '${1:-}'"
   printf '%d' "$(( 10#$1 ))"
 }
 
@@ -2073,7 +2081,10 @@ cmd_restore() {
     (( ${#hits[@]} )) \
       || die "'$only' is not in the index — check '$PROG index ${only##*/}' for the exact path, or pass --disc N. Paths are relative to the archive root, with no leading '/'."
     for d in "${hits[@]}"; do
-      [[ "$d" =~ ^[0-9]+$ ]] || continue
+      # Bounded for the same reason as num_arg: this field comes off the
+      # index, $((10#$d)) wraps at 2^64, and the warning below would then name
+      # a disc number the image lookup never used.
+      [[ "$d" =~ ^[0-9]{1,9}$ ]] || continue
       e="$(printf '%s/disc%02d.squashfs.age' "$ENC_DIR" "$((10#$d))")"
       if [[ -f "$e" ]]; then sel+=( "$e" )
       else warn "'$only' is partly on disc $d, whose image is not in $ENC_DIR"; fi
