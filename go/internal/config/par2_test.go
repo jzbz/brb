@@ -138,3 +138,42 @@ func TestValidateAcceptsAutomaticPar2Blocks(t *testing.T) {
 		t.Error("a negative PAR2_BLOCKS must be rejected")
 	}
 }
+
+// TestPar2RecoveryBlocksRoundUp pins the recovery-block count to what par2
+// actually writes, which is the number this preview exists to predict.
+//
+// It divided by 100 and truncated, so it under-reported every count that is
+// not an exact multiple and reported ZERO for PAR2_BLOCKS 1 to 9 at the default
+// 10% redundancy — a disc described in MANIFEST.txt and at the progress line as
+// carrying no parity, while par2 wrote a block regardless. Expectations below
+// were measured against par2 0.8.1 on a 5 MB file: -b5 -r10 wrote 1000572 bytes
+// of recovery volumes (one block of five), -b9 wrote 556208 (one of nine), -b15
+// wrote two blocks and -b45 five.
+func TestPar2RecoveryBlocksRoundUp(t *testing.T) {
+	const mib = 1 << 20
+	for _, tc := range []struct {
+		blocks, redundancy, want int
+	}{
+		{5, 10, 1},  // truncation said 0
+		{9, 10, 1},  // truncation said 0
+		{1, 10, 1},  // truncation said 0
+		{15, 10, 2}, // truncation said 1
+		{45, 10, 5}, // truncation said 4
+		{10, 10, 1}, // exact multiple: unchanged
+		{40, 10, 4}, // exact multiple: unchanged
+		{3000, 10, 300},
+		{100, 1, 1},
+		{99, 1, 1}, // truncation said 0
+	} {
+		g := Par2GeometryFor(10*mib, tc.blocks, tc.redundancy)
+		if g.RecoveryBlocks != tc.want {
+			t.Errorf("Par2GeometryFor(-b%d -r%d).RecoveryBlocks = %d, want %d",
+				tc.blocks, tc.redundancy, g.RecoveryBlocks, tc.want)
+		}
+	}
+	// Zero redundancy means no recovery set at all, and must not be rounded up
+	// into one: Par2CreateArgs omits -r entirely when it is not positive.
+	if g := Par2GeometryFor(10*mib, 3000, 0); g.RecoveryBlocks != 0 {
+		t.Errorf("with no redundancy, RecoveryBlocks = %d, want 0", g.RecoveryBlocks)
+	}
+}

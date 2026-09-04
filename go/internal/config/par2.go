@@ -69,7 +69,22 @@ func Par2GeometryFor(size int64, blocks, redundancy int) Par2Geometry {
 	if blocks <= 0 {
 		blocks = Par2BlockCount(size)
 	}
-	g := Par2Geometry{Blocks: blocks, RecoveryBlocks: blocks * redundancy / 100}
+	// Rounded up, because that is what par2 does, and this number is the
+	// operator's only preview of the recovery set before it is built.
+	//
+	// Truncating divided by 100 and threw the remainder away, so it under-
+	// reported every count that is not an exact multiple, and reported ZERO for
+	// PAR2_BLOCKS 1 to 9 at the default 10% — a disc described as carrying no
+	// parity at all. par2 was writing one block regardless: measured against
+	// par2 0.8.1 on a 5 MB file, -b5 -r10 produced 1000572 bytes of recovery
+	// volumes (one block of five), -b9 produced 556208 (one of nine), -b15
+	// produced two blocks where truncation says one, and -b45 five where it
+	// says four.
+	rec := (blocks*redundancy + 99) / 100
+	if rec < 1 && redundancy > 0 && blocks > 0 {
+		rec = 1
+	}
+	g := Par2Geometry{Blocks: blocks, RecoveryBlocks: rec}
 	if blocks > 0 {
 		g.BlockSize = (size + int64(blocks) - 1) / int64(blocks)
 	}
