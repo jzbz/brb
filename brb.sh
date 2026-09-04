@@ -114,7 +114,19 @@ ASSUME_YES="${ASSUME_YES:-0}"
 confirm() {
   [[ "$ASSUME_YES" == "1" ]] && { printf '%s [auto-yes]\n' "$1" >&2; return 0; }
   local reply
-  if [[ -r /dev/tty && -w /dev/tty ]]; then read -r -p "$1 [y/N] " reply </dev/tty || return 1
+  # have_tty, not [[ -r /dev/tty && -w /dev/tty ]]. The mode bits are true in a
+  # session with no controlling terminal — a cron job, a systemd unit, a
+  # detached ssh command — where opening the file fails with ENXIO, so this
+  # branch was taken, the read failed, and `|| return 1` turned that into a
+  # plain "no". The caller then aborted the restore as though the operator had
+  # declined it, and the die() below, written for exactly this case, could not
+  # be reached to say "re-run with --yes if you mean it".
+  #
+  # have_tty exists because of that distinction and says so at its definition;
+  # prompt_media and the passphrase prompt already use it. The Go reader opens
+  # /dev/tty to find out too (openTTY in internal/ui/ui.go), so this is the
+  # order both readers already documented and now the same test.
+  if have_tty; then read -r -p "$1 [y/N] " reply </dev/tty || return 1
   elif [[ -t 0 ]]; then read -r -p "$1 [y/N] " reply || return 1
   else die "no terminal available to confirm '$1' — re-run with --yes if you mean it"
   fi
