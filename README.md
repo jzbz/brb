@@ -97,7 +97,7 @@ the same and one fewer thing has to be installed.
 
 No `python3` for either — the bin-packer that once needed it is Go code now.
 
-And to build the Go program from source: **Go 1.25 or newer**. Nothing else
+And to build the Go program from source: **Go 1.26 or newer**. Nothing else
 needs it, and a restore never does.
 
 Optional, but worth having:
@@ -162,7 +162,7 @@ sudo pacman -S ddrescue udisks2 util-linux
   distribution does not carry it, take a static binary from the
   [releases page](https://github.com/FiloSottile/age/releases) — it is a single
   file with no runtime dependencies.
-- **Go 1.25+** only if you build the Go program from source. A prebuilt static
+- **Go 1.26+** only if you build the Go program from source. A prebuilt static
   binary from any disc needs nothing at all.
 
 ### Install brb itself
@@ -282,7 +282,7 @@ warns and burns discs carrying only a copy of the binary that is running (`brb-l
 on x86-64) — a missing payload never fails a backup. `brb doctor` reports exactly what it
 found.
 
-Building the payload needs a Go toolchain (1.25+); nothing else in `brb` does, and a
+Building the payload needs a Go toolchain (1.26+); nothing else in `brb` does, and a
 restore never does.
 
 The source tarball vendors its dependencies, so it rebuilds with no network:

@@ -525,15 +525,15 @@ func TestCreatePartDoesNotFollowAPlantedSymlink(t *testing.T) {
 	}
 }
 
-// TestParseIdentityFileNeverEchoesTheKey: age reports a line it cannot place
-// by quoting it back ("unknown identity type: %q"), and in an identity file
-// that line is the secret key. Every caller prints the error it gets — brb
-// doctor, restore, backup preflight — so a key that failed the exact-prefix
-// test only because a paste carried a leading space, or because something
-// lowercased it, used to be reproduced in full on stderr and from there into
-// scrollback, CI logs and the bug report the operator attaches them to. The
-// key still works once either mutation is undone, so no error out of this
-// function may contain it.
+// TestParseIdentityFileNeverEchoesTheKey: age up to v1.3.1 reported a line it
+// could not place by quoting it back ("unknown identity type: %q"), and in an
+// identity file that line is the secret key. Every caller prints the error it
+// gets — brb doctor, restore, backup preflight — so a key that failed the
+// exact-prefix test only because a paste carried a leading space, or because
+// something lowercased it, used to be reproduced in full on stderr and from
+// there into scrollback, CI logs and the bug report the operator attaches them
+// to. The key still works once either mutation is undone, so no error out of
+// this function may contain it, whatever the age version underneath does.
 func TestParseIdentityFileNeverEchoesTheKey(t *testing.T) {
 	dir := t.TempDir()
 	id := mustIdentity(t)

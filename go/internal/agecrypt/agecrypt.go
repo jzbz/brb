@@ -82,15 +82,16 @@ func ParseRecipientsFile(path string) ([]age.Recipient, error) {
 // to contain no keys.
 //
 // A parse failure is reported in this package's own words and never in age's.
-// age quotes the line it could not place straight back at the caller
-// ("unknown identity type: %q"), and in an identity file that line is the
-// secret key: a paste that carried one leading space, or a key round-tripped
-// through something that lowercased it, is still a perfectly good key, and
-// every caller prints the error it gets — onto the terminal, into the
-// scrollback, into a CI log, into the bug report the operator then attaches
-// the whole thing to. Nothing here may put key material in an error string.
-// ParseRecipientsFile above deliberately keeps age's message: its lines are
-// public keys, and the exact text is the fastest way to fix a typo in one.
+// age up to v1.3.1 quoted the line it could not place straight back at the
+// caller ("unknown identity type: %q"), and in an identity file that line is
+// the secret key: a paste that carried one leading space, or a key
+// round-tripped through something that lowercased it, is still a perfectly
+// good key, and every caller prints the error it gets — onto the terminal,
+// into the scrollback, into a CI log, into the bug report the operator then
+// attaches the whole thing to. v1.3.2 stopped quoting it, but keeping key
+// material out of error strings is not left to the library: nothing here may
+// put it there. ParseRecipientsFile above keeps age's message: its lines are
+// public keys, and age names the line number of the one it rejects.
 func ParseIdentityFile(path string) ([]age.Identity, error) {
 	f, err := os.Open(path)
 	if err != nil {
