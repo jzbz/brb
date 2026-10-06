@@ -2,8 +2,6 @@ module github.com/jzbz/brb
 
 go 1.26.0
 
-toolchain go1.26.8
-
 require filippo.io/age v1.3.2
 
 require (

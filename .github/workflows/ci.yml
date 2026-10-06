@@ -60,6 +60,17 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+# The Go release every job builds and tests with. Build a release on the same one
+# (GOTOOLCHAIN=go<this> ./build-dist.sh), so that the suites have run on the
+# toolchain that produces the shipped bytes. It is stated here rather than as a
+# toolchain line in go.mod, because go.mod ships inside the source tarball on
+# every disc: a toolchain line there is a release every rebuild has to reach,
+# and a rescuer's Go that is older goes looking for a download, which offline
+# is a refusal. go.mod's go line is the floor instead, and the last step of
+# dist builds on exactly that. Move this by hand when a 1.26 point release ships.
+env:
+  GO_VERSION: '1.26.8'
+
 jobs:
   check:
     name: build, vet, gofmt, shellcheck
@@ -96,8 +107,7 @@ jobs:
 
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7.0.0
         with:
-          # Read the version out of go.mod rather than pinning it twice.
-          go-version-file: go/go.mod
+          go-version: ${{ env.GO_VERSION }}
           cache-dependency-path: go/go.sum
 
       # A clean checkout carries no vendor/ — it is gitignored, and regenerated
@@ -132,7 +142,7 @@ jobs:
 
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7.0.0
         with:
-          go-version-file: go/go.mod
+          go-version: ${{ env.GO_VERSION }}
           cache-dependency-path: go/go.sum
 
       - name: Install the tools brb shells out to
@@ -153,12 +163,12 @@ jobs:
           if sudo apt-get install -y --no-install-recommends age; then
             echo "age: from apt"
           else
-            # Read the version out of go.mod rather than pinning it twice, the
-            # same rule the toolchain follows above. A literal here would go
-            # stale silently on the next dependency bump, and it would go stale
-            # in the branch that only runs when the runner image changes — so
-            # the CLI producing the on-disc format could drift away from the
-            # library that writes it without any commit looking wrong.
+            # Read the version out of go.mod rather than pinning it twice. A
+            # literal here would go stale silently on the next dependency bump,
+            # and it would go stale in the branch that only runs when the
+            # runner image changes — so the CLI producing the on-disc format
+            # could drift away from the library that writes it without any
+            # commit looking wrong.
             AGE_VER="$(go -C go list -m -f '{{.Version}}' filippo.io/age)"
             [ -n "$AGE_VER" ] || { echo "::error::could not read the age version out of go/go.mod"; exit 1; }
             echo "age: apt has no package, building $AGE_VER from the pinned module"
@@ -231,7 +241,7 @@ jobs:
 
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7.0.0
         with:
-          go-version-file: go/go.mod
+          go-version: ${{ env.GO_VERSION }}
           cache-dependency-path: go/go.sum
 
       # build-dist.sh is run with NO argument and BRB_DIST_OUT unset, so the
@@ -313,3 +323,39 @@ jobs:
       # no longer describe the module that actually gets shipped on the discs.
       - name: go.mod and go.sum must already be tidy
         run: git diff --exit-code -- go/go.mod go/go.sum
+
+      # The offline rebuild above runs on GO_VERSION, under the GOTOOLCHAIN=local
+      # that setup-go exports, and that is the one arrangement that cannot see
+      # how a rescuer's rebuild breaks. Their go runs with its default,
+      # GOTOOLCHAIN=auto, and given a go.mod asking for a newer release than it
+      # is — a toolchain line, or a dependency bump that raises the go line — it
+      # goes looking for a download, which offline is a refusal. So rebuild once
+      # more on the oldest Go the module admits, read out of go.mod's go line,
+      # with that default restored. Last in the job, because the go it puts on
+      # PATH replaces GO_VERSION's for every step after it.
+      - name: Read the oldest Go the module admits
+        id: floor
+        run: |
+          v="$(sed -n 's/^go \([0-9][0-9.]*\)$/\1/p' go/go.mod)"
+          [ -n "$v" ] || { echo "::error::could not read the go line out of go/go.mod"; exit 1; }
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7.0.0
+        with:
+          go-version: ${{ steps.floor.outputs.version }}
+          cache: false
+
+      # GOPROXY=off covers every go command in the step, not just the build:
+      # inside the module even `go version` switches to whatever toolchain
+      # go.mod asks for, so with the network on it would fetch that release
+      # into the module cache and the build after it would pass from there.
+      - name: The source tarball must rebuild offline on that Go, as installed
+        run: |
+          export GOPROXY=off
+          unset GOTOOLCHAIN
+          cd "$RUNNER_TEMP"
+          go version
+          cd brb-*/go
+          go env GOTOOLCHAIN
+          go build -mod=vendor -o "$RUNNER_TEMP/brb-floor" ./cmd/brb
+          "$RUNNER_TEMP/brb-floor" version
