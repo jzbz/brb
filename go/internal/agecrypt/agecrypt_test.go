@@ -596,6 +596,109 @@ func TestParseIdentityFileNeverEchoesTheKey(t *testing.T) {
 	}
 }
 
+// TestParseIdentityFileSaysWhenItIsTooLong: age v1.3.2 refuses an identity file
+// past 16 MiB where v1.3.1 read the first 16 MiB and dropped every key after
+// it. Every line of such a file can be a good key or a comment, so the rescan
+// that names a bad line finds none, and the message it falls back on told the
+// operator to check the key line for a leading space or a change of case —
+// a repair to a key that is fine. The size is the reason, and has to be said.
+func TestParseIdentityFileSaysWhenItIsTooLong(t *testing.T) {
+	dir := t.TempDir()
+	secret := mustIdentity(t).String()
+	head := "# created: whenever\n" + secret + "\n"
+	pad := func(total int) []byte {
+		b := []byte(head)
+		for len(b) < total {
+			b = append(b, "# padding\n"...)
+		}
+		b = b[:total]
+		b[total-1] = '\n' // the cut lands inside a comment; end it as a line
+		return b
+	}
+
+	// age's limit is 16 MiB exactly: one byte more is refused, the limit itself
+	// still parses. Both sides are pinned, so a change in age shows up here.
+	atLimit := filepath.Join(dir, "at-limit.txt")
+	writeFile(t, atLimit, pad(1<<24))
+	if _, err := ParseIdentityFile(atLimit); err != nil {
+		t.Fatalf("ParseIdentityFile refused a file of exactly 16 MiB: %v", err)
+	}
+
+	over := filepath.Join(dir, "over.txt")
+	writeFile(t, over, pad(1<<24+1))
+	_, err := ParseIdentityFile(over)
+	if err == nil {
+		t.Fatal("ParseIdentityFile accepted a file of 16 MiB and one byte")
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, "longer than the 16 MiB") {
+		t.Errorf("the error does not say the file is too long (has age reworded %q?):\n%s", ageIdentitiesTooLong, msg)
+	}
+	if strings.Contains(msg, "leading space") || strings.Contains(msg, "holds no age identity") {
+		t.Errorf("the error sends the operator to repair a key that is fine:\n%s", msg)
+	}
+	if strings.Contains(strings.ToUpper(msg), secret[:20]) || !strings.Contains(msg, over) {
+		t.Errorf("the error must name the file and quote none of it:\n%s", msg)
+	}
+}
+
+// TestParseRecipientsFileNeverEchoesASecretKey: ParseRecipientsFile passes
+// age's message on, because a recipients file holds public keys. But age quotes
+// a line that starts like a recipient and then fails to parse, so a secret key
+// pasted onto the end of a public key's line — or glued to it, or lowercased —
+// came back whole in the error that doctor, backup and init-key print. A secret
+// key on a line of its own is the other way it gets there; age v1.3.2 no longer
+// quotes that one, and it is pinned here so that stays true.
+func TestParseRecipientsFileNeverEchoesASecretKey(t *testing.T) {
+	dir := t.TempDir()
+	id := mustIdentity(t)
+	secret := id.String()
+	pub := id.Recipient().String()
+	payload := strings.ToUpper(secret[len("AGE-SECRET-KEY-1"):])
+
+	cases := []struct {
+		name, body, line string
+	}{
+		{"after a public key", "# mine\n" + pub + " " + secret + "\n", "line 2"},
+		{"lowercased, after a public key", pub + " " + strings.ToLower(secret) + "\n", "line 1"},
+		{"glued to a public key", pub + secret + "\n", "line 1"},
+		{"on a line of its own", pub + "\n" + secret + "\n", "line 2"},
+		{"lowercased, on a line of its own", pub + "\n\n" + strings.ToLower(secret) + "\n", "line 3"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			p := filepath.Join(dir, "recipients.txt")
+			writeFile(t, p, []byte(c.body))
+			t.Cleanup(func() { os.Remove(p) })
+
+			_, err := ParseRecipientsFile(p)
+			if err == nil {
+				t.Fatalf("ParseRecipientsFile accepted %q", c.body)
+			}
+			msg := err.Error()
+			if strings.Contains(strings.ToUpper(msg), payload) {
+				t.Fatalf("the error reproduced the secret key:\n%s", msg)
+			}
+			if !strings.Contains(msg, p) || !strings.Contains(msg, c.line) {
+				t.Errorf("the error does not name the file and %s:\n%s", c.line, msg)
+			}
+		})
+	}
+
+	// The redaction is for secret keys only: a mistyped public key still gets
+	// age's message with the line in it, which is what makes the typo findable.
+	typo := filepath.Join(dir, "typo.txt")
+	bad := pub[:len(pub)-1] + "x"
+	writeFile(t, typo, []byte(pub+"\n"+bad+"\n"))
+	_, err := ParseRecipientsFile(typo)
+	if err == nil {
+		t.Fatal("ParseRecipientsFile accepted a mistyped public key")
+	}
+	if !strings.Contains(err.Error(), bad) || !strings.Contains(err.Error(), "line 2") {
+		t.Errorf("a mistyped public key lost age's message:\n%v", err)
+	}
+}
+
 // TestCheckRecipientAdditionRefusesAMixedSet: age refuses to encrypt to a set
 // that mixes post-quantum and classic recipients, and both AppendRecipient and
 // ParseRecipientsFile accept such a file happily. init-key only ever mints

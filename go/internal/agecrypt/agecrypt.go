@@ -64,6 +64,13 @@ type Sums struct {
 // ParseRecipientsFile reads an age recipients file: one public key per line,
 // ignoring blank lines and lines starting with "#". It is an error for the file
 // to contain no keys.
+//
+// age's own message is kept, because these lines are public keys and the exact
+// text is the fastest way to fix a typo in one — with one exception. age quotes
+// a line that starts like a recipient and then fails to parse ("malformed
+// recipient %q"), so a secret key pasted onto the end of a public key's line
+// comes back in the error whole, and every caller prints it. An error that
+// carries secret key material is replaced by one that names the line instead.
 func ParseRecipientsFile(path string) ([]age.Recipient, error) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -72,9 +79,40 @@ func ParseRecipientsFile(path string) ([]age.Recipient, error) {
 	defer f.Close()
 	recs, err := age.ParseRecipients(f)
 	if err != nil {
+		if holdsSecretKey(err.Error()) {
+			return nil, redactedRecipientsError(path, f)
+		}
 		return nil, fmt.Errorf("agecrypt: parse recipients file %s: %w", path, err)
 	}
 	return recs, nil
+}
+
+// holdsSecretKey reports whether s carries an age secret key, in either case:
+// bech32 is case-insensitive, so a lowercased key is still the key.
+func holdsSecretKey(s string) bool {
+	return strings.Contains(strings.ToUpper(s), "AGE-SECRET-KEY-")
+}
+
+// redactedRecipientsError names the line of a recipients file that holds a
+// secret key, without reproducing it. A rescan that cannot find the line (a
+// seek that failed) still yields an error naming the file.
+func redactedRecipientsError(path string, f *os.File) error {
+	const advice = "it is not quoted here — a recipients file takes public keys (age1...) only, " +
+		"so take the secret key out and keep it in the identity file"
+	if _, err := f.Seek(0, io.SeekStart); err == nil {
+		sc := bufio.NewScanner(f)
+		sc.Buffer(make([]byte, 0, 4<<10), maxKeyFileLine)
+		for n := 1; sc.Scan(); n++ {
+			line := sc.Text()
+			if line == "" || strings.HasPrefix(line, "#") {
+				continue
+			}
+			if holdsSecretKey(line) {
+				return fmt.Errorf("agecrypt: recipients file %s: line %d holds an age secret key; %s", path, n, advice)
+			}
+		}
+	}
+	return fmt.Errorf("agecrypt: recipients file %s holds an age secret key; %s", path, advice)
 }
 
 // ParseIdentityFile reads an age identity file: one secret key per line,
@@ -90,8 +128,8 @@ func ParseRecipientsFile(path string) ([]age.Recipient, error) {
 // into the scrollback, into a CI log, into the bug report the operator then
 // attaches the whole thing to. v1.3.2 stopped quoting it, but keeping key
 // material out of error strings is not left to the library: nothing here may
-// put it there. ParseRecipientsFile above keeps age's message: its lines are
-// public keys, and age names the line number of the one it rejects.
+// put it there. ParseRecipientsFile above keeps age's message unless it
+// carries a secret key: its lines are public keys.
 func ParseIdentityFile(path string) ([]age.Identity, error) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -100,16 +138,30 @@ func ParseIdentityFile(path string) ([]age.Identity, error) {
 	defer f.Close()
 	ids, err := age.ParseIdentities(f)
 	if err != nil {
+		if err.Error() == ageIdentitiesTooLong {
+			return nil, fmt.Errorf("agecrypt: identity file %s is longer than the 16 MiB age will read — "+
+				"an identity file is a few short lines, so check that this path is the key file", path)
+		}
 		return nil, redactedIdentityError(path, f)
 	}
 	return ids, nil
 }
 
-// maxIdentityLine bounds one line of an identity file while [ParseIdentityFile]
-// is locating the line that failed. An age secret key is 74 characters; a
-// megabyte is a line no identity file has, and stops a rescan of a file that
-// turned out to be a disc image from buffering it.
-const maxIdentityLine = 1 << 20
+// ageIdentitiesTooLong is age's whole message for an identity file past its
+// 16 MiB limit (v1.3.2 on; v1.3.1 read the first 16 MiB and dropped the rest).
+// It quotes nothing, so it is safe to act on, and acting on it matters: every
+// line of such a file can be well-formed, and the rescan behind
+// [redactedIdentityError] would then send the operator to repair a key that is
+// fine. Should age reword it, the comparison fails and the file is still
+// refused, by the generic message; the test pinning it says which happened.
+const ageIdentitiesTooLong = "identities file is too long"
+
+// maxKeyFileLine bounds one line of an identity or recipients file while the
+// line that failed is being located. A secret key is under a hundred
+// characters and a post-quantum recipient about two thousand; a megabyte is a
+// line no key file has, and stops a rescan of a file that turned out to be a
+// disc image from buffering it.
+const maxKeyFileLine = 1 << 20
 
 // redactedIdentityError says which line of an identity file age refused,
 // without reproducing any of it.
@@ -126,7 +178,7 @@ func redactedIdentityError(path string, f *os.File) error {
 		"check that the key line is one unmodified AGE-SECRET-KEY-1... with no leading space and no change of case"
 	if _, err := f.Seek(0, io.SeekStart); err == nil {
 		sc := bufio.NewScanner(f)
-		sc.Buffer(make([]byte, 0, 4<<10), maxIdentityLine)
+		sc.Buffer(make([]byte, 0, 4<<10), maxKeyFileLine)
 		for n := 1; sc.Scan(); n++ {
 			line := sc.Text()
 			if line == "" || strings.HasPrefix(line, "#") {
