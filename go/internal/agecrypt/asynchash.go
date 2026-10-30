@@ -133,3 +133,32 @@ func (a *asyncHash) Sum() (string, error) {
 // error paths where the answer is no longer wanted. It is safe to call more
 // than once and safe to call after Sum.
 func (a *asyncHash) release() { a.stop.Do(func() { close(a.work) }) }
+
+// AsyncHash is asyncHash for callers outside this package: a SHA-512 that runs
+// on its own goroutine, so that it can sit beside work on the caller's —
+// decryption, in restore's fused verify-and-decrypt — instead of after it. It
+// is a thin wrapper and adds nothing to the lifecycle: make one with
+// NewAsyncHash (the zero value has no goroutine behind it and is not usable),
+// finish it with Sum or Release, and write nothing to it after either — a
+// write once the work channel is closed can panic.
+type AsyncHash struct{ a *asyncHash }
+
+// NewAsyncHash starts a SHA-512 on its own goroutine. Every one must be
+// finished with Sum or Release, or the goroutine leaks; a deferred Release
+// beside an explicit Sum is the usual shape, and is safe.
+func NewAsyncHash() *AsyncHash { return &AsyncHash{a: newAsyncHash()} }
+
+// Write queues p for hashing, copying it first, so the caller may reuse p as
+// soon as it returns. It implements io.Writer, for io.TeeReader and
+// io.MultiWriter.
+func (h *AsyncHash) Write(p []byte) (int, error) { return h.a.Write(p) }
+
+// Sum waits for every queued byte to be hashed and returns the digest as
+// lowercase hex. It fails, rather than answer for fewer bytes than were
+// written, if the hashing goroutine stopped early.
+func (h *AsyncHash) Sum() (string, error) { return h.a.Sum() }
+
+// Release shuts the goroutine down without waiting for the digest, for the
+// paths that leave before Sum. It is safe to call more than once and after
+// Sum.
+func (h *AsyncHash) Release() { h.a.release() }

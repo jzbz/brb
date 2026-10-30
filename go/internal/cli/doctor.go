@@ -81,7 +81,9 @@ func doctor(ctx context.Context, cfg *config.Config, cfgPath string, p *ui.Print
 		}
 	}
 	p.Step("nothing else is needed to restore: no python, no mksquashfs, no age binary")
-	p.Step("the kernel alone can mount an image: mount -o loop,ro disc01.squashfs /mnt")
+	// The same recipe brb.sh's doctor prints, and the options brb mount uses:
+	// ro alone leaves setuid programs and device nodes in the image working.
+	p.Step("the kernel alone can mount an image: mount -o loop,ro,nosuid,nodev discNN.squashfs /mnt")
 	p.Step("par2 is only needed when a disc has actually rotted")
 
 	p.Raw("")
@@ -167,8 +169,9 @@ func doctor(ctx context.Context, cfg *config.Config, cfgPath string, p *ui.Print
 		p.Step("                capacity overridden by DISC_CAPACITY_BYTES=%d", cfg.DiscCapacityBytes)
 	}
 
-	if b, err := cfg.Budget(); err != nil {
-		p.Fail("disc budget: %v", err)
+	b, budgetErr := cfg.Budget()
+	if budgetErr != nil {
+		p.Fail("disc budget: %v", budgetErr)
 		problems++
 	} else {
 		p.Step("usable per disc %s  (98%% of the media, ISO 9660 overhead)", ui.HumanBytes(b.Usable))
@@ -198,11 +201,28 @@ func doctor(ctx context.Context, cfg *config.Config, cfgPath string, p *ui.Print
 	p.Step("prune dirs      %s", summariseList(cfg.PruneDirs))
 	p.Step("exclude masks   %s", summariseList(cfg.ExcludeMasks))
 
+	// Validate ends by computing the budget again when nothing else is wrong,
+	// and returns the very error printed and counted just above — so a budget
+	// that was the only problem used to be reported twice and counted as two.
+	// Its lines are dropped here, and the section is only opened when anything
+	// is left to put in it.
 	if err := cfg.Validate(); err != nil {
-		p.Raw("")
-		p.Log("configuration problems")
+		reported := map[string]bool{}
+		if budgetErr != nil {
+			for _, line := range strings.Split(budgetErr.Error(), "\n") {
+				reported[strings.TrimSpace(line)] = true
+			}
+		}
+		var lines []string
 		for _, line := range strings.Split(err.Error(), "\n") {
-			if line = strings.TrimSpace(line); line != "" {
+			if line = strings.TrimSpace(line); line != "" && !reported[line] {
+				lines = append(lines, line)
+			}
+		}
+		if len(lines) > 0 {
+			p.Raw("")
+			p.Log("configuration problems")
+			for _, line := range lines {
 				p.Fail("%s", line)
 				problems++
 			}
@@ -294,20 +314,34 @@ func checkKeys(ctx context.Context, cfg *config.Config, p *ui.Printer) int {
 	// trip below, and the day it matters is the day nobody can run doctor to
 	// find out.
 	rescuePath := filepath.Join(filepath.Dir(cfg.AgeRecipientsFile), rescueIdentityName)
-	if _, err := os.Stat(rescuePath); err == nil {
+	// A regular file only, as for brb.sh's `-f`: restore's findIdentity skips
+	// anything else under that name, so reporting it present would promise a
+	// way in the restore side will not take.
+	if fi, err := os.Stat(rescuePath); err == nil && fi.Mode().IsRegular() {
 		p.OK("rescue key present: %s", rescuePath)
 	} else {
 		p.Step("no rescue key in %s   (add one with 'brb init-key --rescue-key')", filepath.Dir(cfg.AgeRecipientsFile))
 	}
 
 	idPath := defaultIdentityPath(cfg)
-	if _, err := os.Stat(idPath); err != nil {
+	fi, err := os.Stat(idPath)
+	if err != nil {
 		p.Warn("no readable identity at %s — cannot prove this set will ever be decryptable", idPath)
 		p.Step("set AGE_IDENTITY to the secret key that matches those recipients")
 		if _, err := os.Stat(idPath + ".age"); err == nil {
 			p.Step("%s.age exists: a passphrase-protected identity cannot be tested unattended", idPath)
 		}
 		return problems
+	}
+	// Before anything opens it: a FIFO would hang the open, and a device such
+	// as /dev/zero has no end for the sniff below to find. It is a problem
+	// rather than a warning because it is the configured identity and it is
+	// unusable, as a directory there always was ("is a directory"); the
+	// restore side skips such a path for the next candidate, as brb.sh does.
+	if !fi.Mode().IsRegular() {
+		p.Fail("identity %s is not a regular file (%s)", idPath, fi.Mode().Type())
+		p.Step("point AGE_IDENTITY at the secret key file itself")
+		return problems + 1
 	}
 
 	// A passphrase-protected identity — `age -p` over the key file, which the
@@ -384,19 +418,28 @@ func roundTrip(ctx context.Context, recips []age.Recipient, ids []age.Identity) 
 // BEGIN line. An age-keygen identity starts with "# created:" or
 // "AGE-SECRET-KEY-". This is the same test the restore side and brb.sh's
 // identity_is_encrypted apply before deciding whether to ask for a passphrase.
+//
+// Only the first identitySniffLimit bytes are read. The longest prefix compared
+// is 34 bytes, so the bound changes no answer; without it a file with no
+// newline was read whole, all of it into memory, to find the end of a line
+// nothing looks past the start of.
 func identityIsAgeContainer(path string) (bool, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return false, err
 	}
 	defer f.Close()
-	first, err := bufio.NewReader(f).ReadString('\n')
+	first, err := bufio.NewReader(io.LimitReader(f, identitySniffLimit)).ReadString('\n')
 	if err != nil && !errors.Is(err, io.EOF) {
 		return false, err
 	}
 	return strings.HasPrefix(first, "age-encryption.org/v1") ||
 		strings.HasPrefix(first, "-----BEGIN AGE ENCRYPTED FILE-----"), nil
 }
+
+// identitySniffLimit bounds how much of an identity file identityIsAgeContainer
+// reads; see there.
+const identitySniffLimit = 64
 
 // defaultIdentityPath resolves AGE_IDENTITY the way brb.sh's resolve_identity
 // does: the configured path, else identity.txt beside the recipients file.
@@ -410,9 +453,14 @@ func defaultIdentityPath(cfg *config.Config) string {
 // packRatioAdaptNote says in one line whether the pack ratio will be re-learned
 // as the run measures discs, and from what. The number above it — raw per disc
 // — is only the starting point when it will be, which is the default.
+//
+// Off is not "fixed", and the line must not say so: a disc that overshoots is
+// still re-packed at its measured ratio, and buildDiscs plans every later disc
+// from that raised ratio too. An operator who reads "used for every disc" and
+// budgets media for that count gets more discs the first time one overshoots.
 func packRatioAdaptNote(cfg *config.Config) string {
 	if !cfg.PackRatioAdapt {
-		return "no  (PACK_RATIO_ADAPT=0: the ratio above is used for every disc)"
+		return "no  (PACK_RATIO_ADAPT=0: the ratio above; an overshoot raises it for the rest of the set)"
 	}
 	return fmt.Sprintf("yes  (worst of the last %d disc(s) measured, x%.2f margin)",
 		cfg.PackRatioWindow, cfg.PackRatioMargin)

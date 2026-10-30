@@ -72,10 +72,14 @@ func discWithIndex(t *testing.T, n int, index []byte) string {
 // carry the genuine index onto their forged disc, where the restore-side
 // cross-check can catch them with it.
 //
-// Reverting the guard (dropping the isIndexName dispatch at the top of
-// reconcileExisting) makes the second disc's index either be kept with a
+// The guard has two layers: refuseForeignIndex judges the index before the
+// disc stages anything, and the isIndexName dispatch at the top of
+// reconcileExisting still decides a disc whose index that early look could not
+// hash. Reverting both makes the second disc's index either be kept with a
 // warning or, worse, silently replace the staged one under the disc's own
-// recorded hash — both of which fail here.
+// recorded hash — both of which fail here. Each layer alone is pinned
+// elsewhere: the early one by TestIngestRefusesAForeignIndexBeforeStagingAnything,
+// the dispatch by TestIngestStillStagesADiscWhoseIndexCannotBeRead.
 func TestIngestPinsTheIndexOfTheFirstDisc(t *testing.T) {
 	real := []byte("the set's real index, encrypted\n")
 

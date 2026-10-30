@@ -2,6 +2,7 @@ package restore
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -23,6 +24,56 @@ func TestIsArchiveRoot(t *testing.T) {
 	for _, p := range []string{"sub", "./sub", "/sub/", "sub/f.txt", "..sub", ".hidden", "sub/..x"} {
 		if isArchiveRoot(p) {
 			t.Errorf("isArchiveRoot(%q) = true, want false", p)
+		}
+	}
+}
+
+// onlyPath is the one --only spelling both readers work with; brb.sh applies
+// the same rule as it parses the flag, and xcompat-test.sh holds the two
+// together. Before it, "./sub" matched nothing here while brb.sh restored it,
+// and brb.sh refused "/sub" and "sub//" while this restored them.
+func TestOnlyPath(t *testing.T) {
+	for _, tc := range []struct{ in, want string }{
+		{"sub/f.txt", "sub/f.txt"},
+		{"./sub/f.txt", "sub/f.txt"},
+		{"/sub/f.txt", "sub/f.txt"},
+		{"//sub/f.txt", "sub/f.txt"},
+		{"/./sub", "sub"},
+		{".//sub", "sub"},
+		{"././sub/", "sub"},
+		{"sub//", "sub"},
+		{"sub/./x", "sub/./x"}, // only the two ends are touched
+		{".hidden", ".hidden"},
+		{"..sub", "..sub"},
+		{" sub ", " sub "}, // a space is part of a name
+	} {
+		if got := onlyPath(tc.in); got != tc.want {
+			t.Errorf("onlyPath(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+}
+
+// TestRestoreOnlyAcceptsEverySpelling: the spellings onlyPath folds together
+// all restore the same file and nothing else. "./sub/b.txt" used to reach the
+// listing as itself, match nothing, and fail; "/sub/b.txt" went to unsquashfs
+// as an operand with a leading slash.
+func TestRestoreOnlyAcceptsEverySpelling(t *testing.T) {
+	e := newEnv(t)
+	e.squashTools(t)
+	e.makeDisc(1, map[string]string{"sub/b.txt": "two\n", "a.txt": "one\n"})
+	e.writeManifest(manifestSaying(1))
+	e.ui.SetAssumeYes(true)
+	for i, p := range []string{"./sub/b.txt", "/sub/b.txt", "sub/b.txt//", "./sub/", "/sub"} {
+		dest := filepath.Join(e.dir, "dest"+strconv.Itoa(i))
+		if err := Restore(context.Background(), e.opts(), RestoreOptions{Dest: dest, Only: []string{p}}); err != nil {
+			t.Errorf("Restore --only %q: %v\n%s", p, err, e.log())
+			continue
+		}
+		if _, err := os.Stat(filepath.Join(dest, "sub", "b.txt")); err != nil {
+			t.Errorf("--only %q did not restore sub/b.txt: %v", p, err)
+		}
+		if _, err := os.Stat(filepath.Join(dest, "a.txt")); err == nil {
+			t.Errorf("--only %q extracted a.txt as well", p)
 		}
 	}
 }
@@ -83,6 +134,8 @@ func TestExtractionTouches(t *testing.T) {
 		{[]string{"sub/f.txt"}, "subdir", false}, // a sibling with a common prefix
 		{[]string{"sub/f.txt"}, "other", false},
 		{[]string{"a/x", "b/y"}, "b", true},
+		{[]string{"a/bc/x"}, "a/b", false}, // not an ancestor, only a prefix of one
+		{[]string{"/a/b/x/"}, "a/b", true},
 	} {
 		if got := extractionTouches(tc.only, tc.dir); got != tc.want {
 			t.Errorf("extractionTouches(%q, %q) = %v, want %v", tc.only, tc.dir, got, tc.want)
@@ -420,5 +473,67 @@ func TestRestoreRefusesASymlinkedDestinationWithATrailingSlash(t *testing.T) {
 		if _, err := os.Stat(filepath.Join(victim, "sub")); err == nil {
 			t.Fatalf("Restore into %q wrote the archive through the destination link", spelled)
 		}
+	}
+}
+
+// auditImage names at most five planted links, index or no index, as brb.sh's
+// refuse_symlinks_at_dirs does. With a readable index the scan has to run on
+// for the cross-check, and the list of offenders used to run on with it: every
+// link went into one error, so the same set and destination drew five names
+// from bash and all of them from here, and a destination full of planted links
+// made a message as long as the image's directory list. A stand-in unsquashfs
+// prints the listing, so this runs on any machine with /bin/sh.
+func TestAuditImageNamesAtMostFiveLinks(t *testing.T) {
+	if _, err := os.Stat("/bin/sh"); err != nil {
+		t.Skip("no /bin/sh to build an unsquashfs stand-in with")
+	}
+	const links = maxNamedSamples + 3
+	for _, indexed := range []bool{false, true} {
+		t.Run(fmt.Sprintf("indexed=%v", indexed), func(t *testing.T) {
+			e := newEnv(t)
+			if indexed {
+				e.writeIndex("1\tkeep.txt\n")
+			}
+			var listing strings.Builder
+			listing.WriteString("drwxr-xr-x u/g                     3 2026-08-19 01:30 squashfs-root\n")
+			for i := 1; i <= links; i++ {
+				fmt.Fprintf(&listing, "drwxr-xr-x u/g                     3 2026-08-19 01:30 squashfs-root/d%d\n", i)
+			}
+			listing.WriteString("-rw-r--r-- u/g                     3 2026-08-19 01:30 squashfs-root/keep.txt\n")
+			lst := filepath.Join(e.dir, "listing")
+			if err := os.WriteFile(lst, []byte(listing.String()), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			stub := filepath.Join(t.TempDir(), "unsquashfs")
+			if err := os.WriteFile(stub, []byte("#!/bin/sh\nexec cat '"+lst+"'\n"), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			e.tools = tools.NewSet([]tools.Tool{{Name: tools.Unsquashfs, Path: stub, Found: true}})
+
+			// Links to a regular file: the shape refuseSymlinkedDirs lets
+			// through, so it is this guard that has to catch them.
+			victim := filepath.Join(e.dir, "victim")
+			if err := os.WriteFile(victim, []byte("x"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			dest := filepath.Join(e.dir, "dest")
+			if err := os.Mkdir(dest, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			for i := 1; i <= links; i++ {
+				if err := os.Symlink(victim, filepath.Join(dest, fmt.Sprintf("d%d", i))); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			image := filepath.Join(e.cfg.Dirs().Restore, "disc01.squashfs")
+			err := e.opts().auditImage(context.Background(), image, dest, nil, 1)
+			if err == nil || !strings.Contains(err.Error(), "THROUGH them") {
+				t.Fatalf("auditImage = %v, want the symlink refusal\n%s", err, e.log())
+			}
+			if n := strings.Count(err.Error(), " -> "); n != maxNamedSamples {
+				t.Errorf("the refusal names %d link(s), want %d:\n%v", n, maxNamedSamples, err)
+			}
+		})
 	}
 }

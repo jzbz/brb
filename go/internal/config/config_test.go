@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -480,6 +481,39 @@ func TestApplyEnv(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "PAR2_BLOCKS") {
 		t.Errorf("ApplyEnv error = %v, want it to name PAR2_BLOCKS", err)
 	}
+
+	// The expansion above is for scalars. A plain PRUNE_DIRS or EXCLUDE_MASKS
+	// value is one element taken verbatim, ~ and all, and only the array-literal
+	// spelling goes through the parser and its expansion. ApplyEnv's comment
+	// once promised the expansion for every value; this keeps the comment and
+	// the code from drifting apart again. (Expanding it would not help: prune
+	// entries are relative to SOURCE_DIR and lose their leading '/'.)
+	for _, tc := range []struct {
+		raw  string
+		want []string
+	}{
+		{"~/junk", []string{"~/junk"}},
+		{"$HOME/junk", []string{"$HOME/junk"}},
+		{"( ~/junk )", []string{"/home/tester/junk"}},
+		// Blanks before the literal are allowed, and dropped before it is
+		// parsed: kept, they were a space after the '=' of the line envValue
+		// builds, and the value was refused.
+		{" ( a )", []string{"a"}},
+		{"\t( a b )", []string{"a", "b"}},
+	} {
+		c = Default()
+		if err := c.ApplyEnv(func(k string) string {
+			if k == "PRUNE_DIRS" {
+				return tc.raw
+			}
+			return ""
+		}); err != nil {
+			t.Fatalf("ApplyEnv(PRUNE_DIRS=%q): %v", tc.raw, err)
+		}
+		if !reflect.DeepEqual(c.PruneDirs, tc.want) {
+			t.Errorf("PRUNE_DIRS=%q from the environment = %q, want %q", tc.raw, c.PruneDirs, tc.want)
+		}
+	}
 }
 
 func TestLoadPrecedence(t *testing.T) {
@@ -563,6 +597,70 @@ func TestLoadMalformedFileIsAnError(t *testing.T) {
 	}
 	if _, err := Load(path); err == nil {
 		t.Fatal("Load on a malformed file succeeded, want an error")
+	}
+}
+
+// TestLoadRefusesAConfigThatIsNotARegularFile pins the -f test brb.sh's
+// load_config has always made. Load used to refuse only a directory and read
+// anything else: a FIFO blocked it in os.ReadFile until a writer turned up —
+// `brb -c fifo help` included, and one Ctrl-C did not end it — and /dev/null or
+// a `<(...)` pipe loaded here while brb.sh refused it with -c and ran on its
+// defaults under BRB_CONFIG, so the two readers could start from different
+// staging directories.
+func TestLoadRefusesAConfigThatIsNotARegularFile(t *testing.T) {
+	home := t.TempDir()
+	setHome(t, home)
+
+	fifo := filepath.Join(home, "fifo")
+	if err := syscall.Mkfifo(fifo, 0o600); err != nil {
+		t.Skipf("cannot make a FIFO here: %v", err)
+	}
+	// In a goroutine, because the bug was a hang: a test that called Load
+	// directly would not fail, it would time out the whole package.
+	done := make(chan error, 1)
+	go func() {
+		_, err := Load(fifo)
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err == nil || !strings.Contains(err.Error(), "not a regular file") {
+			t.Errorf("Load(FIFO) = %v, want it refused as not a regular file", err)
+		}
+	case <-time.After(10 * time.Second):
+		// Unblock the reader so the goroutine does not outlive the test.
+		// Non-blocking, so that this cannot hang in turn: with nobody
+		// reading — Load stuck somewhere other than the FIFO's open — it
+		// fails at once with ENXIO, and the failure below is still reported.
+		if f, err := os.OpenFile(fifo, os.O_WRONLY|syscall.O_NONBLOCK, 0); err == nil {
+			f.Close()
+		}
+		t.Fatal("Load(FIFO) blocked: it opened the FIFO instead of refusing it")
+	}
+
+	if _, err := Load(os.DevNull); err == nil || !strings.Contains(err.Error(), "not a regular file") {
+		t.Errorf("Load(%s) = %v, want it refused as not a regular file", os.DevNull, err)
+	}
+	if _, err := Load(home); err == nil || !strings.Contains(err.Error(), "is a directory") {
+		t.Errorf("Load(directory) = %v, want it refused as a directory", err)
+	}
+
+	// The companion: a symlink to a regular config is still a config, in both
+	// readers, because os.Stat and bash's -f both follow it.
+	real := filepath.Join(home, "real.conf")
+	if err := os.WriteFile(real, []byte("LABEL_PREFIX=THROUGH_A_LINK\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(home, "link.conf")
+	if err := os.Symlink(real, link); err != nil {
+		t.Skipf("cannot make a symlink here: %v", err)
+	}
+	c, err := Load(link)
+	if err != nil {
+		t.Fatalf("Load(symlink to a regular file): %v", err)
+	}
+	if c.LabelPrefix != "THROUGH_A_LINK" {
+		t.Errorf("LabelPrefix = %q, want the linked file to have been read", c.LabelPrefix)
 	}
 }
 
@@ -682,6 +780,39 @@ func TestNoHomeIsRefusedNotReRooted(t *testing.T) {
 	}
 }
 
+// TestLoadAdjustReachesTheHomeCheck pins where Load runs its adjust functions:
+// after the file and the environment, and before checkHomeDerived judges the
+// result. `backup --public-archive` reaches Load that way, and when the CLI
+// set PublicArchive only after Load returned, the flag could not earn the
+// public-archive exemption that PUBLIC_ARCHIVE=1 got: with no HOME, the run
+// was refused for want of a recipients file it would never read.
+func TestLoadAdjustReachesTheHomeCheck(t *testing.T) {
+	setHome(t, "")
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config")
+	if err := os.WriteFile(path, []byte("SOURCE_DIR="+dir+"\nSTAGING="+dir+"/staging\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	public := func(c *Config) { c.PublicArchive = true }
+
+	if _, err := Load(path); err == nil || !strings.Contains(err.Error(), "AGE_RECIPIENTS_FILE") {
+		t.Fatalf("Load with no HOME and no recipients = %v, want the AGE_RECIPIENTS_FILE refusal", err)
+	}
+	c, err := Load(path, public)
+	if err != nil {
+		t.Fatalf("Load with the public-archive adjustment: %v — it must be applied before the HOME check", err)
+	}
+	if !c.PublicArchive {
+		t.Error("the adjustment did not reach the Config Load returned")
+	}
+	// After the environment, too: PUBLIC_ARCHIVE=0 exported does not undo it,
+	// the same OR the CLI has always applied to the flag.
+	t.Setenv("PUBLIC_ARCHIVE", "0")
+	if c, err := Load(path, public); err != nil || !c.PublicArchive {
+		t.Errorf("Load(PUBLIC_ARCHIVE=0 in the environment, adjustment on) = %+v, %v; want public", c, err)
+	}
+}
+
 // TestBoolSettingSpellings pins the grammar brb.sh's bool_setting accepts,
 // which the README promises both readers share. A KEEP_ISOS written as "true"
 // used to stop every Go command at config load, the restore-side ones included,
@@ -775,7 +906,17 @@ func TestValidate(t *testing.T) {
 			"PACK_RATIO_WINDOW must be at least 1"},
 		{"zero ratio window says how to disable adapting", func(c *Config) { c.PackRatioWindow = 0 },
 			"PACK_RATIO_ADAPT=0"},
+		// With adaptation already off, that advice has been taken: telling the
+		// operator to set PACK_RATIO_ADAPT=0 again was the whole message they
+		// got back after following it. Still refused, but told what to do.
+		{"zero ratio window with adapting off says to remove the line", func(c *Config) {
+			c.PackRatioWindow = 0
+			c.PackRatioAdapt = false
+		}, "remove the line"},
 		{"negative ratio window", func(c *Config) { c.PackRatioWindow = -1 }, "PACK_RATIO_WINDOW"},
+		// The advice fits a negative window as well as a zero one.
+		{"negative ratio window gets advice that fits it", func(c *Config) { c.PackRatioWindow = -1 },
+			"not a window below 1"},
 		// Below 1.0 the margin plans every disc to overshoot, and each
 		// overshoot costs a full rebuild of a multi-gigabyte image.
 		{"margin below one", func(c *Config) { c.PackRatioMargin = 0.9 }, "PACK_RATIO_MARGIN"},
@@ -1068,6 +1209,16 @@ func TestSettingsBoundedAgainstTheToolTheyReach(t *testing.T) {
 			c.PackRatioMargin = bad
 			if err := c.Validate(); err == nil {
 				t.Errorf("Validate accepted PACK_RATIO_MARGIN=%v", bad)
+			}
+		}
+		// And the refusal names the bound that was broken. It said only "must
+		// be at least 1.0" after the cap was added, which 11 satisfies.
+		for _, bad := range []float64{11, 10.0000001, math.Inf(1), 0.5} {
+			c := base()
+			c.PackRatioMargin = bad
+			err := c.Validate()
+			if err == nil || !strings.Contains(err.Error(), "between 1.0 and 10") {
+				t.Errorf("Validate(PACK_RATIO_MARGIN=%v) = %v, want it to say \"between 1.0 and 10\"", bad, err)
 			}
 		}
 	})

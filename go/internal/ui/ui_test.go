@@ -475,3 +475,46 @@ func TestHumanDuration(t *testing.T) {
 		}
 	}
 }
+
+// TestShellWord pins the rendering rule value by value: bare when nothing in it
+// means anything to bash or to config.Parse, single-quoted otherwise, with an
+// embedded quote closed, escaped and reopened. The empty string is an empty
+// pair of quotes, so that an empty argument is still an argument; the
+// configuration listing's KEY= rule for an empty value is cli's, not this
+// function's.
+func TestShellWord(t *testing.T) {
+	tests := []struct{ in, want string }{
+		{"", "''"},
+		{"zstd", "zstd"},
+		{"/var/tmp/brb", "/var/tmp/brb"},
+		{"1.05", "1.05"},
+		{"bd25", "bd25"},
+		{"a-b_c.d+e:f,g@h%i=j", "a-b_c.d+e:f,g@h%i=j"},
+		{"a b", "'a b'"},
+		{"/srv/My Staging", "'/srv/My Staging'"},
+		{"*.pyc", "'*.pyc'"},
+		{"core.[0-9]*", "'core.[0-9]*'"},
+		{"~/photos", "'~/photos'"},
+		{"$HOME/x", "'$HOME/x'"},
+		{"a#b", "'a#b'"},
+		{"x;y", "'x;y'"},
+		{"it's", `'it'\''s'`},
+		{"''", `''\'''\'''`},
+		{"tab\there", "'tab\there'"},
+		{"esc\x1bhere", "'esc\x1bhere'"},
+		{"é", "'é'"},
+	}
+	for _, tc := range tests {
+		if got := ShellWord(tc.in); got != tc.want {
+			t.Errorf("ShellWord(%q) = %s, want %s", tc.in, got, tc.want)
+		}
+	}
+	// Visible leaves the quoting alone, so the order the two are applied in
+	// does not matter: a control byte is spelled out inside the quotes either
+	// way.
+	for _, s := range []string{"a b\x1b[2J", "it's\x07", "/x/\xc2\x9by"} {
+		if a, b := ShellWord(Visible(s)), Visible(ShellWord(s)); a != b {
+			t.Errorf("ShellWord(Visible(%q)) = %q but Visible(ShellWord(%q)) = %q", s, a, s, b)
+		}
+	}
+}

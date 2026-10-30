@@ -110,9 +110,11 @@ age -d -i /path/to/identity.txt \
 
 # 4a. mount it and browse — needs nothing but the kernel. Deliberately not
 #     /mnt: this disc is mounted there, and mounting over it hides the data/
-#     directory that step 1 reads from for every remaining disc.
+#     directory that step 1 reads from for every remaining disc. nosuid and
+#     nodev keep a setuid program or a device node in the backup from acting
+#     on the machine that reads it.
 mkdir -p image
-sudo mount -o loop,ro disc{{.Disc02}}.squashfs image
+sudo mount -o loop,ro,nosuid,nodev disc{{.Disc02}}.squashfs image
 
 # 4b. or extract it
 unsquashfs -d /path/to/destination disc{{.Disc02}}.squashfs
@@ -300,7 +302,7 @@ par2 verify -- FILE.age.par2                   # is this image recoverable?
 par2 repair -- FILE.age.par2                   # fix it
 {{if .SidecarParity}}par2 repair -- sidecars.par2                   # fix a rotted .sha512 or index
 {{end}}age -d -i identity.txt -o OUT.squashfs IN.age  # decrypt
-mount -o loop,ro OUT.squashfs /mnt             # browse
+mount -o loop,ro,nosuid,nodev OUT.squashfs /mnt # browse
 unsquashfs -d /dest OUT.squashfs               # extract (add -user-xattrs
                                                #   if you are not root)
 unsquashfs -ll OUT.squashfs                    # list contents

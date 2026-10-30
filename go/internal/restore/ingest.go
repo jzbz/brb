@@ -11,7 +11,9 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -214,6 +216,7 @@ func (ig *ingester) ingestDisc(ctx context.Context) (staged bool, err error) {
 	if len(names) == 0 {
 		return false, fmt.Errorf("restore: %s is empty", data)
 	}
+	names = o.withoutStagingNames(names)
 
 	// HL-5: the sidecar parity is the one thing on a disc whose name is the same
 	// on every disc of the set, so it needs the disc number to survive being
@@ -246,11 +249,25 @@ func (ig *ingester) ingestDisc(ctx context.Context) (staged bool, err error) {
 	}
 	ig.prevDisc = disc
 
+	// The index first, and before anything at all is written: a disc whose
+	// index disagrees with the one already pinned is refused whole, so it
+	// leaves nothing in staging — not its images, not a public archive's key.
+	// brb.sh's refuse_foreign_index runs at the same point, ahead of its own
+	// key check, so the two readers leave the same staging area behind such a
+	// disc (refuseForeignIndex says which disc they still treat differently).
+	// The index is judged by the same witness the copy loop below uses for it;
+	// a damaged sidecar is left for that loop to report, so it is reported
+	// once.
+	encDir := o.dirs().Enc
+	early, judged, err := o.refuseForeignIndex(ctx, mp, names, o.discWant(discRoot, mp, sums, indexName, true))
+	if err != nil {
+		return false, err
+	}
+
 	// A public archive's key comes off the disc root, ahead of the data files:
 	// a disc that belongs to a different public set than the one already in
 	// staging is refused whole, before any of its images land beside the other
 	// set's.
-	encDir := o.dirs().Enc
 	switch st, err := o.ingestPublicIdentity(discRoot, mp, sums[doc.PublicIdentityName]); {
 	case err == nil:
 		staged = staged || st
@@ -265,7 +282,17 @@ func (ig *ingester) ingestDisc(ctx context.Context) (staged bool, err error) {
 		if err := ctx.Err(); err != nil {
 			return staged, err
 		}
-		st, err := o.ingestFile(ctx, filepath.Join(data, name), filepath.Join(encDir, stagedSidecarName(name, disc)), sums[name])
+		want := o.discWant(discRoot, mp, sums, name, false)
+		dst := filepath.Join(encDir, stagedSidecarName(name, disc))
+		var st bool
+		if name == indexName && judged {
+			// Both copies were hashed before anything was staged, and nothing
+			// since has written to the staged index; reading them again would
+			// only reach the same verdict.
+			st, err = o.settleIndex(name, dst, early)
+		} else {
+			st, err = o.ingestFile(ctx, filepath.Join(data, name), dst, want)
+		}
 		staged = staged || st
 		switch {
 		case err == nil:
@@ -382,10 +409,18 @@ func ingestName(src, dst string) string {
 // regular file, which is the point: the two readers refuse the same discs.
 //
 // Like brb.sh's, this is a check followed by an open, and the window between
-// them is not closed. It buys nothing against an attacker who can rewrite the
-// mount while the ingest runs — one who can do that can simply put a real file
-// there — and everything against the case that actually occurs, a disc that
-// already carries a link at one of these names when it is handed over.
+// them is not closed. Closing it would buy little against an attacker who can
+// rewrite the mount while the ingest runs: the same window is open for every
+// name a disc is read by, and through MANIFEST.txt and data/ (a device
+// streamed into staging) such an attacker can already fill the staging disk
+// without winning any race. SHA512SUMS is no such route any more:
+// [agecrypt.ReadSumFile] stops at its byte cap however the file is fed.
+// What the check buys is everything against the case that actually occurs, a
+// disc that already carries a link at one of these names when it is handed
+// over. The one exception taken is identity.txt, the only file read whole into
+// memory: [Options.ingestPublicIdentity] judges the type again on the file it
+// opened and bounds the read itself, because there a swap in the window
+// otherwise turns a 64 KiB ceiling into none at all.
 func discEntry(root *os.Root, name string) (fs.FileInfo, error) {
 	fi, err := root.Lstat(name)
 	if err != nil {
@@ -403,11 +438,18 @@ func discEntry(root *os.Root, name string) (fs.FileInfo, error) {
 	return fi, nil
 }
 
-// dataFiles lists the regular files in a disc's data directory, sorted. The
-// directory itself is proven not to be a link before this runs (see
-// [discEntry]); within it, os.ReadDir reports the type of each dirent rather
-// than of what it points at, so a symlinked entry is not regular and is skipped
-// here — the same answer `find -type f` gives brb.sh, which tests the link too.
+// dataFiles lists the regular files in a disc's data directory, sorted. Both
+// callers, ingestDisc and VerifyDisc, prove the directory itself is not a link
+// before this runs (see [discEntry]); within it, os.ReadDir reports the type of
+// each dirent rather than of what it points at, so a symlinked entry is not
+// regular and is skipped here — the same answer `find -type f` gives brb.sh,
+// which tests the link too.
+//
+// Only the top level is listed. The format's data/ is flat — brb never writes a
+// subdirectory there — and a file nested in one has no name in staging that
+// would not collide with a top-level one. brb.sh's ingest used to run its find
+// without -maxdepth and stage data/sub/disc01.squashfs.age as disc01's image,
+// which this reader never did; it now lists the same one level.
 func dataFiles(dir string) ([]string, error) {
 	ents, err := os.ReadDir(dir)
 	if err != nil {
@@ -424,14 +466,128 @@ func dataFiles(dir string) ([]string, error) {
 	return out, nil
 }
 
+// stagingOwnName reports whether a name in a disc's data/ is one that staging
+// gives a meaning of its own, beyond "a file this disc carries". Ingest stages
+// every data file under its own name in one flat enc/ directory, and these are
+// the names that directory already uses for something else:
+//
+//   - *.part is a copy still being written, reaped by the next run.
+//   - *.mapfile is a ddrescue map. The Go reader takes enc/<image>.mapfile as
+//     the record of a salvage in progress and resumes it: ddrescue then writes
+//     into the staged image in place, from whichever disc is in the drive, and
+//     with no recorded hash nothing checks the result. A disc carrying
+//     data/disc01.squashfs.age.mapfile marking the whole image unread used to
+//     be staged under that name and so had the staged image overwritten with
+//     its own bytes on the next ingest — the one thing reconcileExisting
+//     promises never happens.
+//   - <image>.copy* is another pressing's copy of an image, which both readers
+//     hand to par2 at restore beside the primary.
+//   - identity.txt is where a public archive's key is staged. It comes off the
+//     disc ROOT, past the key contract in [Options.ingestPublicIdentity]; a
+//     data/identity.txt staged under the same name went round that contract,
+//     and with a recorded hash could replace the staged key outright.
+//   - sidecars-disc* is where each disc's sidecar parity is staged under its
+//     number (see stagedSidecarName), so a disc carrying one could take the
+//     place of another disc's set.
+//
+// A disc brb wrote carries none of these in data/ — its names are frozen
+// format, and none of them is one of these — so such a file is skipped and
+// said so, not staged. brb.sh's ingest loop skips the same five patterns with
+// the same warning.
+func stagingOwnName(name string) bool {
+	switch {
+	case strings.HasSuffix(name, partExt), strings.HasSuffix(name, mapfileExt):
+		return true
+	case strings.Contains(name, ".squashfs"+ageExt+".copy"):
+		return true
+	case name == doc.PublicIdentityName:
+		return true
+	case strings.HasPrefix(name, sidecarsStem+"-disc"):
+		return true
+	}
+	return false
+}
+
+// withoutStagingNames drops the names [stagingOwnName] keeps for staging's own
+// use from a disc's data files, warning about each one it drops.
+func (o Options) withoutStagingNames(names []string) []string {
+	out := make([]string, 0, len(names))
+	for _, name := range names {
+		if stagingOwnName(name) {
+			o.UI.Warn("%s on this disc has a name staging keeps for its own bookkeeping, and no disc brb wrote "+
+				"carries one in %s/ — not staging it", name, dataDir)
+			continue
+		}
+		out = append(out, name)
+	}
+	return out
+}
+
+// discWant is the hash this disc records for one of its data files: its
+// SHA512SUMS entry, or, when SHA512SUMS has none, the digest the file's own
+// per-file sidecar beside it records ("data/disc03.squashfs.age.sha512" for
+// the image, "data/index.tsv.gz.age.sha512" for the index). "" means the disc
+// records nothing usable for it, and the copy goes unchecked.
+//
+// The sidecar is the second witness brb.sh has consulted since 2ad5f0c, and
+// for a disc whose SHA512SUMS is missing or rotted it is the only one left
+// for the image and the index. Without it the two readers disagreed about
+// the same disc: an image that did not match its sidecar was counted bad by
+// brb.sh and staged as fine here, and an index whose copy had rotted, on a
+// disc whose sidecar still vouched for the staged one, was ingested by
+// brb.sh as damage and refused here as another set's. Adding the witness
+// rather than dropping it from brb.sh is the direction that keeps a check.
+//
+// A sidecar that is a link, or that does not parse, or that records two
+// digests for the name, is no witness — reported unless quiet, and then
+// treated exactly as an absent one, which is how restore treats the same
+// sidecar once it is staged (recordedCipherSum).
+func (o Options) discWant(root *os.Root, mp string, sums map[string]string, name string, quiet bool) string {
+	if want := sums[name]; want != "" {
+		return want
+	}
+	want, err := discSidecarSum(root, mp, name)
+	if err != nil && !quiet {
+		o.UI.Warn("%v", err)
+	}
+	return want
+}
+
+// discSidecarSum reads the digest data/<name>.sha512 records for name, through
+// the disc root and by the same rules as every other name ingest reads off a
+// disc: no link at the name ([discEntry]), a regular file, and the
+// [recordedSum] parse, under which the sidecar records a digest but does not
+// get to choose which file it is for. brb.sh's disc_sidecar_sum makes the same
+// three checks with -L, -f and recorded_sum.
+func discSidecarSum(root *os.Root, mp, name string) (string, error) {
+	rel := filepath.Join(dataDir, name+sumExt)
+	switch fi, err := discEntry(root, rel); {
+	case errors.Is(err, fs.ErrNotExist):
+		return "", nil
+	case err != nil:
+		return "", fmt.Errorf("%v; %s cannot be checked against it", err, name)
+	case !fi.Mode().IsRegular():
+		return "", nil
+	}
+	want, ok, err := recordedSum(filepath.Join(mp, rel), name, "")
+	if err != nil {
+		return "", fmt.Errorf("%s%s on this disc is damaged, so %s cannot be checked against it either", name, sumExt, name)
+	}
+	if !ok {
+		return "", nil
+	}
+	return want, nil
+}
+
 // ingestFile copies one file off the disc, or explains why it did not. staged
 // reports whether anything new reached the staging area — a fresh copy, a
 // resumed salvage, a verified replacement or an alternate copy — as opposed to
 // "already have", which stages nothing.
 //
-// want is the hash the disc's own SHA512SUMS records for it, or "" when the
-// disc carries no sums. When it is known the copy is checked against it for
-// free, because copyStream hashes as it writes.
+// want is the hash the disc records for it — its SHA512SUMS entry, or failing
+// that its per-file sidecar ([Options.discWant]) — or "" when the disc records
+// nothing usable. When it is known the copy is checked against it for free,
+// because copyStream hashes as it writes.
 func (o Options) ingestFile(ctx context.Context, src, dst, want string) (staged bool, err error) {
 	name := ingestName(src, dst)
 	switch _, err := os.Stat(dst); {
@@ -511,7 +667,7 @@ func (o Options) reconcileExisting(ctx context.Context, src, dst, want string) (
 		} else if ok && missing > 0 {
 			return true, o.resumeSalvage(ctx, src, dst, want, missing)
 		}
-		return o.replaceOrKeepBoth(ctx, src, dst, want)
+		return o.replaceOrKeepBoth(ctx, src, dst, want, got)
 	}
 
 	// No recorded hash. A partial salvage is still resumable — the map file is
@@ -556,8 +712,20 @@ func (o Options) reconcileExisting(ctx context.Context, src, dst, want string) (
 		// disc's version is staged under the .copy name par2 combines from.
 		alt := altCopyName(dst)
 		o.UI.Step("ingesting this disc's copy as %s for par2 to combine during 'brb restore'", filepath.Base(alt))
-		if _, err := o.copyRobustly(ctx, src, alt); err != nil {
+		sum, err := o.copyRobustly(ctx, src, alt)
+		if err != nil {
 			return true, err
+		}
+		// It differs from the primary, but it may be a pressing read before:
+		// the same disc ingested twice is the same bytes twice, and a second
+		// copy of them is a whole image of staging that gives par2 nothing.
+		if same, err := o.sameAltCopy(ctx, dst, alt, sum); err != nil {
+			return true, err
+		} else if same != "" {
+			o.removeUnverified(alt)
+			o.removeStaleMapfile(alt)
+			o.UI.Step("this disc's copy of %s is byte for byte %s, staged from an earlier read, so it was not kept a second time", name, same)
+			return false, nil
 		}
 		return true, nil
 	}
@@ -609,8 +777,10 @@ func isIndexName(dst string) bool {
 // down (ingestPublicIdentity): same shape, same reasoning, same remedy of
 // finishing or clearing the staging area before the other set goes into it.
 //
-// Rot is told apart from a foreign index by the disc's own SHA512SUMS, and only
-// where that can settle it:
+// Rot is told apart from a foreign index by what the disc itself records for
+// its index — its SHA512SUMS entry, or failing that the index's own sidecar
+// ([Options.discWant]), the two witnesses brb.sh's refuse_foreign_index asks in
+// the same order — and only where that can settle it:
 //
 //   - The staged copy is what this disc records the index should be, and the
 //     copy beside it on the medium is not. The disc agrees with the staged
@@ -626,61 +796,232 @@ func isIndexName(dst string) bool {
 // the attacker wrote both. That is what leaves the refusal below for the case
 // where two self-consistent discs disagree with each other.
 //
-// Note what this does not do: a disc's image is staged before its index is
-// (dataFiles is sorted, and "disc07.squashfs.age" sorts before
-// "index.tsv.gz.age"), so the refusal here leaves that image in enc/. That is
-// not a hole. The image is inert until a restore extracts it, and the restore
-// cross-check refuses it there against the index that is still pinned.
+// The same verdict is reached once before this, by [Options.refuseForeignIndex],
+// ahead of anything the disc stages. A disc's image sorts before its index
+// ("disc07.squashfs.age" before "index.tsv.gz.age"), so when this function was
+// the only check, a refused disc had already left its image, its sidecars and
+// a public archive's key in enc/ — inert, and refused again at restore by the
+// cross-check, but beside the other set's files, and contrary to what brb.sh
+// does. When that early look reaches a verdict, the copy loop reports it
+// through [Options.settleIndex] without coming here, so the index is read once
+// per disc, not twice. The loop comes here only when the early look could not
+// hash the two copies, and the refusal in settleIndex is then reached only if
+// this second look can.
 func (o Options) reconcileIndex(ctx context.Context, src, dst, want string) (staged bool, err error) {
 	name := ingestName(src, dst)
-	staged0, err := agecrypt.SumFile(ctx, dst)
+	verdict, err := judgeIndex(ctx, name, src, dst, want)
 	if err != nil {
-		return false, fmt.Errorf("restore: hashing the staged %s: %w", name, err)
+		return false, err
+	}
+	return o.settleIndex(name, dst, verdict)
+}
+
+// settleIndex reports what an [indexVerdict] means for the disc: the index
+// staged at dst stays as it is whatever the verdict, and only a foreign one
+// fails the disc outright. See [Options.reconcileIndex] for the reasoning.
+func (o Options) settleIndex(name, dst string, verdict indexVerdict) (staged bool, err error) {
+	switch verdict {
+	case indexSame:
+		o.UI.Step("already have %s, and this disc's copy is identical — this disc belongs to the staged set", name)
+		return false, nil
+	case indexVouchedFor:
+		// This disc vouches for the staged index and has lost its own copy of
+		// it. Nothing is wrong with the set, and nothing here needs
+		// restaging.
+		o.UI.Warn("already have %s, and it matches the hash on this disc — but this disc's copy is damaged "+
+			"and was not staged; %s if you need this disc's copy back", name, o.sidecarRepairHint(0))
+		return false, nil
+	case indexSelfContradicting:
+		// The disc contradicts itself, so it cannot be believed about which
+		// set it belongs to either. Nothing is staged: the pinned index stays.
+		return false, &CopyProblem{
+			Name:    name,
+			Missing: -1,
+			Reason: "this disc's copy of the index matches neither the hash this disc itself records for it nor the " +
+				"index already staged, so this disc's copy is damaged; the staged index was kept — " +
+				o.sidecarRepairHint(0),
+		}
+	}
+	// Reached only when refuseForeignIndex could not hash the two copies and
+	// reconcileIndex could, so what sorted before the index may be staged
+	// already.
+	return false, o.foreignIndexError(dst, "Nothing from this disc was added to the index")
+}
+
+// indexVerdict is what a disc's copy of the index says about the disc, set
+// against the index already staged. See [Options.reconcileIndex] for the
+// reasoning behind each.
+type indexVerdict int
+
+const (
+	// indexSame: the two copies are identical, as every disc of one set's are.
+	indexSame indexVerdict = iota
+	// indexVouchedFor: the disc records the staged index's hash and has lost
+	// its own copy of it. Rot on this disc, not another set.
+	indexVouchedFor
+	// indexSelfContradicting: neither copy matches what the disc records. Rot
+	// on this disc, which therefore cannot be believed about its set either.
+	indexSelfContradicting
+	// indexForeign: the disc vouches for an index that is not the staged one,
+	// or records nothing to judge by. Another set, or not a set at all.
+	indexForeign
+)
+
+// judgeIndex hashes both copies of the index and says which [indexVerdict]
+// they amount to. It reads and reports nothing else, so it can be asked before
+// a disc has staged anything. want is the hash the disc records for its index,
+// or "".
+func judgeIndex(ctx context.Context, name, src, dst, want string) (indexVerdict, error) {
+	staged, err := agecrypt.SumFile(ctx, dst)
+	if err != nil {
+		return 0, fmt.Errorf("restore: hashing the staged %s: %w", name, err)
 	}
 	onDisc, err := agecrypt.SumFile(ctx, src)
 	if err != nil {
-		return false, fmt.Errorf("restore: hashing %s on the disc: %w", name, err)
+		return 0, fmt.Errorf("restore: hashing %s on the disc: %w", name, err)
 	}
-	if strings.EqualFold(staged0, onDisc) {
-		o.UI.Step("already have %s, and this disc's copy is identical — this disc belongs to the staged set", name)
-		return false, nil
+	switch {
+	case strings.EqualFold(staged, onDisc):
+		return indexSame, nil
+	case want == "":
+		return indexForeign, nil
+	case strings.EqualFold(staged, want):
+		return indexVouchedFor, nil
+	case !strings.EqualFold(onDisc, want):
+		return indexSelfContradicting, nil
 	}
-	if want != "" {
-		switch {
-		case strings.EqualFold(staged0, want):
-			// This disc vouches for the staged index and has lost its own
-			// copy of it. Nothing is wrong with the set, and nothing here
-			// needs restaging.
-			o.UI.Warn("already have %s, and it matches the hash on this disc — but this disc's copy is damaged "+
-				"and was not staged; %s if you need this disc's copy back", name, o.sidecarRepairHint(0))
-			return false, nil
-		case !strings.EqualFold(onDisc, want):
-			// The disc contradicts itself, so it cannot be believed about
-			// which set it belongs to either. Nothing is staged: the pinned
-			// index stays.
-			return false, &CopyProblem{
-				Name:    name,
-				Missing: -1,
-				Reason: "this disc's copy of the index matches neither the hash this disc itself records for it nor the " +
-					"index already staged, so this disc's copy is damaged; the staged index was kept — " +
-					o.sidecarRepairHint(0),
-			}
+	return indexForeign, nil
+}
+
+// refuseForeignIndex is reconcileIndex's refusal, made before a disc stages
+// anything: when an index is already pinned and this disc carries a different
+// one that it vouches for (or records nothing about), the disc is refused here
+// and leaves staging exactly as it found it. brb.sh's refuse_foreign_index
+// runs at the same point, ahead of the published key as this does, so for a
+// disc whose index both readers can read the two refuse the same discs, by the
+// same witnesses in the same order. Any other verdict is returned, with judged
+// set, for the copy loop to report when it reaches the index
+// ([Options.settleIndex]) instead of hashing both copies a second time.
+//
+// An index this disc cannot even be read back from gets no verdict here, and
+// that is deliberate; it is also where the two readers part. A read error
+// hashing the disc's copy says nothing about which set the disc belongs to, so
+// this reader does not refuse over it: the disc's readable images are staged,
+// as this reader has always staged them for a damaged disc, and the read error
+// fails the disc when the copy loop reaches the index (reconcileIndex). brb.sh
+// cannot read the copy either, but its cmp then reads as a difference: with
+// nothing on the disc recording the index's hash, it refuses the disc as
+// another set's with nothing staged; with something recording it, it takes the
+// copy for rot and ingests the rest of the disc. README.md's table of reader
+// differences records it.
+func (o Options) refuseForeignIndex(ctx context.Context, mp string, names []string, want string) (verdict indexVerdict, judged bool, err error) {
+	if !slices.Contains(names, indexName) {
+		return 0, false, nil
+	}
+	dst := filepath.Join(o.dirs().Enc, indexName)
+	if _, err := os.Stat(dst); err != nil {
+		// Nothing pinned yet: this disc's index becomes the pinned one. (Any
+		// other failure is the copy loop's to report, where it stats dst too.)
+		return 0, false, nil
+	}
+	verdict, err = judgeIndex(ctx, indexName, filepath.Join(mp, dataDir, indexName), dst, want)
+	if err != nil {
+		if cerr := ctx.Err(); cerr != nil {
+			return 0, false, cerr
 		}
+		return 0, false, nil
 	}
-	return false, fmt.Errorf("restore: this disc carries an index that differs from the one already staged at %s — "+
+	if verdict == indexForeign {
+		return 0, false, o.foreignIndexError(dst, "Nothing from this disc was staged")
+	}
+	return verdict, true, nil
+}
+
+// foreignIndexError is the refusal of a disc whose index is not the one pinned
+// at dst. kept says what the refusal left alone, which depends on how far the
+// disc got before it.
+func (o Options) foreignIndexError(dst, kept string) error {
+	return fmt.Errorf("restore: this disc carries an index that differs from the one already staged at %s — "+
 		"every disc of one set carries the identical index, so this disc belongs to a different set, or one of the two "+
-		"indexes is not the set's at all. Nothing from this disc was added to the index, and it must not be ingested "+
+		"indexes is not the set's at all. %s, and it must not be ingested "+
 		"beside the other set's images: finish or clear %s before ingesting the other set. If both discs are meant to be "+
 		"from one set, one of them is not what it claims to be, and the images already staged cannot be told apart from "+
 		"here — ingest each disc into an empty staging directory and compare",
-		dst, o.Cfg.Staging)
+		dst, kept, o.Cfg.Staging)
 }
 
 // altCopyName is where a further pressing's copy of an already-staged file
 // goes: the same ".copy<unixtime>" convention brb.sh uses, in the same
-// directory, so either reader's par2 pass finds the other's copies.
+// directory, so either reader's par2 pass finds the other's copies — each
+// takes every name with that prefix, so any number after it will do.
+//
+// It is the first such name at or after now that is FREE. It used to be now,
+// whatever was there: copyStream renames its finished copy over the name and
+// brb.sh's cp truncates it, so two pressings read within one second — a
+// clock stepped back, a machine with no RTC that boots to the same second, a
+// script looping ingest over small images — had the second destroy the first,
+// the very copy par2 might need, without a word. A failed copy that removes
+// its own unverified output then deleted the earlier pressing outright.
+//
+// The search advances only while Lstat finds the name taken, and stops on any
+// other answer: a name too long for the filesystem, or a staging disk that
+// cannot be read, is returned for the copy to fail on and report, as it always
+// was, rather than searched past forever. That is the same test brb.sh's
+// alt_copy_name makes with [[ -e || -L ]], which is false for those too. It
+// ends because a directory holds finitely many names, and the staging lock
+// keeps any other run of either reader from taking one in between.
 func altCopyName(dst string) string {
-	return fmt.Sprintf("%s.copy%d", dst, time.Now().Unix())
+	for t := time.Now().Unix(); ; t++ {
+		alt := fmt.Sprintf("%s.copy%d", dst, t)
+		if _, err := os.Lstat(alt); err != nil {
+			return alt
+		}
+	}
+}
+
+// sameAltCopy names the alternate copy of dst, already staged, that holds
+// exactly the bytes a new copy at alt hashed to (sum), or "" when none does.
+//
+// Only a complete pressing's copy is a candidate: a regular file under the
+// .copy name, and not the new copy itself, a salvage's map file, a copy still
+// being written, or an incomplete salvage — an alternate with a map file
+// beside it, whose unread regions are zeros the drive never returned, so a
+// complete read matches it only by accident and hashing it is a read of
+// staging spent for nothing. A regular file, not merely a name that is not a
+// directory as altCopies lists them, because a FIFO left in staging would
+// block the hash forever.
+//
+// Each candidate is hashed, which is one read of staging per alternate — and
+// only on the path that has just read the same number of bytes off an optical
+// disc, which is far slower. A candidate that cannot be hashed is passed over,
+// so the new copy is kept: keeping is the side to err on. brb.sh's
+// same_alt_copy makes the same comparison over the same names, its -L before
+// -f standing in for the Lstat here.
+func (o Options) sameAltCopy(ctx context.Context, dst, alt, sum string) (string, error) {
+	dir := filepath.Dir(dst)
+	for _, c := range altCopies(dir, filepath.Base(dst)) {
+		p := filepath.Join(dir, c)
+		if p == alt || strings.HasSuffix(c, mapfileExt) || strings.HasSuffix(c, partExt) {
+			continue
+		}
+		if fi, err := os.Lstat(p); err != nil || !fi.Mode().IsRegular() {
+			continue
+		}
+		if _, err := os.Lstat(p + mapfileExt); err == nil {
+			continue
+		}
+		got, err := agecrypt.SumFile(ctx, p)
+		if err != nil {
+			if cerr := ctx.Err(); cerr != nil {
+				return "", cerr
+			}
+			continue
+		}
+		if strings.EqualFold(got, sum) {
+			return c, nil
+		}
+	}
+	return "", nil
 }
 
 // replaceOrKeepBoth handles a staged copy that fails the hash this disc
@@ -689,7 +1030,18 @@ func altCopyName(dst string) string {
 // are never destroyed ahead of that proof. A copy that is damaged too is kept
 // under the .copy name for par2 to combine at restore time, which is the one
 // way two bad burns still add up to a whole image.
-func (o Options) replaceOrKeepBoth(ctx context.Context, src, dst, want string) (staged bool, err error) {
+//
+// have is the staged copy's own hash, which the caller has just taken. A
+// damaged copy is only worth keeping when it is DIFFERENT damage: a disc that
+// returns the same wrong bytes every time — burned wrong, read through a
+// faulty drive or bridge, or carrying a sums line that was wrong from the
+// start — used to leave one more byte-identical .copy per re-read, each a
+// whole image of staging and one more operand for par2 to scan, with not one
+// new block among them — and both readers' advice after a bad copy invited
+// exactly those re-reads. A copy identical to the staged one,
+// or to an alternate already staged, is dropped and reported as the still
+// unverified copy it is: a *CopyProblem, as brb.sh counts the same file bad.
+func (o Options) replaceOrKeepBoth(ctx context.Context, src, dst, want, have string) (staged bool, err error) {
 	name := ingestName(src, dst)
 	o.UI.Warn("the staged %s does not match the hash on this disc; reading this disc's copy", name)
 	alt := altCopyName(dst)
@@ -714,6 +1066,25 @@ func (o Options) replaceOrKeepBoth(ctx context.Context, src, dst, want string) (
 		return true, nil
 	}
 	if isImageName(dst) {
+		same := ""
+		if strings.EqualFold(sum, have) {
+			same = "the staged one"
+		} else if c, err := o.sameAltCopy(ctx, dst, alt, sum); err != nil {
+			return true, err
+		} else if c != "" {
+			same = c + ", staged from an earlier read"
+		}
+		if same != "" {
+			o.removeUnverified(alt)
+			o.removeStaleMapfile(alt)
+			return false, &CopyProblem{
+				Name:    name,
+				Missing: -1,
+				Reason: "this disc's copy is byte for byte " + same + ", and does not match the hash this disc records " +
+					"for it either, so it was not kept a second time — reading this disc again will not help; ingest " +
+					"another pressing, or let par2 repair it during 'brb restore'",
+			}
+		}
 		o.UI.Warn("this disc's copy of %s does not match the recorded hash either; keeping both — par2 will combine them during 'brb restore'", name)
 		return true, nil
 	}
@@ -811,7 +1182,8 @@ func (o Options) copyManifest(ctx context.Context, root *os.Root, mp string) err
 // the restore down the wrong path. This is the one file read into memory
 // whole rather than streamed past its hash — it has to be parsed as a key, not
 // copied — so its size is judged first, against [maxPublicIdentityBytes], and
-// an implausible one is refused the same way.
+// an implausible one is refused the same way; the read is then bounded by the
+// same ceiling, so a file that is not what the stat said cannot outrun it.
 //
 // A staged key that already exists is compared, not overwritten. Identical
 // contents are the ordinary case — every disc of a public set carries the same
@@ -843,7 +1215,12 @@ func (o Options) ingestPublicIdentity(root *os.Root, mp, want string) (staged bo
 				"few hundred bytes of text, so this is not one and it was not read or staged", fi.Mode().Type()),
 		}
 	}
-	f, err := os.Open(src)
+	if testHookBeforeIdentityOpen != nil {
+		testHookBeforeIdentityOpen()
+	}
+	// Through the root, like the Lstat above, rather than by plain path: a
+	// name re-resolved from the top could leave the disc altogether.
+	f, err := root.Open(name)
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
 			return false, nil
@@ -862,20 +1239,48 @@ func (o Options) ingestPublicIdentity(root *os.Root, mp, want string) (staged bo
 	// diagnosis is an out-of-memory kill rather than "that file is not a key".
 	// A public set cannot be ingested at all until they work out which file
 	// did it.
+	//
+	// The type is judged again here, on the descriptor, because the check
+	// above was made on a name and this is the file actually open. A device
+	// or a FIFO put at the name since reports a size of 0, and would slide
+	// under the size gate just as a device node there did before that check
+	// was added.
+	tooBig := func(size string) error {
+		return &CopyProblem{
+			Name:    name,
+			Missing: -1,
+			Reason: fmt.Sprintf("is %s bytes on this disc; a public archive's key is a few hundred, so this file is not one "+
+				"and it was not read or staged — the key is printed in the disc's MANIFEST.txt and README.md, "+
+				"and AGE_IDENTITY can be pointed at a copy typed out from there", size),
+		}
+	}
 	if fi, err := f.Stat(); err != nil {
 		return false, fmt.Errorf("restore: reading %s: %w", src, err)
-	} else if fi.Size() > maxPublicIdentityBytes {
+	} else if !fi.Mode().IsRegular() {
 		return false, &CopyProblem{
 			Name:    name,
 			Missing: -1,
-			Reason: fmt.Sprintf("is %d bytes on this disc; a public archive's key is a few hundred, so this file is not one "+
-				"and it was not read or staged — the key is printed in the disc's MANIFEST.txt and README.md, "+
-				"and AGE_IDENTITY can be pointed at a copy typed out from there", fi.Size()),
+			Reason: fmt.Sprintf("is not a regular file on this disc (%s); a public archive's key is a "+
+				"few hundred bytes of text, so this is not one and it was not read or staged", fi.Mode().Type()),
 		}
+	} else if fi.Size() > maxPublicIdentityBytes {
+		return false, tooBig(strconv.FormatInt(fi.Size(), 10))
 	}
-	body, err := io.ReadAll(f)
+	if testHookBeforeIdentityRead != nil {
+		testHookBeforeIdentityRead()
+	}
+	// And the read itself is bounded, whatever the stat said. A size is a
+	// claim made before the read, not a limit on it: a file that grows after
+	// the stat, or a filesystem whose st_size understates what it serves (a
+	// FUSE mount with direct_io, say), sails past the gate above and into an
+	// unbounded io.ReadAll. One byte past the ceiling is enough to know it is
+	// past the ceiling.
+	body, err := io.ReadAll(io.LimitReader(f, maxPublicIdentityBytes+1))
 	if err != nil {
 		return false, fmt.Errorf("restore: reading %s: %w", src, err)
+	}
+	if len(body) > maxPublicIdentityBytes {
+		return false, tooBig(fmt.Sprintf("more than %d", maxPublicIdentityBytes))
 	}
 	if want != "" {
 		sum := sha512.Sum512(body)
@@ -940,6 +1345,17 @@ func (o Options) ingestPublicIdentity(root *os.Root, mp, want string) (staged bo
 	}
 	return true, nil
 }
+
+// testHookBeforeIdentityOpen and testHookBeforeIdentityRead run in
+// [Options.ingestPublicIdentity]'s two windows: between the check of the name
+// and the open, and between the size gate on the open file and the read. Both
+// are nil in every build but the tests that change the file in those windows;
+// an interleaving is not something a test can schedule from the outside, and
+// the claim of the code between them is that the change makes no difference.
+var (
+	testHookBeforeIdentityOpen func()
+	testHookBeforeIdentityRead func()
+)
 
 // writeStagedFile writes body to dst through a ".part" sibling that is
 // created fresh (see fsx.CreateFresh — never through a symlink planted at the

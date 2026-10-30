@@ -27,7 +27,7 @@
 #
 #   par2   -> repair the ciphertext if the disc has rotted
 #     age  -> decrypt the image
-#       mount -o loop,ro discNN.squashfs /mnt     (or unsquashfs to extract)
+#       mount -o loop,ro,nosuid,nodev discNN.squashfs /mnt  (or unsquashfs)
 #
 # Every disc is independent. Losing disc 7 loses exactly the files on disc 7;
 # every other disc still restores on its own. That last step needs nothing but
@@ -82,6 +82,55 @@ CLI_ASSUME_YES=""                                    # --yes, applied after the 
 # saying 1 here and won there. That is the setting that answers the
 # confirmation in front of a restore overwriting its destination, so the reader
 # that ignored the environment was ignoring it in the dangerous direction.
+#
+# Each value is remembered with ~ and $HOME expanded in it, by env_home_expand
+# below. That is the Go build's expandHomePath (go/internal/config/parse.go),
+# which ApplyEnv runs on every environment value, and this script used to take
+# the value exactly as written. A shell has normally expanded both already, so
+# the difference only shows when a literal marker arrives some other way — a
+# systemd Environment= line, an env file, a quoted export — and then
+# STAGING='~/brb' was $HOME/brb to the Go build and a directory named "~" under
+# the current one here: ingest with one reader and restore with the other, and
+# they were not looking at the same staging tree.
+#
+# env_home_expand VALUE — sets BRB_EXPANDED to VALUE with expandHomePath's three
+# rules applied, in its order: a lone ~ or a leading ~/ becomes $HOME, then
+# every ${HOME}, then every $HOME that is not the start of a longer name
+# ($HOMEBREW stays). With HOME unset or empty the value is left as it is, as
+# there. A variable rather than output, because $( ) would strip a trailing
+# newline that the Go build keeps; and no ${s//pat/rep}, because bash 5.2 reads
+# '&' in the replacement as the match, and HOME may contain one.
+#
+# shellcheck disable=SC2016  # every '$HOME' and '${HOME}' below is the literal
+# text being searched for, single-quoted precisely so that it is not expanded.
+env_home_expand() {
+  local s="$1" h="${HOME:-}" out="" c
+  BRB_EXPANDED="$s"
+  [[ -n "$h" ]] || return 0
+  # \~, not ~: a case pattern is tilde-expanded like any other word.
+  case "$s" in
+    \~)   BRB_EXPANDED="$h"; return 0 ;;
+    \~/*) s="$h${s:1}" ;;
+  esac
+  while [[ "$s" == *'${HOME}'* ]]; do
+    out+=${s%%'${HOME}'*}$h
+    s=${s#*'${HOME}'}
+  done
+  s="$out$s"
+  out=""
+  while [[ "$s" == *'$HOME'* ]]; do
+    out+=${s%%'$HOME'*}
+    s=${s#*'$HOME'}
+    c="${s:0:1}"
+    # The letters spelled out: a range such as [A-Za-z] follows the locale's
+    # collation in bash 4, and the Go side tests ASCII bytes.
+    case "$c" in
+      [ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_]) out+='$HOME' ;;
+      *) out+=$h ;;
+    esac
+  done
+  BRB_EXPANDED="$out$s"
+}
 BRB_ENV_OVERRIDES=()
 for _v in STAGING AGE_RECIPIENTS_FILE AGE_IDENTITY BURNER KEEP_IMAGES ASSUME_YES; do
   # ${!_v:+x}, not ${!_v+x}: the second is true for a variable that is exported
@@ -93,7 +142,10 @@ for _v in STAGING AGE_RECIPIENTS_FILE AGE_IDENTITY BURNER KEEP_IMAGES ASSUME_YES
   #
   # An if, not `&&`: on the last iteration a false test would become the for
   # loop's status and errexit would end the script before it started.
-  if [[ -n "${!_v:+x}" ]]; then BRB_ENV_OVERRIDES+=( "$_v=${!_v}" ); fi
+  if [[ -n "${!_v:+x}" ]]; then
+    env_home_expand "${!_v}"
+    BRB_ENV_OVERRIDES+=( "$_v=$BRB_EXPANDED" )
+  fi
 done
 unset _v
 
@@ -102,11 +154,17 @@ unset _v
 # parameters, ISO mode — was decided when the set was written and is recorded in
 # MANIFEST.txt on every disc. Re-declaring it here could only ever contradict
 # what is already burned.
-STAGING="${STAGING:-/var/tmp/brb}"
-AGE_RECIPIENTS_FILE="${AGE_RECIPIENTS_FILE:-$HOME/.config/brb/recipients.txt}"
-AGE_IDENTITY="${AGE_IDENTITY:-}"                     # the secret key; without it nothing decrypts
-BURNER="${BURNER:-/dev/sr0}"                         # where discs are read back from
-KEEP_IMAGES="${KEEP_IMAGES:-0}"                      # 1 keeps each decrypted image for re-runs
+#
+# A function, because load_config applies these a second time, after the config
+# file and the environment; see there for why once was not enough.
+reader_defaults() {
+  STAGING="${STAGING:-/var/tmp/brb}"
+  AGE_RECIPIENTS_FILE="${AGE_RECIPIENTS_FILE:-$HOME/.config/brb/recipients.txt}"
+  AGE_IDENTITY="${AGE_IDENTITY:-}"                   # the secret key; without it nothing decrypts
+  BURNER="${BURNER:-/dev/sr0}"                       # where discs are read back from
+  KEEP_IMAGES="${KEEP_IMAGES:-0}"                    # 1 keeps each decrypted image for re-runs
+}
+reader_defaults
 
 # ---------------------------------------------------------------------------
 # ---------------------------------------------------------------------------
@@ -194,8 +252,11 @@ num_arg() {  # num_arg <value> <what-it-is>
   # that does not exist. Nine digits is past any disc count a set can have --
   # the number here only ever names a disc -- and it makes the wrap
   # unreachable by construction rather than by a range test of its own. The Go
-  # reader refuses the same argument as a usage error.
-  [[ "${1:-}" =~ ^[0-9]{1,9}$ ]] || die "${2:-argument} must be a number, got '${1:-}'"
+  # reader refuses the same argument as a usage error. The digits are spelled
+  # out, not [0-9], for the reason disc_number_of gives: under a UTF-8 locale
+  # the range also admits "٣", and the arithmetic below then ends the run with
+  # bash's own syntax error in place of this message.
+  [[ "${1:-}" =~ ^[0123456789]{1,9}$ ]] || die "${2:-argument} must be a number, got '${1:-}'"
   printf '%d' "$(( 10#$1 ))"
 }
 
@@ -331,6 +392,15 @@ secure_staging() {  # secure_staging [SUBDIR ...]
 # process ends. The file is never removed either — unlinking a file another
 # process is about to lock is how advisory locking is commonly got wrong, and
 # LockName in lock.go gives the same reason for the same file.
+#
+# The file holds the pid of whoever has the lock, and nothing else, because
+# that is what LockStaging writes and what its refusal reads back to name the
+# other run. This script used to open it with `>`, which truncates on open —
+# BEFORE flock had said whether the lock was free — so a brb.sh that was about
+# to be refused had already erased the pid a running Go backup wrote, and the
+# next Go contender's message lost its " (pid N)". It opens with `<>` now,
+# which creates the file without truncating it, and replaces the pid only once
+# the lock is its own, as LockStaging does.
 BRB_LOCK_FD=""
 lock_staging() {
   [[ -z "$BRB_LOCK_FD" ]] || return 0
@@ -338,13 +408,14 @@ lock_staging() {
     step "flock is not installed, so this run cannot tell whether another brb is already using $STAGING — run one brb at a time"
     return 0
   fi
-  # Before the redirect, because bash has no O_NOFOLLOW to give it. `>` follows
-  # a symlink and truncates what it finds, so a link left at this name empties
-  # the file it points at with this run's privileges — under the sudo restore
-  # the README recommends, any file on the machine. LockStaging opens the same
-  # path with O_NOFOLLOW for exactly this reason (go/internal/fsx/lock.go) and
-  # refuses with the same advice, so refuse here too rather than leaving the
-  # Go build the only one that does.
+  # Before the redirect, because bash has no O_NOFOLLOW to give it. `<>`
+  # follows a symlink, and once the lock is held the pid write below truncates
+  # what it opened, so a link left at this name empties the file it points at
+  # with this run's privileges — under the sudo restore the README recommends,
+  # any file on the machine. LockStaging opens the same path with O_NOFOLLOW
+  # for exactly this reason (go/internal/fsx/lock.go) and refuses with the same
+  # advice, so refuse here too rather than leaving the Go build the only one
+  # that does.
   #
   # This is a name test and then an open, which is weaker than the flag: a
   # symlink planted in the gap is still followed. secure_dir has already proven
@@ -352,12 +423,19 @@ lock_staging() {
   # that race can write in there anyway; the case this catches is the link that
   # is already sitting at the name, which is the one that occurs.
   if [[ -L "$STAGING/.brb.lock" ]]; then
-    die "the staging lock $(esc_str "$STAGING/.brb.lock") is a symlink (-> $(esc_str "$(readlink -- "$STAGING/.brb.lock" 2>/dev/null || true)")); opening it truncates whatever it points at, so following the link would empty a file that is none of this run's business — remove the link, or point STAGING at a directory you own"
+    die "the staging lock $(esc_str "$STAGING/.brb.lock") is a symlink (-> $(esc_str "$(readlink -- "$STAGING/.brb.lock" 2>/dev/null || true)")); this run truncates it and writes its pid into it, so following the link would empty a file that is none of this run's business — remove the link, or point STAGING at a directory you own"
   fi
-  exec {BRB_LOCK_FD}>"$STAGING/.brb.lock" \
+  exec {BRB_LOCK_FD}<>"$STAGING/.brb.lock" \
     || die "could not open the staging lock $(esc_str "$STAGING/.brb.lock") — fix its permissions, or point STAGING at a directory you own"
   flock -n "$BRB_LOCK_FD" \
     || die "another brb is using the staging directory $(esc_str "$STAGING") — wait for it to finish, or point STAGING at a directory of its own; two runs sharing one staging tree can write the same image at the same time, and the result verifies clean and does not restore"
+  # The lock is ours, so any pid in the file belongs to a run that has ended.
+  # Replace it with this one. Through /dev/fd/N rather than the path: on Linux
+  # that reopens the very file this descriptor locked, wherever the name now
+  # points, and `>` there truncates it before the write. Best effort, exactly
+  # as in LockStaging — the pid only ever decorates another run's refusal — so
+  # a system with no /dev/fd simply keeps the stale one.
+  { printf '%s\n' "$$" >"/dev/fd/$BRB_LOCK_FD"; } 2>/dev/null || true
 }
 
 # dir_path DIR — the spelling of a directory path that lstat answers about the
@@ -373,11 +451,14 @@ lock_staging() {
 # collapses the lot with filepath.Clean (go/internal/restore/extract.go), and
 # this is that, for the trailing components which are the ones that matter:
 # an interior "//" or "/./" names the same file to lstat and to unsquashfs
-# alike, so it can hide nothing.
+# alike, so it can hide nothing. For the mount point the Go reader does not use
+# Clean but dirPath (go/internal/restore/mount.go), which is this function rule
+# for rule, so that both hand mount(8) the same bytes.
 #
-# The result is handed to unsquashfs -d as well as to the guards, so the two
-# can never disagree about which directory they mean. "/" survives as "/", and
-# an empty argument stays empty for the caller to reject.
+# The result is handed to unsquashfs -d, and in cmd_mount to mkdir and mount,
+# as well as to the guards, so the two can never disagree about which directory
+# they mean. "/" survives as "/", and an empty argument stays empty for the
+# caller to reject.
 dir_path() {  # dir_path DIR
   local d="${1:-}"
   while [[ -n "$d" && "$d" != "/" ]]; do
@@ -435,10 +516,15 @@ secure_dir() {
 # What to do about a staging directory somebody else owns. Under sudo the
 # likeliest story is a directory the operator made earlier without it, in which
 # case chown is the fix; otherwise the fix is a directory of one's own. Mirrors
-# ownershipAdvice in go/internal/restore/staging.go.
+# ownershipAdvice in go/internal/fsx/staging.go.
+#
+# The chown is pasted as root, so DIR goes into it through %q, as one shell
+# word: bare, a STAGING with a space in it hands chown -R the existing directory
+# before the space as well. %q spells control bytes as $'...' escapes, so it
+# keeps the terminal safety esc_str gave this line.
 ownership_advice() {  # ownership_advice DIR OWNER-UID
   if (( EUID == 0 )); then
-    printf 'chown -R root %s if it is yours, or point STAGING at a directory root owns' "$(esc_str "$1")"
+    printf 'chown -R root %s if it is yours, or point STAGING at a directory root owns' "$(printf '%q' "$1")"
   elif (( $2 == 0 )); then
     printf 'run this command as root, or point STAGING at a directory you own'
   else
@@ -466,6 +552,21 @@ dir_owner() {  # dir_owner DIR
 # Configuration
 # ---------------------------------------------------------------------------
 load_config() {
+  # Something is at the path and it is not a file: refused whether -c or
+  # BRB_CONFIG named it, in the Go build's words (config.Load). With -c this
+  # used to say "not found", which a directory or a FIFO plainly is not; with
+  # BRB_CONFIG it said "no config file" and ran on the defaults, while the Go
+  # build read the FIFO, the device or the `<(...)` pipe — so
+  # BRB_CONFIG=<(printf 'STAGING=...') gave the two readers two staging
+  # directories — or refused the directory. -e and -f both follow a symlink, as
+  # os.Stat does, so a link to a real config is still a config, and a dangling
+  # one is still "not there" to both.
+  if [[ -d "$CONFIG_FILE" ]]; then
+    die "config file $CONFIG_FILE is a directory"
+  fi
+  if [[ -e "$CONFIG_FILE" && ! -f "$CONFIG_FILE" ]]; then
+    die "config file $CONFIG_FILE is not a regular file"
+  fi
   # A mistyped -c is otherwise indistinguishable from no config at all, and the
   # default it falls back to is STAGING=/var/tmp/brb — an empty staging
   # directory, and a restore that reports finding no discs at all.
@@ -486,6 +587,18 @@ load_config() {
   if (( ${#BRB_ENV_OVERRIDES[@]} )); then
     for kv in "${BRB_ENV_OVERRIDES[@]}"; do declare -g "$kv"; done
   fi
+  # And the defaults again, now that nothing else will set these. KEY= in the
+  # file means "not overridden" to the Go build, which skips an empty value
+  # (config.go, Config.set), and the README's own sample writes DIST_DIR= and
+  # DISC_CAPACITY_BYTES= that way. Here the defaults were applied only before
+  # the file was sourced, so a STAGING=, AGE_RECIPIENTS_FILE= or BURNER= in a
+  # shared config overwrote them with nothing: an empty STAGING, which made
+  # ENC_DIR "/enc" and left every staging command to die in secure_dir, an
+  # identity looked for in the current directory instead of beside
+  # ~/.config/brb/recipients.txt, and no burner at all, while the Go build ran
+  # on all three defaults. The environment has already been put back above, so
+  # an exported value still wins, and an empty one is still ignored.
+  reader_defaults
   [[ -z "$CLI_ASSUME_YES" ]] || ASSUME_YES=1
   # The two yes/no settings are used in (( )) arithmetic further down, and under
   # set -u a KEEP_IMAGES=true from the config — the natural thing to write —
@@ -519,13 +632,19 @@ bool_setting() {
 # set can sit in staging for weeks between reading the discs and finishing the
 # restore. Every command here — ingest, restore, mount, list, index — reads
 # staging, so it has to survive between them.
+#
+# The exclusion is a command to paste, so STAGING goes into it through %q, as
+# one shell word, the way ownership_advice gives its chown. In double quotes, a
+# valid STAGING holding a $, a backtick, a " or a \ was expanded, run as a
+# command or cut short by the shell it was pasted into, and root's tee wrote
+# whatever came out into /etc/tmpfiles.d.
 warn_staging_volatile() {
   case "$STAGING" in
     /var/tmp/*|/tmp/*)
       warn "$STAGING is under systemd-tmpfiles cleanup (/var/tmp: 30 days, /tmp: 10 days)"
       warn "a slow restore can lose ingested images there; prefer a dedicated path:"
       warn "  STAGING=/srv/brb-staging   (ideally on an encrypted volume)"
-      warn "or exclude it:  printf 'x %s\\n' \"$STAGING\" | sudo tee /etc/tmpfiles.d/brb.conf"
+      warn "or exclude it:  printf 'x %s\\n' $(printf '%q' "$STAGING") | sudo tee /etc/tmpfiles.d/brb.conf"
       ;;
   esac
 }
@@ -545,7 +664,7 @@ cmd_doctor() {
     if command -v "$t" >/dev/null 2>&1; then ok "$t  $(command -v "$t")"
     else warn "$t  MISSING"; missing=1; fi
   done
-  step "and none of them for the last step: mount -o loop,ro discNN.squashfs /mnt"
+  step "and none of them for the last step: mount -o loop,ro,nosuid,nodev discNN.squashfs /mnt"
   step "needs nothing but the Linux kernel"
 
   echo >&2
@@ -607,9 +726,19 @@ cmd_doctor() {
 
   echo >&2
   if [[ -d "$ENC_DIR" ]]; then
-    local n; n="$(find "$ENC_DIR" -maxdepth 1 -name 'disc*.squashfs.age' 2>/dev/null | wc -l)"
+    # numbered_images, as check_complete on the next line counts them: a glob
+    # here also counted discx, disc00, and a directory under an image's name,
+    # so this line could report more images than the line after it found.
+    # Staging that holds only such names is not the same as empty staging,
+    # though, so check_complete still runs then and names what is missing.
+    # The warning is worded to be true of both kinds: a directory under
+    # disc01's image name does carry a number, it is just not a file.
+    local n; n="$(numbered_images | wc -l)"
     if (( n > 0 )); then
       ok "$n disc image(s) ingested in $ENC_DIR"
+      check_complete || true
+    elif [[ -n "$(find "$ENC_DIR" -maxdepth 1 -name 'disc*.squashfs.age' -print -quit 2>/dev/null || true)" ]]; then
+      warn "nothing in $ENC_DIR named like a disc image is a file with a disc number in its name, so none of it counts towards the set"
       check_complete || true
     else
       step "no disc images in $ENC_DIR yet — run '$PROG ingest'"
@@ -660,17 +789,104 @@ unmount_disc() {
 
 # Which disc is actually in the drive, by the name of the image on it. Empty if
 # there is nothing recognisable there.
+#
+# -type f, because the Go reader's dataFiles lists regular files only. Without
+# it a FIFO, a directory or a symlink under the image's name passed this gate:
+# a FIFO image that SHA512SUMS did not list had verify-disc call the disc
+# verified, and one it did list hung the hash, where the Go reader called the
+# same disc unrecognised.
+#
+# And the first name that carries a disc number, in byte order, because that
+# is the name discOfDataFiles picks: dataFiles sorts, and NumberOf skips every
+# name it cannot read a number from. This used to take whichever name find
+# reported first, in directory order and numbered or not, so a hand-made disc
+# with a discx.squashfs.age beside its disc01 could read as "discx" here: then
+# verify-disc refused a disc the Go reader verified, and ingest staged the
+# sidecar parity under the flat name, warning that the disc carried no numbered
+# image, where the Go reader staged sidecars-disc01.par2. find prints one name
+# per line, so a name holding a newline comes back in pieces, and one piece can
+# read as a numbered name; the -f test on what was picked keeps such a piece
+# from counting unless a file of that name really is there.
 disc_identity() {
-  find "$1/data" -maxdepth 1 -name 'disc*.squashfs.age' -printf '%f' -quit 2>/dev/null || true
+  local f
+  while IFS= read -r f; do
+    if [[ "$(disc_number_of "$f")" != 0 && -f "$1/data/$f" && ! -L "$1/data/$f" ]]; then
+      printf '%s' "$f"; return 0
+    fi
+  done < <(find "$1/data" -maxdepth 1 -type f -name 'disc*.squashfs.age' -printf '%f\n' 2>/dev/null | LC_ALL=C sort)
+  return 0
 }
 
 # The disc number in an image name such as disc07.squashfs.age, as a plain
-# integer; 0 when the name is not one this format produces. Any number of
-# digits, so a set past 99 discs still works — the same rule as discNumberOf
-# in go/internal/restore/restore.go.
+# decimal integer; 0 when the name is not one this format produces. Any number
+# of digits, so a set past 99 discs still works — the same rule as NumberOf in
+# go/internal/disc/disc.go, which the Go writer and reader share.
+#
+# Bounded the way strconv.Atoi bounds it there, and never put through
+# $((10#...)) to get there. That used to be the whole function, and bash
+# arithmetic wraps at 2^64 without a word: disc18446744073709551617 came back
+# as disc 1, so ingest staged its sidecars as disc 1's and a restore
+# cross-checked it as disc 1, while disc9223372036854775808 came back negative,
+# which refuse_foreign_image reads as "a name that says no disc". The leading
+# zeros are stripped as text and the length decides the rest, so nothing that
+# can wrap ever reaches arithmetic: up to eighteen significant digits always
+# fit, nineteen fit up to Atoi's ceiling of 9223372036854775807 (compared as an
+# eighteen-digit head and a last digit, each of which fits on its own), and
+# anything longer is "not a disc number" here exactly as it is to Atoi.
+#
+# The digits are spelled out rather than written [0-9]. bash hands =~ to the C
+# library's regcomp, which reads a range in the order of the locale's collation,
+# and under en_US.UTF-8 that order puts the Arabic-Indic, fullwidth and
+# superscript digits between 0 and 9: disc٣.squashfs.age came back as "٣", which
+# is not a number to anything downstream, and every arithmetic test it then met
+# printed a bash syntax error. NumberOf accepts the ten ASCII digits and nothing
+# else, in any locale, and so does an explicit list.
 disc_number_of() {
-  if [[ "${1:-}" =~ ^disc([0-9]+)\.squashfs\.age$ ]]; then printf '%d' "$(( 10#${BASH_REMATCH[1]} ))"
-  else printf '0'; fi
+  local d="" head
+  if [[ "${1:-}" =~ ^disc([0123456789]+)\.squashfs\.age$ ]]; then
+    d="${BASH_REMATCH[1]}"
+    d="${d#"${d%%[!0]*}"}"
+  fi
+  if [[ -n "$d" ]] && (( ${#d} <= 18 )); then printf '%s' "$d"; return 0; fi
+  if (( ${#d} == 19 )); then
+    head="${d:0:18}"
+    if (( 10#$head < 922337203685477580 || (10#$head == 922337203685477580 && ${d:18:1} <= 7) )); then
+      printf '%s' "$d"; return 0
+    fi
+  fi
+  printf '0'
+}
+
+# Every staged image whose name carries a disc number, one path per line in
+# ascending disc order: listNumbered in go/internal/restore/restore.go, which
+# skips every other name. It is the set a whole-set restore works through and
+# the set check_complete counts. Both used to be a bare glob of
+# disc*.squashfs.age, which also matches discx, disc00 and disc+2 — names this
+# format never writes, and which ingest nonetheless stages under whatever the
+# disc called them. Such an image reached refuse_foreign_image as disc 0 and was
+# extracted with the index cross-check "degraded", because its name did not say
+# which disc it was, and it counted towards a complete set while it was at it.
+# A forged disc carrying the genuine index needed nothing more than that name to
+# land its tree in the destination, with no question asked. The Go reader never
+# selects such a name, so neither does this.
+#
+# A glob rather than find, so that a name holding a newline stays one word
+# rather than two half-lines, the second of which can read as a numbered name
+# in the current directory. The glob comes back as itself when nothing matches,
+# and a directory is skipped the way listNumbered skips one — by lstat, so a
+# symlink is kept, as it is there. Every path printed has a basename that
+# passed disc_number_of, which admits no newline, so one per line is safe to
+# read back with mapfile.
+numbered_images() {
+  local f n line
+  for f in "$ENC_DIR"/disc*.squashfs.age; do
+    if [[ ! -e "$f" && ! -L "$f" ]]; then continue; fi
+    if [[ -d "$f" && ! -L "$f" ]]; then continue; fi
+    n="$(disc_number_of "${f##*/}")"
+    if (( n > 0 )); then printf '%s\t%s\n' "$n" "$f"; fi
+  done | sort -t $'\t' -k1,1n | while IFS= read -r line; do
+    printf '%s\n' "${line#*$'\t'}"
+  done
 }
 
 # The name a file from a disc's data/ directory is stored under in staging.
@@ -744,26 +960,200 @@ sidecar_repair_hint() {  # sidecar_repair_hint DISC-NUMBER
 # SHA512SUMS is usable but unverifiable, and says so (discSums in
 # go/internal/restore/ingest.go).
 declare -A DISC_SUMS=()
-# The ceiling mirrors agecrypt.maxSumLines, and for the same reason: this file
-# comes off a disc somebody else handed over, restore reads it with nothing in
-# between so much as looking at its size, and every parsed line is retained in
-# DISC_SUMS until the command ends. A "disc" that is a directory rather than
-# real media has no size limit at all, so a generated multi-gigabyte SHA512SUMS
-# turns into an OOM kill mid-ingest. A million is unreachable rather than tight:
-# a brb disc directory holds on the order of ten files. Lines READ are counted,
-# not entries stored, so a file of a million repeated names stops here too
-# rather than being scanned forever for free.
+# MAX_SUM_BYTES is what bounds every sha512sum-format file this script reads —
+# the disc's own SHA512SUMS in ingest and verify-disc, and a staged .sha512
+# sidecar in restore — and it is agecrypt.maxSumBytes: the same number, counted
+# the same way (sum_file_too_big). These files come off a disc somebody else
+# handed over and are read with nothing in between so much as looking at their
+# size. The line count below used to be called that bound and never was: a line
+# can be any length, and `read -r` and awk both hold a whole line before
+# anything counts it, so a newline-free SHA512SUMS of a few gigabytes on a
+# "disc" that is a directory got this process OOM-killed with the count still
+# at 1. A brb disc's SHA512SUMS lists on the order of ten files in a few
+# kilobytes, so sixteen megabytes is unreachable rather than tight.
+MAX_SUM_BYTES=16777216
+# The line ceiling mirrors agecrypt.maxSumLines. Under MAX_SUM_BYTES it can only
+# be reached by a file of blank or comment lines, which store nothing, so lines
+# READ are counted rather than entries stored; it stays so that the two readers
+# refuse the same files.
 MAX_SUM_LINES=1048576
+
+# sum_file_too_big FILE — true when FILE holds more than MAX_SUM_BYTES bytes, and
+# true as well when it cannot be read to find out, so that a failure counts
+# against the file rather than letting it through.
+#
+# Counted on bytes actually read, never taken from stat, for the three things a
+# stat gets wrong: `stat -c %s` reports a symlink's own length while every read
+# after it follows the link to its target; a procfs or FUSE file can report 0
+# and then stream without end (a link to /proc/self/pagemap is a "regular file"
+# of size 0); and a count of lines read plus one per newline misses carriage
+# returns and invents a final newline. head stops one byte past the cap, so
+# nothing larger is ever read in full. Failing closed is not a nicety: head gets
+# EINVAL on pagemap's unaligned last read, and the count it had reached by then
+# was exactly the cap, which would have let that file through.
+sum_file_too_big() {  # sum_file_too_big FILE
+  local sz
+  sz="$(head -c "$(( MAX_SUM_BYTES + 1 ))" -- "$1" 2>/dev/null | wc -c)" || return 0
+  sz="${sz//[[:space:]]/}"
+  [[ "$sz" =~ ^[0-9]+$ ]] || return 0
+  (( sz > MAX_SUM_BYTES ))
+}
+
+# sum_feed FILE — FILE as SUM_AWK is to read it: through head, so that what the
+# parse holds is bounded by what is read rather than by what sum_file_too_big
+# measured a moment earlier. Those are two opens of the file, and one that grew
+# in between, or a FUSE file that serves more the second time, would otherwise
+# hand awk an unbounded line after all. head stops two bytes past the cap, not
+# one, because SUM_AWK's own count cannot tell whether the last line ended in a
+# newline and may come out one byte over: at two past, a file head cut short is
+# always counted past the cap and refused, never parsed as if it ended there.
+sum_feed() {  # sum_feed FILE
+  head -c "$(( MAX_SUM_BYTES + 2 ))" -- "$1"
+}
+
+# SUM_AWK — ReadSumFile and parseSumLine from go/internal/agecrypt/sums.go, as
+# awk, so that a sha512sum-format file read here gets the answer the Go reader
+# gets. A caller runs it under LC_ALL=C, where length() counts bytes, passes
+# -v sum_max_lines="$MAX_SUM_LINES" -v sum_max_bytes="$MAX_SUM_BYTES", feeds it
+# sum_feed FILE, appends its own rules and calls sum_line() on every record.
+# sum_line returns 1 for a new entry, leaving the digest in sd and the name in
+# sn, and 0 for a line that adds nothing: blank, a '#' comment, or a name
+# already listed with the same digest. Anything Go's parse refuses ends the
+# program with sum_bad set to "LINE: reason", and the caller's END says what
+# that means to it. With -v sum_lenient=1 a line that does not parse is skipped
+# instead (read_disc_sums says why); the caps, and one name listed with two
+# digests, still end it.
+#
+# The rules, in Go's order. More bytes than sum_feed lets through, more than
+# sum_max_lines lines, or a line of 1048576 bytes or more counting a trailing
+# CR (bufio.Scanner's limit at maxSumLine), refuses the file, a comment line
+# included. Every trailing CR is trimmed, as strings.TrimRight trims them. Then
+# an optional leading backslash marking an escaped name, 128 hex digits in
+# either case, one space or tab, an optional second space or '*' for binary
+# mode, and a name that is not empty. One name listed twice with two different
+# digests is a refusal, not a coin toss. GNU `sha512sum -c` accepts more than
+# this — a BSD-style "SHA512 (name) = digest" line, and leading whitespace —
+# which is half of why verify-disc stopped handing it the file (see
+# verify_disc_sums).
+#
+# sn is not the name as Go's unescapeName leaves it but that name spelled for
+# bash's `printf '%b'`, which turns it back into exactly those bytes: every
+# backslash as \x5c, a newline as \n, a carriage return as \r, and nothing else
+# touched. The spelling is one-to-one with the name, so duplicates are found on
+# sn just as Go finds them on the name, and sn never holds a raw newline, which
+# lets it travel to bash one record per line. A name holding none of the three
+# — every name brb writes — passes through as it stands. \x5c rather than a
+# doubled backslash because it lets sum_spell be a few gsub calls: a gsub
+# replacement can write a backslash before a letter in every awk, where what
+# two backslashes in a row come out as differs from one awk to the next; and
+# one gsub is one pass over the name, where building it a byte at a time with
+# out = out c copies the whole string per byte in mawk, which is quadratic in a
+# megabyte-long name.
+#
+# The one byte that does not survive the trip to bash is NUL, which read drops.
+# sum_read deals with that; every caller that wants the names goes through it.
+# shellcheck disable=SC2016  # awk source, not shell: its $0 is awk's record and
+# must reach awk unexpanded, exactly as in the awk programs written inline.
+SUM_AWK='
+function sum_fail(why) { sum_bad = NR ": " why; exit }
+function sum_skip(why) { if (!sum_lenient) sum_fail(why); return 0 }
+function sum_spell(s, esc) {
+  if (s !~ /[\\\r\n]/) return s
+  if (esc) {
+    # unescapeName reads escapes left to right, so each \\ pair goes first and
+    # is held as a raw newline, which no record contains. Every backslash left
+    # after that escapes nothing — unescapeName keeps it, and the byte after it
+    # — unless it starts \n or \r, which already spell the byte they stand for.
+    gsub(/\\\\/, "\n", s)
+    gsub(/\\/, "\\x5c", s)
+    gsub(/\\x5cn/, "\\n", s)
+    gsub(/\\x5cr/, "\\r", s)
+    gsub(/\n/, "\\x5c", s)
+  } else {
+    gsub(/\\/, "\\x5c", s)
+    gsub(/\n/, "\\n", s)
+  }
+  gsub(/\r/, "\\r", s)
+  return s
+}
+function sum_line(    line, esc, c) {
+  sum_bytes += length($0) + 1
+  if (sum_bytes > sum_max_bytes + 1) sum_fail("more than " sum_max_bytes " bytes")
+  if (NR > sum_max_lines) sum_fail("more than " sum_max_lines " lines")
+  if (length($0) >= 1048576) sum_fail("a line of 1048576 bytes or more")
+  line = $0; sub(/\r+$/, "", line)
+  if (line == "" || substr(line, 1, 1) == "#") return 0
+  esc = substr(line, 1, 1) == "\\"
+  if (esc) line = substr(line, 2)
+  if (length(line) < 130) return sum_skip("line too short for a sha-512 checksum")
+  sd = tolower(substr(line, 1, 128))
+  if (sd !~ /^[0-9a-f]+$/) return sum_skip("line does not start with a sha-512 hex digest")
+  c = substr(line, 129, 1)
+  if (c != " " && c != "\t") return sum_skip("missing separator after the digest")
+  sn = substr(line, 130); c = substr(sn, 1, 1)
+  if (c == " " || c == "*") sn = substr(sn, 2)
+  if (sn == "") return sum_skip("missing file name")
+  sn = sum_spell(sn, esc)
+  if (sn in sum_seen) {
+    if (sum_seen[sn] != sd) sum_fail("a name listed twice with different digests")
+    return 0
+  }
+  sum_seen[sn] = sd
+  return 1
+}
+'
+
+# sum_read FILE [LENIENT] — the entries of a sha512sum-format file, as SUM_AWK
+# reads it through sum_feed (with sum_lenient=LENIENT), left in SUM_DS (the
+# digest), SUM_NS (the name, unescaped) and SUM_ZS (1 for a name that held a
+# NUL), index for index, with awk's verdict in SUM_TAIL: "OK", or "LINE: reason"
+# for a file Go's parse refuses. A verdict that never arrives, as when awk is
+# killed, leaves SUM_TAIL empty, which no caller takes for a clean parse.
+#
+# Each entry crosses as one record: "E", the digest, the length of the name's
+# spelling as eight digits, and the spelling. The length is for NUL, the one
+# byte read drops: a spelling that arrives shorter than awk measured it held
+# one, and a name holding a NUL is no file's name — not to the kernel, and not
+# to Go, whose open refuses it. Without this, "./READ<NUL>ME.md" carrying
+# README.md's digest verified in this reader and was a mismatch in the other,
+# and the image's own line spelled with a NUL in it counted as listing the
+# image here and not there. The comparison is of bytes, which is why LC_ALL=C
+# is set here and only here: the callers go on in the operator's locale.
+declare -a SUM_DS=() SUM_NS=() SUM_ZS=()
+SUM_TAIL=""
+sum_read() {  # sum_read FILE [LENIENT]
+  local LC_ALL=C rec sp n
+  SUM_DS=(); SUM_NS=(); SUM_ZS=(); SUM_TAIL=""
+  while IFS= read -r rec; do
+    case "$rec" in
+      E*)
+        SUM_DS+=( "${rec:1:128}" ); sp="${rec:137}"
+        if (( ${#sp} == 10#${rec:129:8} )); then SUM_ZS+=( 0 ); else SUM_ZS+=( 1 ); fi
+        printf -v n '%b' "$sp"; SUM_NS+=( "$n" ) ;;
+      Z*) SUM_TAIL="${rec:1}" ;;
+    esac
+  done < <(sum_feed "$1" | LC_ALL=C awk -v sum_max_lines="$MAX_SUM_LINES" \
+             -v sum_max_bytes="$MAX_SUM_BYTES" -v sum_lenient="${2:-0}" "$SUM_AWK"'
+      sum_line() { printf "E%s%08d%s\n", sd, length(sn), sn }
+      END { if (sum_bad != "") print "Z" sum_bad; else print "ZOK" }
+    ')
+}
 
 # How many missing disc numbers check_complete will spell out. The same bound
 # as maxNamedMissing in go/internal/restore/complete.go, and for the reason
 # given there: MANIFEST.txt is read off a disc that may have rotted or been
 # edited, and "discs : 3" is one flipped byte from "discs : 30000000".
 MAX_NAMED_MISSING=64
+# What check_complete last found missing — the list it printed and the
+# manifest's count — kept for the closing lines of a restore that was told to
+# carry on without those discs (reportOutcome in go/internal/restore/
+# extract.go). Empty when the set was complete or its size could not be told.
+SET_MISSING=""
+SET_WANT=""
 
 read_disc_sums() {  # read_disc_sums MOUNTPOINT
   DISC_SUMS=()
-  local h p n=0
+  local i n
   # -L before -f: a disc brb wrote carries no links at its own names, and -f
   # alone follows one, so a SHA512SUMS symlinked to a file off the disc would be
   # read as this disc's record of itself. The Go reader refuses the same names
@@ -776,18 +1166,46 @@ read_disc_sums() {  # read_disc_sums MOUNTPOINT
     warn "no SHA512SUMS on this disc; copies cannot be checked as they are made"
     return 0
   fi
-  while read -r h p; do
-    if (( ++n > MAX_SUM_LINES )); then
-      warn "SHA512SUMS on this disc has more than $MAX_SUM_LINES lines; reading stopped there"
-      step "a brb disc lists about ten files, so this one was not written by brb"
-      break
-    fi
-    # A line SHA512SUMS's own rot has mangled is simply not a hash for anything;
-    # the file it named is then copied unchecked, exactly as if it were absent.
-    [[ "$h" =~ ^[0-9A-Fa-f]{128}$ && -n "$p" ]] || continue
-    p="${p#\*}"; p="${p#./}"
-    DISC_SUMS["$p"]="${h,,}"
-  done < "$1/SHA512SUMS"
+  # Before a line is read, because awk holds a whole line before anything can
+  # count it: one newline-free gigabyte was an OOM kill at line 1. The Go reader
+  # refuses the same file in ReadSumFile, and discSums warns and checks nothing,
+  # as this does.
+  if sum_file_too_big "$1/SHA512SUMS"; then
+    warn "SHA512SUMS on this disc is larger than $MAX_SUM_BYTES bytes, or could not be read; copies cannot be checked as they are made"
+    step "a brb disc's SHA512SUMS lists about ten files in a few kilobytes, so this one was not written by brb"
+    return 0
+  fi
+  # The file is read with SUM_AWK, the grammar the Go reader and verify-disc
+  # read it with — every trailing CR trimmed, an escaped name unescaped, one
+  # name with two digests refused — and one difference kept on purpose, which
+  # is sum_lenient: a line SHA512SUMS's own rot has mangled is simply not a hash
+  # for anything, so the file it named is copied unchecked, exactly as if it
+  # were absent, and every other line is still used. The Go reader is stricter
+  # — one such line and discSums checks nothing — which README's table of
+  # reader differences records. Whatever else ReadSumFile refuses a file for,
+  # this refuses it for too, and then nothing is checked, as there.
+  #
+  # It used to be `read -r h p` over the file itself. A CRLF file then kept the
+  # CR on every name, so not one copy was checked against it and nothing said
+  # so, where the Go reader checked them all; a million blank lines took a
+  # minute or two; and a megabyte-long name took about nineteen seconds per
+  # ${p#...} that stripped a '*' or a './' that was not there.
+  sum_read "$1/SHA512SUMS" 1
+  if [[ "$SUM_TAIL" != OK ]]; then
+    # Nothing from a file the Go reader refuses is trusted, not even the lines
+    # before the one it refused it for: discSums discards all of it.
+    warn "SHA512SUMS on this disc cannot be read${SUM_TAIL:+ (line $SUM_TAIL)}; copies cannot be checked as they are made"
+    step "a brb disc's SHA512SUMS lists about ten files in a few kilobytes, so this one is damaged or was not written by brb"
+    return 0
+  fi
+  for (( i = 0; i < ${#SUM_NS[@]}; i++ )); do
+    # A name that held a NUL is no file's name (sum_read), so this is nobody's
+    # hash; nor is one that is "./" and nothing more.
+    (( SUM_ZS[i] )) && continue
+    n="${SUM_NS[i]}"; [[ "$n" == ./* ]] && n="${n:2}"
+    [[ -n "$n" ]] || continue
+    DISC_SUMS["$n"]="${SUM_DS[i]}"
+  done
 }
 
 # The SHA-512 of a file, from its contents alone — no name in the output to
@@ -810,46 +1228,129 @@ sha512_of() { sha512sum < "$1" | awk '{print $1}'; }
 # choose which file is hashed. recordedSum in go/internal/restore/restore.go
 # draws the line in the same place, and hashes the file itself afterwards.
 #
-# The parse is ReadSumFile/parseSumLine from go/internal/agecrypt/sums.go: an
-# optional leading backslash for an escaped name, 128 hex digits, one space or
-# tab, an optional second space or '*' for binary mode, then the name — of
-# which only the base is compared, as recordedSum compares filepath.Base. Blank
-# lines and '#' comments are skipped; one name listed twice with two different
-# digests is a refusal, not a coin toss. An escaped name is left escaped rather
-# than unescaped: no artifact this format writes contains a backslash, a newline
-# or a carriage return, so such a line simply matches nothing and reads as "no
-# digest recorded for this file", which is the safe answer.
+# The parse is SUM_AWK, which is ReadSumFile/parseSumLine from
+# go/internal/agecrypt/sums.go, caps and all; of each name only the base is
+# compared, as recordedSum compares filepath.Base — trailing slashes dropped
+# first, as Base drops them. Two entries whose bases both match with two
+# different digests are a refusal, as they are in recordedSum; two that merely
+# share some other base are not, because recordedSum never looks at them. An
+# escaped name is compared as Go unescapes it: sn is that name in SUM_AWK's
+# one-to-one spelling, and NAME is spelled the same way before the two meet
+# (no artifact this format writes contains a backslash, a newline or a
+# carriage return, so on a disc brb wrote this never matters). A file larger
+# than MAX_SUM_BYTES is rotted without being read, which is what ReadSumFile
+# makes of it too.
 recorded_sum() {  # recorded_sum SUMFILE NAME
   [[ -f "$1" ]] || return 1
+  ! sum_file_too_big "$1" || return 2
   local out=""
-  out="$(N="$2" LC_ALL=C awk '
-    { line = $0; sub(/\r$/, "", line) }
-    line == "" || substr(line, 1, 1) == "#" { next }
+  out="$(N="$2" LC_ALL=C awk -v sum_max_lines="$MAX_SUM_LINES" -v sum_max_bytes="$MAX_SUM_BYTES" "$SUM_AWK"'
+    BEGIN { want = sum_spell(ENVIRON["N"], 0) }
     {
-      if (substr(line, 1, 1) == "\\") line = substr(line, 2)
-      if (length(line) < 130) { bad = 1; exit }
-      d = tolower(substr(line, 1, 128))
-      if (d !~ /^[0-9a-f]{128}$/) { bad = 1; exit }
-      sep = substr(line, 129, 1)
-      if (sep != " " && sep != "\t") { bad = 1; exit }
-      n = substr(line, 130)
-      c = substr(n, 1, 1)
-      if (c == " " || c == "*") n = substr(n, 2)
-      if (n == "") { bad = 1; exit }
-      sub(/.*\//, "", n)
-      if (n in seen && seen[n] != d) { bad = 1; exit }
-      seen[n] = d
-      if (n == ENVIRON["N"] && got == "") got = d
+      if (!sum_line()) next
+      b = sn; sub(/\/+$/, "", b); sub(/.*\//, "", b)
+      if (b != want) next
+      if (got != "" && got != sd) sum_fail("two different digests for " b)
+      got = sd
     }
-    END { if (bad) exit 2; if (got == "") exit 1; print got }
-  ' "$1")" || return $?
+    END { if (sum_bad != "") exit 2; if (got == "") exit 1; print got }
+  ' < <(sum_feed "$1"))" || return $?
   printf '%s' "$out"
+}
+
+# disc_sidecar_sum FILE [quiet] — the digest FILE's own per-file sidecar on the
+# disc (FILE.sha512, beside it in data/) records for it, printed on stdout;
+# nothing when there is no usable one. It is the second witness ingest
+# consults, after SHA512SUMS, and for a disc whose SHA512SUMS is missing or
+# rotted it is the only one left for the image and the index. The Go reader
+# consults the same one in the same order (discWant in
+# go/internal/restore/ingest.go); it did not until the two were found to
+# disagree about the same disc — an image that failed its sidecar was counted
+# bad here and staged as fine there, and a rotted index this disc's sidecar
+# vouched against was ingested here as damage and refused there as another
+# set's.
+#
+# The sidecar is read by the rules every other name off a disc is read by: -L
+# before -f, because -f follows a link to a file that is not on the disc; and
+# through recorded_sum, so it records a digest but does not get to say which
+# file it is for. One that is a link, or does not parse, is no witness — said
+# so unless "quiet" is passed, and then treated exactly as an absent one, which
+# is also how restore treats the same sidecar once it is staged. Always
+# returns 0: it is called inside an assignment, under set -e.
+disc_sidecar_sum() {  # disc_sidecar_sum FILE [quiet]
+  local f="$1" quiet="${2:-}" base out rc=0
+  base="$(esc_str "${f##*/}")"
+  if [[ -L "$f.sha512" ]]; then
+    [[ -n "$quiet" ]] || warn "$base.sha512 on this disc is a symbolic link, which no disc brb wrote carries; $base cannot be checked against it"
+    return 0
+  fi
+  [[ -f "$f.sha512" ]] || return 0
+  out="$(recorded_sum "$f.sha512" "${f##*/}")" || rc=$?
+  if (( rc == 0 )); then
+    printf '%s' "$out"
+  elif (( rc == 2 )) && [[ -z "$quiet" ]]; then
+    warn "$base.sha512 on this disc is damaged, so $base cannot be checked against it either"
+  fi
+  return 0
+}
+
+# alt_copy_name DST — where a further pressing's copy of the staged DST goes:
+# DST.copy<epoch>, the name prepare_image hands par2, at the first epoch at or
+# after now whose name is FREE. It used to be now, whatever was there: cp
+# truncates an existing file in place, and the Go reader renames over one, so
+# two pressings read within one second — a clock stepped back, a machine with
+# no RTC that boots to the same second, a script looping ingest over small
+# images — had the second destroy the first, the very copy par2 might need,
+# without a word. The test is -e or -L, and anything else — a name too long
+# for the filesystem, an unreadable directory — reads as free, so the copy
+# fails on it and says why instead of the loop running on; altCopyName in the
+# Go reader stops on exactly the same answers. The staging lock keeps any
+# other run from taking the name in between.
+alt_copy_name() {  # alt_copy_name DST
+  local t
+  t="$(date +%s)"
+  while [[ -e "$1.copy$t" || -L "$1.copy$t" ]]; do t=$(( t + 1 )); done
+  printf '%s' "$1.copy$t"
+}
+
+# same_alt_copy DST ALT [DIGEST] — the name of a copy of DST already staged
+# beside it whose bytes are ALT's, printed on stdout; nothing when there is
+# none. Re-reading a pressing that is already staged gives par2 nothing new,
+# and is not worth a whole image of staging. DIGEST is ALT's hash when the
+# caller already has it; without it ALT is hashed here, and only once there is
+# a candidate to compare it with, so the usual case — no earlier copy at all —
+# costs no second read of an image just written.
+#
+# Only a complete pressing's copy is a candidate: a regular file named
+# DST.copy* (-L before -f, so a link is not followed to one), and not ALT
+# itself, a salvage's map file, a copy still being written, or an incomplete
+# salvage — a copy with a map file beside it, whose unread regions are zeros
+# the drive never returned, so a complete read matches it only by accident. A
+# copy that cannot be hashed reads as different, and so does an ALT that
+# cannot, so the new one is kept: keeping is the side to err on. sameAltCopy
+# in the Go reader compares the same names the same way. The directory part of
+# the glob is quoted, so a staging path holding glob metacharacters is matched
+# literally (see par2_repair_image); with no nullglob, an unmatched pattern
+# comes through as itself and -f drops it.
+same_alt_copy() {  # same_alt_copy DST ALT [DIGEST]
+  local c sum="${3:-}"
+  for c in "$1".copy*; do
+    [[ ! -L "$c" && -f "$c" && "$c" != "$2" && "$c" != *.mapfile && "$c" != *.part ]] || continue
+    [[ ! -e "$c.mapfile" && ! -L "$c.mapfile" ]] || continue
+    if [[ -z "$sum" ]]; then
+      sum="$(sha512_of "$2")" || sum=""
+      [[ -n "$sum" ]] || return 0
+    fi
+    if [[ "$(sha512_of "$c")" == "$sum" ]]; then printf '%s' "${c##*/}"; return 0; fi
+  done
+  return 0
 }
 
 # ingest_one SRC DST WANT — bring one file off the disc into staging, or say
 # why not. DST is where it is stored (the staged name, which for the sidecar
-# parity differs from the on-disc name); WANT is the hash the disc's SHA512SUMS
-# records for it, "" when the disc carries none. Returns non-zero for a copy
+# parity differs from the on-disc name); WANT is the hash the disc records for
+# it — its SHA512SUMS entry, or failing that its own sidecar (disc_sidecar_sum)
+# — and "" when the disc records nothing usable. Returns non-zero for a copy
 # that is not proven good — incomplete, or not matching the hash — which the
 # caller counts and reports at the end.
 #
@@ -861,10 +1362,13 @@ recorded_sum() {  # recorded_sum SUMFILE NAME
 # disc, each rotted past its own par2 redundancy, can still hold every block
 # between them, but only if both copies are on disk for par2 to combine — and
 # par2 only combines files named on its command line, so the second copy sits
-# beside the first as <name>.copy<epoch>, the name prepare_image passes.
+# beside the first as <name>.copy<epoch>, the name prepare_image passes (the
+# first such name that is free; see alt_copy_name). A copy that is the same
+# bytes as one already staged is NOT a second pressing, and is not kept twice
+# (see same_alt_copy).
 ingest_one() {
   local src="$1" dst="$2" want="$3"
-  local base name got alt
+  local base name got have alt same
   base="${src##*/}"
   # $name is this function's own copy of the on-disc name, and it exists only
   # to be printed. The name comes off the media, where Rock Ridge lets it carry
@@ -893,8 +1397,9 @@ ingest_one() {
         rm -f -- "$dst.mapfile"
         step "already have $name, and it matches the hash on this disc"; return 0
       fi
+      have="$got"
       warn "the staged $name does not match the hash on this disc; reading this disc's copy"
-      alt="$dst.copy$(date +%s)"
+      alt="$(alt_copy_name "$dst")"
       if ! copy_file_robustly "$src" "$alt"; then
         if [[ "$base" == *.squashfs.age ]]; then
           # The partial salvage — and its map file — stay under the .copy name:
@@ -917,6 +1422,29 @@ ingest_one() {
         step "replaced the staged $name with this disc's verified copy"; return 0
       fi
       if [[ "$base" == *.squashfs.age ]]; then
+        # Only DIFFERENT damage is worth a second copy. A disc that returns
+        # the same wrong bytes every time — burned wrong, read through a
+        # faulty drive, or carrying a sums line that was wrong from the start —
+        # used to leave one more byte-identical .copy per re-read, each a whole
+        # image of staging and one more operand for par2, with no new block in
+        # any of them; and the summary at the end of cmd_ingest used to invite
+        # exactly those re-reads. replaceOrKeepBoth in the Go reader drops the
+        # same copies. The new copy's digest is tested for being there at
+        # all: the caller runs this function on the left of ||, where set -e
+        # is off, so a sha512_of that failed leaves an empty one rather than
+        # ending the run, and two empty digests are not two equal images.
+        same=""
+        if [[ -n "$got" && "$got" == "$have" ]]; then
+          same="the staged one"
+        else
+          same="$(same_alt_copy "$dst" "$alt" "$got")"
+          [[ -z "$same" ]] || same="$(esc_str "$same"), staged from an earlier read"
+        fi
+        if [[ -n "$same" ]]; then
+          rm -f -- "$alt" "$alt.mapfile"
+          warn "$name: this disc's copy is byte for byte $same, and does not match the hash this disc records for it either, so it was not kept a second time — reading this disc again will not help; ingest another pressing, or let par2 repair it during '$PROG restore'"
+          return 1
+        fi
         warn "this disc's copy of $name does not match the recorded hash either; keeping both — par2 will combine them during '$PROG restore'"
         return 1
       fi
@@ -933,10 +1461,18 @@ ingest_one() {
       step "already have $name, byte for byte"; return 0
     fi
     if [[ "$base" == *.squashfs.age ]]; then
-      alt="$dst.copy$(date +%s)"
+      alt="$(alt_copy_name "$dst")"
       warn "already have $name, and it differs from the copy on this disc"
       step "ingesting this disc's copy as $(esc_str "${alt##*/}") for par2 to combine during '$PROG restore'"
       copy_file_robustly "$src" "$alt" || return 1
+      # It differs from the primary, but it may be a pressing read before: the
+      # same disc ingested twice is the same bytes twice. same_alt_copy hashes
+      # the new copy itself, and only when there is an earlier one to compare.
+      same="$(same_alt_copy "$dst" "$alt")"
+      if [[ -n "$same" ]]; then
+        rm -f -- "$alt" "$alt.mapfile"
+        step "this disc's copy of $name is byte for byte $(esc_str "$same"), staged from an earlier read, so it was not kept a second time"
+      fi
       return 0
     fi
     warn "already have $name, and it differs from the copy on this disc; keeping the staged copy"
@@ -958,10 +1494,11 @@ ingest_one() {
       # The drive returned wrong data without reporting an error. Keep the
       # damaged bytes under the REAL name: restore's par2 repair only ever
       # looks there, and this branch is reached only when no copy of the file
-      # exists at all, so nothing good is overwritten. A second ingest of this
-      # disc — or of another pressing — then lands as the .copy<epoch> above,
-      # exactly the pair par2 can combine, or replaces it outright once proven
-      # whole. (Filing it away under a .bad name kept bytes par2 could often
+      # exists at all, so nothing good is overwritten. A second ingest of
+      # another pressing then lands as the .copy<epoch> above, exactly the pair
+      # par2 can combine, or replaces it outright once proven whole; a second
+      # ingest of THIS disc, the same bytes again, is recognised there and not
+      # kept twice. (Filing it away under a .bad name kept bytes par2 could often
       # repair where no repair path would ever read them.)
       warn "$name does not match the hash this disc records for it — keeping the damaged copy for par2 repair, or for a second pressing to replace"
       mv -f -- "$dst.part" "$dst"
@@ -986,9 +1523,10 @@ ingest_one() {
 # other. Two copies of the same key are compared by the key line alone, because
 # the writer stamps every disc's copy with its own "# created:" time.
 #
-# Runs before the data files are touched, so a refused disc leaves nothing
-# behind. Returns non-zero for a copy that could not be trusted, which the
-# caller counts like any other bad file; the same key is on every other disc.
+# Runs after refuse_foreign_index and before the data files are touched, so a
+# disc refused by either leaves nothing behind. Returns non-zero for a copy
+# that could not be trusted, which the caller counts like any other bad file;
+# the same key is on every other disc.
 ingest_public_identity() {  # ingest_public_identity MOUNTPOINT
   local mp="$1" src="$1/identity.txt" dst="$ENC_DIR/identity.txt" want got key have
   if [[ -L "$src" ]]; then
@@ -1075,15 +1613,28 @@ ingest_public_identity() {  # ingest_public_identity MOUNTPOINT
 # substitution a forger wants. The message below says so, and says how to do it
 # on purpose.
 #
-# Runs before any data file is staged, so a refused disc leaves nothing behind.
+# Runs before anything from the disc is staged — ahead of the published key as
+# well as the data files — so a refused disc leaves nothing behind.
 refuse_foreign_index() {  # refuse_foreign_index MOUNTPOINT
   local mp="$1" src="$1/data/index.tsv.gz.age" dst="$ENC_DIR/index.tsv.gz.age" want
-  [[ -f "$src" && -f "$dst" ]] || return 0
+  # -L before -f, as everywhere a disc's names are read: the copy loop's
+  # `find -type f` never stages a linked index, so its target must not be what
+  # decides whether the disc is refused (the Go reader judges only the regular
+  # files dataFiles lists).
+  [[ ! -L "$src" && -f "$src" && -f "$dst" ]] || return 0
+  # cmp fails as well when it cannot read the disc's copy at all, and that is
+  # taken for a difference below: refused as another set's when nothing on the
+  # disc records the index's hash, read as rot when something does. The Go
+  # reader judges no unreadable copy here — it stages what it can and fails
+  # the disc at its index — which README.md's table of reader differences
+  # records.
   cmp -s -- "$src" "$dst" && return 0
   # The same two witnesses cmd_ingest uses for every other file, in the same
-  # order: the disc's SHA512SUMS, then the per-file sidecar beside it.
+  # order: the disc's SHA512SUMS, then the per-file sidecar beside it. Quiet,
+  # because the copy loop asks again for the index and says so then if the
+  # sidecar is damaged.
   want="${DISC_SUMS[data/index.tsv.gz.age]:-}"
-  if [[ -z "$want" && -f "$src.sha512" ]]; then want="$(awk '{print tolower($1); exit}' "$src.sha512")"; fi
+  [[ -n "$want" ]] || want="$(disc_sidecar_sum "$src" quiet)"
   if [[ -n "$want" && "$(sha512_of "$src")" != "$want" ]]; then
     warn "the index on this disc differs from the staged one, but does not match the hash this disc records for it either — reading that as rot on this disc, not as a second set"
     return 0
@@ -1092,41 +1643,113 @@ refuse_foreign_index() {  # refuse_foreign_index MOUNTPOINT
   die "the disc at $(esc_str "$mp") carries a different index (index.tsv.gz.age) from the one already in $dst, and every disc of one set carries the identical index: either two different sets are being ingested into one staging area, or one of these discs is not from your set. Nothing from this disc has been staged. Ingest each set into a STAGING of its own; if instead the STAGED index is the rotted one, $(sidecar_repair_hint 0), or delete $dst and ingest this disc again to take its copy."
 }
 
-# refuse_escaping_sums MOUNTPOINT — every name in a disc's SHA512SUMS has to be
-# a path ON that disc, or the one command whose whole job is the integrity claim
-# is not making it.
+# verify_disc_sums MOUNTPOINT IMAGE — check a disc against its own SHA512SUMS
+# the way agecrypt.VerifyDir checks it for the Go reader: read every name the
+# file lists, then hash each one that is a regular file on the disc reached
+# without a symbolic link, and compare. Returns 0 when every listed file
+# matches and 1 after naming each one that does not; dies when the file cannot
+# vouch for the disc at all. IMAGE is the image's name (discNN.squashfs.age),
+# which has to be listed.
 #
-# `sha512sum -c` hashes whatever each line names, resolved against the directory
-# it runs in, and never learns which files the caller meant. A disc whose
-# SHA512SUMS said "<digest of the empty file>  /dev/null" on every line would
-# therefore be reported "disc N verified" without a single byte of the disc
-# being read — and SHA512SUMS is a plain text file on media nobody here wrote.
-# The Go reader cannot be fooled that way: VerifyDir opens each name through an
-# os.Root rooted at the disc, which refuses an absolute path or one that climbs
-# out (go/internal/agecrypt/sums.go). This is that rule, applied before the
-# delegation rather than inside it.
+# WHY NOT `sha512sum -c` ANY MORE: the reason recorded_sum gives, met here
+# twice. It hashes whatever path each line names, so a SHA512SUMS reading
+# "<digest of the empty file>  /dev/null" had the disc reported verified without
+# a byte of it read. A textual check in front of it closed that spelling and not
+# the others. --strict also takes a BSD-style "SHA512 (/dev/null) = ..." line
+# and one with leading whitespace, which the check skipped as unparseable; and
+# sha512sum follows a symlink anywhere at all, so the image linked to /dev/null
+# beside the empty file's digest was "disc 1 verified", a listed link to a host
+# file carrying that file's digest verified too, and a listed link to /dev/zero
+# read forever. The sums file gets to record digests; it does not get to choose
+# what is read. So the file is parsed here with ReadSumFile's grammar (SUM_AWK)
+# and every name is held to the rule hashInRoot in
+# go/internal/agecrypt/sums.go applies, so that the two readers refuse the same
+# discs:
 #
-# Lines that do not parse are left alone: --strict below is what answers those,
-# and a name is only judged when there is a name to judge.
-refuse_escaping_sums() {  # refuse_escaping_sums MOUNTPOINT
-  local bad
-  bad="$(LC_ALL=C awk '
-    { line = $0; sub(/\r$/, "", line) }
-    line == "" || substr(line, 1, 1) == "#" { next }
-    {
-      if (substr(line, 1, 1) == "\\") line = substr(line, 2)
-      if (length(line) < 130) next
-      if (tolower(substr(line, 1, 128)) !~ /^[0-9a-f]{128}$/) next
-      n = substr(line, 130)
-      c = substr(n, 1, 1)
-      if (c == " " || c == "*") n = substr(n, 2)
-      if (n == "") next
-      if (substr(n, 1, 1) == "/" || n == ".." || index(n, "../") == 1 \
-          || index(n, "/../") > 0 || n ~ /\/\.\.$/) { print n; exit }
-    }
-  ' "$1/SHA512SUMS")"
-  [[ -z "$bad" ]] \
-    || die "SHA512SUMS on this disc records a hash for $(esc_str "$bad"), which is not a file on the disc — 'sha512sum -c' would hash that instead and call the disc verified without reading it. This is not a checksum file brb wrote; treat the disc as untrusted."
+#   - The file is at most MAX_SUM_BYTES and every line parses. A line that does
+#     not refuses the whole file, as it does in Go, rather than being a warning
+#     that leaves the file it named unhashed — the case --strict was there for.
+#   - It lists something, and it lists data/IMAGE, with or without a leading
+#     ./. Without these an empty or comment-only file, or one that simply leaves
+#     the image out, reported a disc verified with its image never read.
+#   - No name is absolute or has a .. component. That refuses the disc outright
+#     rather than counting a mismatch: it is not damage, it is a checksum file
+#     brb did not write. (The Go reader counts it as a mismatch; both exit 1.)
+#   - Then each name, with one leading ./ dropped, must be under 4096 bytes, no
+#     directory on the way to it may be a symbolic link or anything but a
+#     directory, and its last component must be a regular file and not a link
+#     (sum_name_is_file). A name that fails is a mismatch, as in Go, and so is a
+#     missing file. The names are resolved from inside the disc root, so the
+#     kernel holds them to the same PATH_MAX Go's maxSumName stands for.
+#   - A name holding a NUL byte is a mismatch without being looked up, and it
+#     is not the image's line either, however the rest of it reads: no file
+#     name can hold a NUL, and Go's open refuses it (sum_read says how it is
+#     seen at all, given that bash's read drops it).
+#
+# Nothing brb writes fails any of this: WriteSums lists every regular file as
+# ./relative/path, never through a link, and the image always among them.
+verify_disc_sums() {  # verify_disc_sums MOUNTPOINT IMAGE
+  local mp="$1" image="$2" n rel got i bad=0 found=0
+  ! sum_file_too_big "$mp/SHA512SUMS" \
+    || die "SHA512SUMS on this disc is larger than $MAX_SUM_BYTES bytes, or could not be read; a brb disc's lists a handful of files in a few kilobytes, so this one is damaged or was not written by brb"
+  sum_read "$mp/SHA512SUMS"
+  [[ "$SUM_TAIL" == OK ]] \
+    || die "SHA512SUMS on this disc does not parse${SUM_TAIL:+ (line $SUM_TAIL)} — it is damaged or was not written by brb, so it cannot vouch for this disc"
+  (( ${#SUM_NS[@]} > 0 )) \
+    || die "SHA512SUMS on this disc lists no files, so it cannot vouch for any"
+  for (( i = 0; i < ${#SUM_NS[@]}; i++ )); do
+    rel="${SUM_NS[i]}"; [[ "$rel" == ./* ]] && rel="${rel:2}"
+    if (( ! SUM_ZS[i] )) && [[ "$rel" == "data/$image" ]]; then found=1; fi
+    if [[ "$rel" == /* || "/$rel/" == */../* ]]; then
+      die "SHA512SUMS on this disc records a hash for $(esc_str "${SUM_NS[i]}"), which is not a file on the disc — hashing it would call the disc verified without reading it. This is not a checksum file brb wrote; treat the disc as untrusted."
+    fi
+  done
+  (( found )) \
+    || die "SHA512SUMS on this disc records no hash for data/$(esc_str "$image"), so it cannot vouch for the disc's image — it is damaged or was not written by brb"
+  # From inside the disc root, in a subshell so the working directory and the
+  # mount are left as they were: every path handed to the kernel is then the
+  # name itself, which is what holds it to PATH_MAX exactly as the Go reader's
+  # maxSumName does. The subshell's status is this function's.
+  ( CDPATH='' cd -P -- "$mp" || exit 1
+    for (( i = 0; i < ${#SUM_NS[@]}; i++ )); do
+      n="${SUM_NS[i]}"; rel="$n"; [[ "$rel" == ./* ]] && rel="${rel:2}"
+      if (( SUM_ZS[i] )); then
+        warn "mismatch: $(esc_str "$n") — as listed, the name holds a NUL byte, which no file name can"; bad=1; continue
+      fi
+      if ! sum_name_is_file "$rel"; then
+        warn "mismatch: $(esc_str "$n")"; bad=1; continue
+      fi
+      got="$(sha512_of "$rel")" || got=""
+      [[ "$got" == "${SUM_DS[i]}" ]] || { warn "mismatch: $(esc_str "$n")"; bad=1; }
+    done
+    exit "$bad" )
+}
+
+# sum_name_is_file REL — true when REL, a path relative to the working directory,
+# reaches a regular file without passing through a symbolic link: hashInRoot's
+# walk in go/internal/agecrypt/sums.go, component for component. Empty and "."
+# components are skipped, as the Go walk skips them; a name ending in "/" or "."
+# names a directory and is not a file; .. never gets this far (verify_disc_sums
+# refuses it) and is refused again here so the function stands on its own.
+#
+# Every step is linear in the name. A name of 4096 bytes or more is refused
+# before any of it — the kernel would refuse it anyway, and walking a megabyte
+# of name a component at a time costs a megabyte per component. ${#rest} counts
+# characters, so a shorter name of many-byte characters gets walked, and then
+# the kernel says ENAMETOOLONG instead, which is the same answer.
+sum_name_is_file() {  # sum_name_is_file REL
+  local rest="$1" cur="" comp
+  (( ${#rest} < 4096 )) || return 1
+  while [[ "$rest" == */* ]]; do
+    comp="${rest%%/*}"; rest="${rest:${#comp}+1}"
+    [[ -z "$comp" || "$comp" == . ]] && continue
+    [[ "$comp" != .. ]] || return 1
+    cur+="$comp"
+    [[ ! -L "$cur" && -d "$cur" ]] || return 1
+    cur+=/
+  done
+  [[ -n "$rest" && "$rest" != . && "$rest" != .. ]] || return 1
+  [[ ! -L "$cur$rest" && -f "$cur$rest" ]]
 }
 
 cmd_verify_disc() {
@@ -1137,6 +1760,11 @@ cmd_verify_disc() {
   mount_disc "${2:-}"; mp="$MOUNT_POINT"
   trap unmount_disc EXIT
   [[ -f "$mp/SHA512SUMS" ]] || die "no SHA512SUMS at $mp — is this one of ours?"
+  # -L before the identity check, as ingest has it: a disc brb wrote holds
+  # data/ as a real directory, and `find -P` will not descend a symlinked one,
+  # so without this the disc read as unrecognised rather than hostile. The Go
+  # reader refuses the same name through discEntry.
+  [[ -L "$mp/data" ]] && die "$(esc_str "$mp"): data on this disc is a symbolic link, which no disc brb wrote carries — nothing was read through it"
 
   # SHA512SUMS is per-disc and self-consistent, so ANY disc of the set passes
   # against its own copy. Without this, a tray that did not re-mount lets disc 3
@@ -1161,15 +1789,8 @@ cmd_verify_disc() {
       || warn "this disc belongs to archive '$(esc_str "$marc")', not '$ARCHIVE_NAME'"
   fi
 
-  refuse_escaping_sums "$mp"
   log "verifying disc $n at $mp"
-  # --strict matters: without it a line inside SHA512SUMS that has itself rotted
-  # is a WARNING, sha512sum still exits 0, and the file that line named is never
-  # hashed at all — so the one command whose job is the integrity claim would
-  # assert it falsely. The single-line .sha512 sidecar checks elsewhere are safe
-  # without it: a sidecar whose only line is malformed has no valid lines, and
-  # sha512sum already fails on that.
-  if ( cd "$mp" && sha512sum -c --quiet --strict SHA512SUMS ); then
+  if verify_disc_sums "$mp" "$want"; then
     ok "disc $n verified"
   else
     warn "disc $n has mismatches — par2 may still recover it; run '$PROG ingest' then '$PROG restore'"
@@ -1220,7 +1841,12 @@ copy_file_robustly() {
 expected_discs() {
   local v=""
   [[ -f "$STAGING/MANIFEST.txt" ]] && v="$(sed -n 's/^discs[[:space:]]*:[[:space:]]*//p' "$STAGING/MANIFEST.txt" | head -1 || true)"
-  [[ "$v" =~ ^[0-9]+$ ]] || return 1
+  # Spelled out rather than [0-9], which under a UTF-8 locale also admits "٣"
+  # (see disc_number_of): a manifest reading "discs : ٣" got through here, and
+  # check_complete's own arithmetic then ended the whole restore with a bash
+  # syntax error, where Atoi refuses the field and the Go reader goes on
+  # without knowing the set's size.
+  [[ "$v" =~ ^[0123456789]+$ ]] || return 1
   # A string of digits is not yet a number. check_complete puts this through
   # (( )), where a leading zero means OCTAL and anything past 2^64 wraps: a
   # manifest reading "discs : 010" let 8 staged images satisfy a ten-disc set,
@@ -1241,14 +1867,37 @@ expected_discs() {
 
 # Every disc carries the full directory skeleton, so a partial set restores a
 # complete-looking tree with files silently absent. Name the missing discs.
+#
+# What is counted is the distinct disc NUMBERS from 1 to the manifest's count
+# that have an image in staging, as checkComplete in go/internal/restore/
+# complete.go counts them — not how many names match a glob. A count of names
+# was satisfied by things that are not discs of this set at all: disc001 beside
+# disc01 (two names, one disc), a disc03 in a two-disc set, a discx, even a
+# directory with an image's name. Each of them made "all 2 disc image(s)
+# present" true of a set with no disc 2, and so took away the one warning, and
+# the one prompt, that a partial restore exists to raise. 'have' is the number
+# of numbered images, which is what both readers print as "N present".
+#
+# Returns 1 for an incomplete set, with SET_MISSING and SET_WANT saying what
+# was missing; 0, with both empty, for a complete one or an unknown size.
 check_complete() {
-  local want have missing=() i
+  local want have=0 inrange=0 missing=() i f n
+  local -A present=()
+  SET_MISSING="" SET_WANT=""
   # || true: expected_discs returns 1 when there is no usable manifest, and a
   # failing command substitution in an assignment is fatal under set -e.
   want="$(expected_discs || true)"
-  have=$(find "$ENC_DIR" -maxdepth 1 -name 'disc*.squashfs.age' | wc -l)
   [[ -n "$want" ]] || { warn "no MANIFEST.txt in $STAGING — cannot tell how many discs this set has"; return 0; }
-  (( have >= want )) && { ok "all $want disc image(s) present"; return 0; }
+  # n >= 1 is tested here and not left to numbered_images, which already drops
+  # a name that says no disc, so that the bound is this function's own, as it
+  # is Go's.
+  while IFS= read -r f; do
+    n="$(disc_number_of "${f##*/}")"
+    have=$(( have + 1 ))
+    if (( n >= 1 && n <= want )) && [[ -z "${present[$n]:-}" ]]; then inrange=$(( inrange + 1 )); fi
+    present[$n]=1
+  done < <(numbered_images)
+  (( inrange == want )) && { ok "all $want disc image(s) present"; return 0; }
   # Named at most MAX_NAMED_MISSING of them, and the count carries the rest.
   # This loop used to run to $want, which is a number off a disc: a manifest
   # claiming two billion discs spent the restore building a two-billion-entry
@@ -1256,14 +1905,18 @@ check_complete() {
   # (maxNamedMissing in go/internal/restore/complete.go) and prices the
   # unbounded version at 1.6 GB and a 168 MB line; this is that bound. It stops
   # early in every real case too, since it can only run past the last staged
-  # image by the number of names it is still allowed to print.
+  # image by the number of names it is still allowed to print. It asks the set
+  # of numbers rather than the file system, so a disc staged as disc001 is
+  # disc 1 here as it is to Go, and the rest is reckoned from the discs that
+  # count rather than from the names that happen to be there.
   for (( i = 1; i <= want && ${#missing[@]} < MAX_NAMED_MISSING; i++ )); do
-    [[ -f "$(printf '%s/disc%02d.squashfs.age' "$ENC_DIR" "$i")" ]] || missing+=("$i")
+    [[ -n "${present[$i]:-}" ]] || missing+=("$i")
   done
-  local shown="${missing[*]}" rest=$(( want - have - ${#missing[@]} ))
+  local shown="${missing[*]}" rest=$(( want - inrange - ${#missing[@]} ))
   (( rest > 0 )) && shown="$shown ... and $rest more"
   warn "MANIFEST says $want discs; $have present. MISSING: $shown"
   warn "files on those discs will NOT be restored"
+  SET_MISSING="$shown" SET_WANT="$want"
   return 1
 }
 
@@ -1303,6 +1956,14 @@ cmd_ingest() {
     # os.Root plus an Lstat (restore/ingest.go, discEntry).
     [[ -L "$mp/data" ]] && die "$(esc_str "$mp"): data on this disc is a symbolic link, which no disc brb wrote carries — nothing was read from it (the trap above has unmounted it, so the tray will open)"
     [[ -d "$mp/data" ]] || die "$(esc_str "$mp") has no data/ directory — is this one of ours? (the trap above has unmounted it, so the tray will open)"
+    # And a file at the top of it, which is all the copy loop below reads: the
+    # Go reader fails a data/ with none as empty (dataFiles lists the same one
+    # level of regular files). This reader used to take an empty data/ for a
+    # disc with nothing left to stage and report the run a success — and, once
+    # the loop listed one level only, a data/ holding nothing but a
+    # subdirectory too.
+    [[ -n "$(find "$mp/data" -mindepth 1 -maxdepth 1 -type f -print -quit 2>/dev/null || true)" ]] \
+      || die "$(esc_str "$mp")/data holds no file — is this one of ours? (the trap above has unmounted it, so the tray will open)"
     # eject is silently a no-op on a disc the user cannot unmount, and findmnt
     # then keeps reporting the old mount point. Nothing else in the loop notices.
     this_id="$(disc_identity "$mp")"
@@ -1320,23 +1981,43 @@ cmd_ingest() {
     (( disc > 0 )) \
       || warn "$mp carries no numbered image, so its sidecars.par2 is staged under the flat name and another disc's may already be there"
     read_disc_sums "$mp"
-    # The published key first: a disc from a different public set is refused
-    # before any of its same-named files can be taken for damaged copies of
-    # this set's.
-    ingest_public_identity "$mp" || bad=$(( bad + 1 ))
-    # And the index second, for the same reason and by the same rule: it is the
-    # one file every disc of a set carries identically, so a disc whose copy
-    # disagrees is either from another set or forged. Both checks run before a
-    # single data file is copied, so a refused disc leaves staging untouched.
+    # The index first: it is the one file every disc of a set carries
+    # identically, so a disc whose copy disagrees is either from another set
+    # or forged, and is refused before any of its same-named files can be
+    # taken for damaged copies of this set's. refuse_foreign_index only reads.
+    # It has to come before the published key, not after: staging the key is
+    # a write, and a public disc refused here used to leave its key behind in
+    # $ENC_DIR/identity.txt — under a refusal saying nothing had been staged,
+    # and live, since resolve_identity then offered it as the archive's own
+    # key. The Go reader checks at the same point (refuseForeignIndex).
     refuse_foreign_index "$mp"
+    # The published key second, by the same rule: a disc from a different
+    # public set is refused before any of its files land. Neither check has
+    # written anything when it refuses, so a refused disc leaves staging
+    # untouched.
+    ingest_public_identity "$mp" || bad=$(( bad + 1 ))
+    # One level only, as dataFiles lists it in the Go reader and disc_identity
+    # above: the format's data/ is flat, and a file nested in a subdirectory
+    # used to be staged under its bare name here — data/sub/disc01.squashfs.age
+    # as disc01's image — while the Go reader ignored it.
     while IFS= read -r f; do
       base="${f##*/}"
+      # Names staging gives a meaning of its own (stagingOwnName in
+      # go/internal/restore/ingest.go, which says what each one is). No disc
+      # brb wrote carries one in data/, and staged under its own name each
+      # would be taken for staging's: a disc's *.mapfile as a salvage map the
+      # Go reader resumes INTO the staged image, a *.copy* as another pressing
+      # for par2, data/identity.txt as the published key, sidecars-disc* as
+      # another disc's parity.
+      case "$base" in
+        *.part|*.mapfile|*.squashfs.age.copy*|identity.txt|sidecars-disc*)
+          warn "$(esc_str "$base") on this disc has a name staging keeps for its own bookkeeping, and no disc brb wrote carries one in data/ — not staging it"
+          continue ;;
+      esac
       want="${DISC_SUMS[data/$base]:-}"
-      # A disc whose SHA512SUMS is unreadable still carries the two per-file
-      # sidecars; they are the only witness left for the image and the index.
-      if [[ -z "$want" && -f "$f.sha512" ]]; then want="$(awk '{print tolower($1); exit}' "$f.sha512")"; fi
+      [[ -n "$want" ]] || want="$(disc_sidecar_sum "$f")"
       ingest_one "$f" "$ENC_DIR/$(staged_name "$base" "$disc")" "$want" || bad=$(( bad + 1 ))
-    done < <(find "$mp/data" -type f | sort -V)
+    done < <(find "$mp/data" -mindepth 1 -maxdepth 1 -type f | sort -V)
     # The manifest is the same on every disc, so a rotted copy is simply not
     # taken: the next disc's will do, and check_complete copes without one.
     if [[ -L "$mp/MANIFEST.txt" ]]; then
@@ -1376,9 +2057,12 @@ cmd_ingest() {
     prompt_media "another disc? press Enter to continue, or type q to stop" || break
     [[ "$MEDIA_REPLY" == [qQ] ]] && break
   done
-  ok "ingested $(find "$ENC_DIR" -name 'disc*.age' 2>/dev/null | wc -l) image(s)"
+  # Counted as check_complete below counts them, and as the Go reader's
+  # summary does (listNumbered): this used to count every disc*.age under
+  # staging at any depth, which could contradict the very next line.
+  ok "ingested $(numbered_images | wc -l) image(s)"
   (( bad == 0 )) \
-    || warn "$bad file(s) are incomplete or failed their hash — re-ingest those discs (or a second copy) before restoring"
+    || warn "$bad file(s) are incomplete or failed their hash — ingest another pressing of those discs, or let par2 repair them during '$PROG restore'"
   check_complete || true
 }
 
@@ -1423,11 +2107,13 @@ prepare_image() {
   local enc="$1" base ebase plain intact
   base="$(basename "$enc" .age)"
   # $ebase exists only to be printed, the same split ingest_one makes: the image
-  # name is whatever the disc's data/ directory called it, ingest stages it
-  # under exactly those bytes, and the restore glob matches any name of the
-  # disc*.squashfs.age shape whatever sits in the middle. Raw $base is what the
-  # paths and the comparisons use; every message below prints $ebase, so an ESC
-  # in a name retitles nobody's terminal on the way past.
+  # name is whatever the disc's data/ directory called it, and ingest stages it
+  # under exactly those bytes. The restore glob used to pass on any name of the
+  # disc*.squashfs.age shape whatever sat in the middle; every caller now hands
+  # over a numbered name (numbered_images, or one built from a disc number), so
+  # this is the second line of defence rather than the only one. Raw $base is
+  # what the paths and the comparisons use; every message below prints $ebase,
+  # so an ESC in a name retitles nobody's terminal on the way past.
   ebase="$(esc_str "$base")"
   plain="$RESTORE_DIR/$base"
   # Cheap, and re-checked per image on purpose: every caller secures the
@@ -1839,6 +2525,50 @@ list_image() {  # list_image IMAGE
   IMAGE_LISTED="$img"
 }
 
+# check_index_intact — compare the staged encrypted index with the hash
+# recorded beside it, before anything reads it; checkIndexIntact in
+# go/internal/restore/extract.go, with the same three answers. A matching hash
+# is a step and a missing one a warning, since age's authentication still
+# stands between a damaged index and a plausible wrong answer. A mismatch, or a
+# sidecar too damaged to parse, returns 1 with the sentence in INDEX_FAULT, and
+# what that costs is the caller's to decide, as it is in Go: 'index' stops on
+# it, and a restore takes it as an index that will not read — --only searches
+# every disc rather than trust its map, and the image cross-check degrades.
+#
+# This script never used to look at that sidecar, so an index rotted past its
+# first age chunk was read as the map of which disc holds what for every row
+# that came out before the damage, and nothing said the hash beside it
+# disagreed — in the reader whose whole reason to exist is the day something
+# has rotted, while the Go reader refused to trust the same file.
+#
+# A hash that could not be taken is a fault of its own, not a mismatch: with
+# sha512sum missing or the index unreadable, sha512_of prints nothing, and
+# comparing that nothing with the recorded digest told the operator their index
+# had rotted and sent them to par2 over a file nobody had looked at. Go fails
+# the same way, with "hashing index.tsv.gz.age" and the reason.
+INDEX_FAULT=""
+check_index_intact() {
+  local idx="$ENC_DIR/index.tsv.gz.age" want="" got="" rc=0
+  INDEX_FAULT=""
+  want="$(recorded_sum "$idx.sha512" index.tsv.gz.age)" || rc=$?
+  case "$rc" in
+    0) ;;
+    1) warn "no recorded hash for index.tsv.gz.age; age's own authentication is the only check performed"
+       return 0 ;;
+    *) INDEX_FAULT="index.tsv.gz.age.sha512 is damaged and cannot be read — $(sidecar_repair_hint 0), then retry"
+       return 1 ;;
+  esac
+  got="$(sha512_of "$idx")" || {
+    INDEX_FAULT="could not hash index.tsv.gz.age to check it against index.tsv.gz.age.sha512 (the error is above)"
+    return 1; }
+  if [[ "$got" == "$want" ]]; then
+    step "index.tsv.gz.age matches its recorded hash"
+    return 0
+  fi
+  INDEX_FAULT="index.tsv.gz.age does not match the hash in index.tsv.gz.age.sha512 — one of the two has rotted; $(sidecar_repair_hint 0), then retry"
+  return 1
+}
+
 # refuse_foreign_image IMAGE DISC-NUMBER — this image must hold exactly the
 # files the index says disc N holds.
 #
@@ -1878,8 +2608,26 @@ list_image() {  # list_image IMAGE
 # attack, so this warns loudly and extracts, rather than refusing, whenever
 # either side is not exactly comparable: the listing had lines it could not
 # parse, the index lists a newline in a path for this disc, the index is not in
-# staging to compare against, or the image's own name does not say which disc
-# it is. The warning names which, so the operator knows the check did not run.
+# staging to compare against or will not read — which includes failing its own
+# recorded hash, as it does for the Go reader's crossCheckRows — or the image's
+# own name does not say which disc it is. The warning names which, so the
+# operator knows the check did not run.
+#
+# The hash arm has a price that both readers pay. Ingest pins the index and not
+# the hash beside it, which is an ordinary sidecar there, replaced by any later
+# disc whose own SHA512SUMS vouches for a different one. So a disc carrying the
+# genuine index and a junk index.tsv.gz.age.sha512 switches this check off for
+# every image of the set, loudly. It gives a forger nothing that a
+# newline-named file in their own image does not already give them, and
+# README's Limitations says so; closing it is a change to ingest on both sides.
+#
+# That last one is a guard and not a path cmd_restore takes: it chooses images
+# through numbered_images, or by --disc N, so every image it hands here has a
+# number. The arm used to be reachable, and was the whole of an attack — a
+# forged image named discx.squashfs.age was waved through by it — which is why
+# a name that says no disc is now never selected rather than merely warned
+# about; crossCheckRows in go/internal/restore/extract.go says the same of its
+# own n == 0 arm.
 #
 # Restore only, deliberately: mount hands an image to the kernel read-only and
 # list prints its contents, and neither writes the archive's files into the
@@ -1893,6 +2641,8 @@ refuse_foreign_image() {  # refuse_foreign_image IMAGE DISC-NUMBER
     why="its name does not say which disc it is, and the index lists paths by disc number"
   elif [[ ! -f "$idx" ]]; then
     why="there is no index.tsv.gz.age in $ENC_DIR to check it against"
+  elif ! check_index_intact; then
+    why="the index would not read ($INDEX_FAULT)"
   elif (( IMAGE_STRAY > 0 )); then
     why="$IMAGE_STRAY line(s) of its listing are not entries this can parse, so a name in it is one a line-based listing cannot carry — a filename containing a newline is listed as two half-lines, and this format supports such names"
   fi
@@ -1905,25 +2655,67 @@ refuse_foreign_image() {  # refuse_foreign_image IMAGE DISC-NUMBER
     # a literal backslash-then-n is written as, so the check walks the escapes
     # rather than grepping for two characters. Any other non-zero status is age
     # or gunzip failing, which is a different message.
+    #
+    # Exit 4 is rows that do not parse, on any disc, counted on a last line
+    # that starts with '#'. Such rows used to be skipped without a word, so the
+    # list compared below was short by whatever they had held, and an image
+    # holding those paths was refused as foreign. A damaged index cannot say
+    # what the disc holds, so indexRowsForDisc in go/internal/restore/locate.go
+    # degrades the check for it instead, and so does this. A newline outranks
+    # it there too.
+    #
+    # A row is read as indexfmt.ParseLine reads it, because the verdict here
+    # is the Go reader's verdict or the two disagree about the same disc:
+    # everything up to the first tab is the disc number, which strconv.Atoi
+    # takes with a '+' in front and leading zeros, and refuses below 1 or past
+    # 2^63-1 (on the 64-bit builds brb ships); everything after it is the
+    # path, raw tabs included, and must not be empty. The number is compared
+    # as a string, both sides stripped of their zeros, since awk's numbers are
+    # doubles and lose digits past 2^53. The --only lookup in cmd_restore is
+    # stricter: it holds its numbers to nine digits, for bash's arithmetic, so
+    # a '+', a number past 999999999 and a raw tab are rows it cannot use.
+    # Nothing here reaches bash's arithmetic, and taking those rules here would
+    # degrade the check on rows the Go reader compares exactly, and extract an
+    # image it refuses. The writer produces none of these rows.
+    #
+    # And a path is compared in one spelling. list_image escapes the image's
+    # names as indexfmt.EscapePath does, but the Go reader compares the
+    # index's paths after UnescapePath, so a row it reads fine that is not in
+    # that spelling, a raw tab or a backslash before a letter the format does
+    # not define, is put into it here first: canon is EscapePath(UnescapePath(p))
+    # in one pass. Only a path with a tab or a backslash in it can need that,
+    # which keeps the walk off every other row.
     rows="$(age_d "$idx" | gunzip -c | N="$n" LC_ALL=C awk -F'\t' '
-      function has_newline(s,   i, c) {
+      function canon(s,   i, c, e, out) {
+        out = ""
         for (i = 1; i <= length(s); i++) {
           c = substr(s, i, 1)
-          if (c != "\\") continue
-          i++
-          if (substr(s, i, 1) == "n") return 1
+          if (c == "\t") { out = out "\\t"; continue }
+          if (c != "\\") { out = out c; continue }
+          e = substr(s, i + 1, 1)
+          if (e == "\\" || e == "t" || e == "n") {
+            if (e == "n") nl = 1
+            out = out c e; i++
+          } else out = out "\\\\"
         }
-        return 0
+        return out
       }
-      NF == 2 && $1 ~ /^[0-9]+$/ && $1 + 0 == ENVIRON["N"] + 0 {
-        if (index($2, "\\") && has_newline($2)) nl = 1
-        print "i" $2
+      BEGIN { n = ENVIRON["N"] ""; sub(/^0+/, "", n) }
+      $0 == "" { next }
+      NF < 2 || (NF == 2 && $2 == "") || $1 !~ /^[+]?[0-9]+$/ { bad++; next }
+      { d = $1; sub(/^[+]?0*/, "", d) }
+      d == "" || length(d) > 19 || (length(d) == 19 && d > "9223372036854775807") { bad++; next }
+      (d "") == n {
+        p = NF == 2 ? $2 : substr($0, length($1) + 2)
+        if (NF > 2 || index(p, "\\")) p = canon(p)
+        print "i" p
       }
-      END { exit (nl ? 3 : 0) }
+      END { if (nl) exit 3; if (bad) { print "#" bad; exit 4 } }
     ')" || rc=$?
     case "$rc" in
       0) ;;
       3) why="the index lists a path for disc $n whose name contains a newline, which a line-based 'unsquashfs -ll' listing cannot carry faithfully" ;;
+      4) why="${rows##*#} record(s) in index.tsv.gz.age do not parse, so the index's list for this disc is incomplete ($(sidecar_repair_hint "$n"))" ;;
       *) why="the index in $ENC_DIR could not be read (age or gunzip exited $rc)" ;;
     esac
   fi
@@ -1935,19 +2727,42 @@ refuse_foreign_image() {  # refuse_foreign_image IMAGE DISC-NUMBER
   # Both sides down one pipe, each line tagged with where it came from, and
   # compared in the order they were read so the examples below are the same
   # ones on every run and on both readers.
+  #
+  # The index's rows go first, so that by the time the image's entries arrive
+  # every path the index gives this disc is already known: an image path then
+  # either ticks off its row and is forgotten, or is an extra and is kept, in
+  # order, for the examples. Only the index's side and the extras are ever held
+  # — which is how auditImage in go/internal/restore/extract.go streams the
+  # image past the index — where image-first held two copies of every path the
+  # image has, a key and an ordered value, only to test them against the index
+  # at the end. On a clean disc of a million files that halved this awk's peak.
+  #
+  # And the entries are printed one at a time rather than as one printf over
+  # "${IMAGE_ENTRIES[@]}": that expansion builds the whole array a second time
+  # as an argument list inside the pipe's subshell, and at a million entries
+  # that copy outweighed the awk. The loop costs a few seconds per million
+  # entries, against hundreds of megabytes on the machine least able to spare
+  # them — the trade list_image makes, for the same machine. IMAGE_ENTRIES is
+  # contiguous from 0: mapfile fills it so, and list_image only ever unsets its
+  # last elements. k is assigned in the pipe's subshell and never leaks.
   local -a verdict=()
-  mapfile -t verdict < <( { printf '%s\n' ${IMAGE_ENTRIES[@]+"${IMAGE_ENTRIES[@]}"}
-                            printf '%s\n' "$rows"; } | LC_ALL=C awk '
+  mapfile -t verdict < <( { printf '%s\n' "$rows"
+                            for (( k = 0; k < ${#IMAGE_ENTRIES[@]}; k++ )); do
+                              printf '%s\n' "${IMAGE_ENTRIES[k]}"
+                            done; } | LC_ALL=C awk '
     {
       t = substr($0, 1, 1); p = substr($0, 2)
-      if (t == "f") { if (!(p in img)) { img[p] = 1; ford[++nf] = p } }
-      else if (t == "i") { if (!(p in idx)) { idx[p] = 1; iord[++ni] = p } }
+      if (t == "i") { if (!(p in idx)) { idx[p] = 0; iord[++ni] = p } }
+      else if (t == "f") {
+        if (p in idx) { if (!idx[p]) { idx[p] = 1; nf++ } }
+        else if (!(p in extra)) { extra[p] = 1; eord[++nx] = p; nf++ }
+      }
     }
     END {
       # Bounded on purpose: a forged image can differ by every path it holds,
       # and ten thousand lines of them is not a message anybody reads.
-      for (i = 1; i <= ni; i++) if (!(iord[i] in img)) { nm++; if (nm <= 3) print "M" iord[i] }
-      for (i = 1; i <= nf; i++) if (!(ford[i] in idx)) { ne++; if (ne <= 3) print "E" ford[i] }
+      for (i = 1; i <= ni; i++) if (!idx[iord[i]]) { nm++; if (nm <= 3) print "M" iord[i] }
+      for (i = 1; i <= nx; i++) { ne++; if (ne <= 3) print "E" eord[i] }
       print "=" nm + 0 " " ne + 0 " " ni + 0 " " nf + 0
     }
   ')
@@ -2004,16 +2819,37 @@ cmd_restore() {
   # filepath.Clean at the head of Extract.
   dest="$(dir_path "$dest")"
   shift || true
-  local only="" onedisc=""
+  local only="" onedisc="" partial=0
   while (( $# )); do
     case "$1" in
       # ${2:?} produces bash's own "2: parameter null or not set", which names
       # neither the option nor the script.
-      # Strip a trailing slash and any leading ./ so "notes/" and "./notes"
-      # mean the directory the user was pointing at: matching below is exact,
-      # not substring, and would otherwise miss on the cosmetic difference.
-      --only) only="${2:-}"; only="${only%/}"; only="${only#./}"
-              [[ -n "$only" ]] || die "--only needs a path"; shift 2 ;;
+      #
+      # Every leading '/' and './' and every trailing '/' is stripped, so that
+      # "/notes", "./notes" and "notes//" all mean the path the user was
+      # pointing at: matching below is exact, not substring, and would
+      # otherwise miss on the cosmetic difference. It is the rule onlyPath in
+      # go/internal/restore/extract.go applies, and it has to be the same rule:
+      # this used to strip one trailing '/' and one leading './' and never a
+      # leading '/', while the Go reader trimmed every '/' and never './', so
+      # "./notes" restored here and failed there and "/notes" and "notes//"
+      # did the reverse. What is left is what the index, the listing, the
+      # unsquashfs operand and the post-check all see. A spelling with nothing
+      # left, or only ".", names the archive root — the whole tree, which is
+      # what a restore without --only is for — and is refused as Go refuses it.
+      --only) only="${2:-}"
+              [[ -n "$only" ]] || die "--only needs a path"
+              while :; do
+                case "$only" in
+                  /*)  only="${only#/}" ;;
+                  ./*) only="${only#./}" ;;
+                  *)   break ;;
+                esac
+              done
+              while [[ "$only" == */ ]]; do only="${only%/}"; done
+              [[ -n "$only" && "$only" != "." ]] \
+                || die "--only $2: that is the whole tree — run restore without --only"
+              shift 2 ;;
       --disc) onedisc="$(num_arg "${2:-}" '--disc')"; shift 2 ;;
       *) die "unknown option: $1" ;;
     esac
@@ -2051,50 +2887,150 @@ cmd_restore() {
     encs=( "$(printf '%s/disc%02d.squashfs.age' "$ENC_DIR" "$onedisc")" )
     [[ -f "${encs[0]}" ]] || die "no image for disc $onedisc in $ENC_DIR"
   else
-    mapfile -t encs < <(find "$ENC_DIR" -maxdepth 1 -name 'disc*.squashfs.age' | sort -V)
+    # numbered_images, not a glob: see there for the forged image a glob let
+    # through, and for why its name was all that forgery needed.
+    mapfile -t encs < <(numbered_images)
     (( ${#encs[@]} > 0 )) || die "no images in $ENC_DIR — run '$PROG ingest' first"
-    check_complete || confirm "Restore the partial set anyway?" || die "aborted"
+    # An if, so that the answer is remembered: a partial set the operator said
+    # yes to must not end on the same line as a complete one (see the end).
+    if ! check_complete; then
+      confirm "Restore the partial set anyway?" || die "aborted"
+      partial=1
+    fi
   fi
 
   # --only used to par2-verify and decrypt every image in the set — hours and
   # hundreds of GiB — to pull back one file, printing "extracted" for each disc
   # whether or not the path was on it. The index already knows where it lives.
-  if [[ -n "$only" && -z "$onedisc" ]]; then
-    local -a hits=() sel=(); local d e esc_only
-    [[ -f "$ENC_DIR/index.tsv.gz.age" ]] \
-      || die "--only needs the encrypted index, which is not in $ENC_DIR — pass --disc N instead"
-    # Resolve the disc by EXACT path, not by 'index'-style substring search:
-    # a fuzzy hit selects a disc for --only notes when only notes2025 exists,
-    # and the extraction filter downstream is exact — so the run used to report
-    # "restore complete" having written nothing. The index stores paths with
-    # backslash, tab and newline escaped (backslash first — the same order the
-    # writer uses; any other order fails to round-trip), so the pattern is
-    # escaped the same way, then matched as the whole path or as a directory
-    # prefix of one. ENVIRON, not -v: awk -v mangles backslash sequences.
-    esc_only="${only//\\/\\\\}"
-    esc_only="${esc_only//$'\t'/\\t}"
-    esc_only="${esc_only//$'\n'/\\n}"
-    mapfile -t hits < <(age_d "$ENC_DIR/index.tsv.gz.age" | gunzip -c \
-      | P="$esc_only" awk -F'\t' \
-          'NF==2 && ($2 == ENVIRON["P"] || index($2, ENVIRON["P"] "/") == 1) { print $1 }' \
-      | sort -un || true)
-    (( ${#hits[@]} )) \
-      || die "'$only' is not in the index — check '$PROG index ${only##*/}' for the exact path, or pass --disc N. Paths are relative to the archive root, with no leading '/'."
-    for d in "${hits[@]}"; do
-      # Bounded for the same reason as num_arg: this field comes off the
-      # index, $((10#$d)) wraps at 2^64, and the warning below would then name
-      # a disc number the image lookup never used.
-      [[ "$d" =~ ^[0-9]{1,9}$ ]] || continue
-      e="$(printf '%s/disc%02d.squashfs.age' "$ENC_DIR" "$((10#$d))")"
-      if [[ -f "$e" ]]; then sel+=( "$e" )
-      else warn "'$only' is partly on disc $d, whose image is not in $ENC_DIR"; fi
-    done
-    # ${hits[*]} is field 1 of the decrypted index, which came off a disc: the
-    # loop above drops anything that is not a plain number before using it as a
-    # disc, but these two lines PRINT it, so they escape it (see esc_controls).
-    (( ${#sel[@]} )) || die "'$only' is on disc(s) $(esc_str "${hits[*]}"), none of which have been ingested"
-    encs=( "${sel[@]}" )
-    step "'$only' is on disc(s) $(esc_str "${hits[*]}")"
+  #
+  # This is narrowByIndex in go/internal/restore/locate.go, down to its refusal
+  # to fail over the index itself. An index that is not staged, fails its
+  # recorded hash, or will not decrypt and decompress is a warning, and the
+  # restore searches every image it was going to search anyway — it used to
+  # die here "--only needs the encrypted index" when there was none, and when
+  # there was one that would not read it reported the path "not in the index",
+  # sending the operator off to look for a file the index had never been able
+  # to answer for. Worse, the `|| true` that hid age's and gunzip's status
+  # believed whatever rows came out before the damage, so an index rotted past
+  # its first age chunk narrowed a directory to the discs named in the readable
+  # part and restored part of it, exit 0.
+  #
+  # With --disc N as well, the index is still asked, but it can only refuse
+  # that disc, never widen the choice: when it is sure the path is somewhere
+  # else the run stops before a whole image is hashed and decrypted to find out
+  # the same thing. This used to skip the index whenever --disc was given, and
+  # for a directory whose files are all on another disc the skeleton copy of it
+  # on disc N then satisfied the pre-check below, so the run restored an empty
+  # directory and said "restore complete" where the Go reader refuses.
+  if [[ -n "$only" ]]; then
+    local -a discs=() sel=()
+    local -A bynum=()
+    local d e line esc_only out="" irc=0 here=0 unparsed=0 unread="" idx="$ENC_DIR/index.tsv.gz.age"
+    if [[ ! -f "$idx" ]]; then
+      warn "no index.tsv.gz.age in $ENC_DIR, so there is nothing to say which disc(s) hold '$only'"
+      unread=1
+    elif ! check_index_intact; then
+      warn "the encrypted index could not be read: $INDEX_FAULT"
+      unread=1
+    else
+      # Resolve the disc by EXACT path, not by 'index'-style substring search:
+      # a fuzzy hit selects a disc for --only notes when only notes2025 exists,
+      # and the extraction filter downstream is exact — so the run used to
+      # report "restore complete" having written nothing. The index stores
+      # paths with backslash, tab and newline escaped (backslash first — the
+      # same order the writer uses; any other order fails to round-trip), so
+      # the pattern is escaped the same way, then matched as the whole path or
+      # as a directory prefix of one. ENVIRON, not -v: awk -v mangles backslash
+      # sequences. The status is kept — pipefail carries age's or gunzip's
+      # failure out of the substitution — and awk and sort read to the end, so
+      # no early exit can fake one.
+      #
+      # Field 1 came off a disc, so awk takes it apart before anything else
+      # sees it: a run of ASCII digits (awk under C reads [0-9] as nothing
+      # else), leading zeros dropped, 1 or more, as indexfmt.ParseLine
+      # requires, and at most nine digits, for the reason num_arg gives —
+      # $((10#...)) wraps at 2^64, and a wrapped field would name a disc the
+      # image lookup never used. It used to be `sort -un` on the raw field and
+      # the test afterwards, and sort keeps the FIRST of two numerically equal
+      # lines: a row reading 00000000001, which Go takes as disc 1, came out in
+      # place of the row reading 1 and was then dropped as too long, so the
+      # path was "not in the index". Every row is parsed, not only the matching
+      # ones, so that the rows that do not parse are counted and reported as
+      # indexDiscs in go/internal/restore/locate.go reports them; the count
+      # comes last, on a line of its own that starts with '#'. ParseLine reads
+      # a few rows that this cannot use — a '+' before the number, a number
+      # past 999999999, a raw tab in the path — and they count here, which is
+      # what they are to this reader. The writer produces none of them.
+      esc_only="${only//\\/\\\\}"
+      esc_only="${esc_only//$'\t'/\\t}"
+      esc_only="${esc_only//$'\n'/\\n}"
+      out="$(age_d "$idx" | gunzip -c \
+        | P="$esc_only" LC_ALL=C awk -F'\t' '
+            $0 == "" { next }
+            NF != 2 || $2 == "" || $1 !~ /^[0-9]+$/ { bad++; next }
+            { d = $1; sub(/^0+/, "", d) }
+            d == "" || length(d) > 9 { bad++; next }
+            ($2 == ENVIRON["P"] || index($2, ENVIRON["P"] "/") == 1) && !(d in seen) { seen[d] = 1; print d }
+            END { print "#" bad + 0 }' \
+        | LC_ALL=C sort -n)" || irc=$?
+      if (( irc != 0 )); then
+        warn "the encrypted index could not be read (age or gunzip exited $irc) — $(sidecar_repair_hint 0)"
+        unread=1
+      fi
+    fi
+    if [[ -n "$unread" ]]; then
+      if [[ -z "$onedisc" ]]; then
+        warn "every one of the ${#encs[@]} ingested image(s) will be decrypted to look for it; pass --disc N to restrict that to one disc"
+      fi
+    else
+      # What awk printed: the distinct discs holding the path, ascending, and
+      # the '#' line. A row with no usable number is no evidence of where the
+      # path is, so a path whose rows are all like that counts as unlisted —
+      # it used to be "on disc(s) 0", and with --disc it would have refused
+      # the disc with "pass --disc 0".
+      while IFS= read -r line; do
+        case "$line" in
+          '#'*) unparsed="${line#\#}" ;;
+          ?*)   discs+=( "$line" ) ;;
+        esac
+      done <<<"$out"
+      if (( unparsed > 0 )); then
+        warn "$unparsed record(s) in index.tsv.gz.age do not parse and were ignored; $(sidecar_repair_hint 0) if a path seems to be missing"
+      fi
+      if [[ -n "$onedisc" ]]; then
+        for d in ${discs[@]+"${discs[@]}"}; do
+          if (( d == onedisc )); then here=1; fi
+        done
+        if (( ${#discs[@]} == 0 )); then
+          warn "the index does not list '$only'; searching disc $onedisc anyway, because --disc names it"
+        elif (( here )); then
+          step "the index puts '$only' on disc(s) ${discs[*]}"
+        else
+          die "the index puts '$only' on disc(s) ${discs[*]}, not on disc $onedisc — drop --disc, or pass --disc ${discs[0]}"
+        fi
+      else
+        # The sentence on the end used to add "with no leading '/'", from when
+        # a leading slash made a path miss here; it is stripped with the rest
+        # of the spelling now, so it is never the reason.
+        (( ${#discs[@]} )) \
+          || die "'$only' is not in the index — check '$PROG index ${only##*/}' for the exact path, or pass --disc N. Paths are relative to the archive root, not the path the file had on the machine that was backed up."
+        # Each disc's image is found by its NUMBER among the images this
+        # restore was going to work through, as narrowByIndex finds it in
+        # listNumbered's: a disc staged as disc001 is disc 1 here, as it is to
+        # check_complete and to Go. Building the name disc%02d instead found
+        # nothing for such a disc, warned that it had not been ingested, and
+        # refused a path the rest of the restore could see. Where two names
+        # claim one number, the one listed later wins, as in Go's map.
+        for e in "${encs[@]}"; do bynum[$(disc_number_of "${e##*/}")]="$e"; done
+        for d in "${discs[@]}"; do
+          if [[ -n "${bynum[$d]:-}" ]]; then sel+=( "${bynum[$d]}" )
+          else warn "'$only' is partly on disc $d, whose image is not in $ENC_DIR"; fi
+        done
+        (( ${#sel[@]} )) || die "'$only' is on disc(s) ${discs[*]}, none of which have been ingested"
+        encs=( "${sel[@]}" )
+        step "'$only' is on disc(s) ${discs[*]}"
+      fi
+    fi
   fi
 
   # The images to be decrypted are sitting right there, so measure them rather
@@ -2150,14 +3086,34 @@ cmd_restore() {
     # (go/internal/restore/extract.go): an image this path is not on extracts
     # nothing at all, so there is nothing for the guard to protect and no
     # reason for an unrelated link in the destination to stop the run.
-    local precheck="$only"
+    #
+    # awk reads the listing to its end rather than exiting at the first match,
+    # and unsquashfs's own status is taken apart from awk's before awk's answer
+    # is believed — the two things pathsPresent does by draining the listing
+    # and then checking the child. Exiting early closed the pipe under
+    # unsquashfs, which neither ignores nor handles SIGPIPE, so it died on its
+    # next write as soon as a few kilobytes of listing followed the match, and
+    # pipefail turned that 141 into "not on this image": on any real disc a
+    # path near the top of the listing was reported absent, and a directory
+    # spanning discs was silently skipped on the disc holding most of it while
+    # the run went on to say "restore complete". And a listing that really
+    # failed — an unsquashfs built without the image's compression, say — said
+    # exactly the same thing with its error sent to /dev/null, where list_image
+    # stops on the same failure with the error in view. Now it stops here too,
+    # and the decrypted image stays where it is, as list_image leaves it.
+    local precheck="$only" lrc=0 arc=0
     if [[ "$only" == *$'\n'* || "$only" == *$'\r'* ]]; then precheck=""; fi
-    if [[ -n "$precheck" ]] && ! unsquashfs -l "$img" 2>/dev/null \
-        | P="squashfs-root/$only" awk \
-            '$0 == ENVIRON["P"] || index($0, ENVIRON["P"] "/") == 1 { f=1; exit } END { exit !f }'; then
-      step "$only is not on $(esc_str "$(basename "$img")")"
-      if (( ! KEEP_IMAGES )); then rm -f -- "$img"; fi
-      continue
+    if [[ -n "$precheck" ]]; then
+      unsquashfs -l "$img" | P="squashfs-root/$only" LC_ALL=C awk \
+          '!f && ($0 == ENVIRON["P"] || index($0, ENVIRON["P"] "/") == 1) { f = 1 } END { exit !f }' \
+        || { lrc=${PIPESTATUS[0]} arc=${PIPESTATUS[1]}; }
+      (( lrc == 0 )) \
+        || die "could not list the contents of $(esc_str "$(basename "$img")"): 'unsquashfs -l' exited $lrc (its own error is above), so whether '$only' is on it cannot be told. An unsquashfs that calls the image's compression unsupported needs a newer squashfs-tools — the Go reader runs the same unsquashfs and would fail the same way; otherwise fix or re-ingest that image and retry."
+      if (( arc != 0 )); then
+        step "$only is not on $(esc_str "$(basename "$img")")"
+        if (( ! KEEP_IMAGES )); then rm -f -- "$img"; fi
+        continue
+      fi
     fi
     # Does this image belong to the set the staged index describes? Asked
     # before the symlink guard because it is the more fundamental question —
@@ -2201,9 +3157,18 @@ cmd_restore() {
     # of the image — chosen by whoever could plant one file in the backed-up
     # tree. Its output goes through esc_controls for the same reason ingest's
     # names do, rather than straight to the terminal.
+    #
+    # The first three lines are picked by an awk that reads the whole log, not
+    # by `grep | head -3`: under pipefail and errexit, head exiting after its
+    # third line left grep to die of SIGPIPE on a log of more than a few
+    # kilobytes, and that 141 ended the whole restore on the spot — no failure
+    # message, the next disc never reached, and every rerun stopping on the same
+    # disc — where this branch and the README both promise a warning and the
+    # next disc. A destination that refuses xattrs or special files is exactly
+    # what writes a log that long.
     if (( urc == 2 )); then
       warn "unsquashfs reported non-fatal errors on $(esc_str "$(basename "$img")") — see $ulog"
-      grep -v '^$' "$ulog" | head -3 | esc_controls | sed 's/^/    /' >&2
+      LC_ALL=C awk '$0 != "" && ++n <= 3' "$ulog" | esc_controls | sed 's/^/    /' >&2
     elif (( urc != 0 )); then
       warn "unsquashfs output:"; esc_controls < "$ulog" | sed 's/^/    /' >&2
       die "unsquashfs failed on $(esc_str "$(basename "$img")") (exit $urc)"
@@ -2225,13 +3190,31 @@ cmd_restore() {
   [[ -z "$only" ]] || (( found )) \
     || die "'$only' was not found on any ingested disc — check '$PROG index $only'"
 
+  # A restore of a set with discs missing must not end on the line a complete
+  # one ends on. The tree it produced has the right shape and the wrong
+  # contents — every disc carries the whole skeleton — and on a multi-disc run
+  # the MISSING warning it opened with has long scrolled away, a few status
+  # lines per disc and hours later, so this is the last chance to say so.
+  # reportOutcome in go/internal/restore/extract.go, word for word; this used
+  # to print "restore complete" either way.
+  local closing="restore complete"
+  if (( partial )); then
+    warn "this restore was PARTIAL: disc(s) $SET_MISSING of $SET_WANT were not in the staging area"
+    warn "files that lived only on those discs are NOT in $dest, and the empty directories left behind do not show it"
+    warn "ingest the missing disc(s) and run the same restore again to fill them in"
+    closing="partial restore complete"
+  fi
+
+  # The rm -rf is a command to paste, so the directory goes into it through %q
+  # as one shell word: RESTORE_DIR is $STAGING/restore, and a STAGING of
+  # "/srv/backup tmp" printed bare would delete /srv/backup.
   cat >&2 <<EOF
 
-$(ok "restore complete: $dest")
+$(ok "$closing: $dest")
 
   $RESTORE_DIR holds decrypted (plaintext) images: every one of them with
   KEEP_IMAGES=1, otherwise only what a failed run left behind.
-  Remove them when done:  rm -rf $RESTORE_DIR
+  Remove them when done:  rm -rf $(printf '%q' "$RESTORE_DIR")
 
 EOF
 }
@@ -2244,6 +3227,34 @@ cmd_mount() {
   local n mp="${2:-}"
   [[ -n "${1:-}" && -n "$mp" ]] || die "usage: $PROG mount <disc-number> <mount-point>"
   n="$(num_arg "$1" 'disc number')"
+  # A mount point that is itself a symlink is refused: mount(8) run as root
+  # resolves the whole path and mounts on the link's TARGET, so a link left at
+  # /shared/browse pointing at /etc gets the image mounted over /etc, and
+  # mkdir -p takes the link for an existing directory without a word. Mount in
+  # go/internal/restore/mount.go refuses the same paths with the same words.
+  #
+  # dir_path first, because "link/" and "link/." are resolved through the link
+  # before [[ -L ]] sees them, and the same spelling is what mkdir and mount get
+  # below, so the check and the act are about one path. Go's dirPath is this
+  # function rule for rule rather than filepath.Clean, which would collapse a
+  # "link/../x" lexically and mount somewhere the kernel, and this script, do
+  # not. It is still a name test followed by an act — a link planted in the gap
+  # is followed, which nothing can close while mount(8) takes a path.
+  #
+  # Before the root check, so the refusal is the same for everyone and can be
+  # tested without root, and before secure_staging, as Mount orders it too, so
+  # neither reader touches staging for a run it is about to refuse.
+  #
+  # The trailing "x" keeps the path's own bytes. $(...) drops every trailing
+  # newline, so "browse/<newline>" came back as "browse/" — which [[ -L ]]
+  # answers through the link, and which mkdir and mount then followed onto its
+  # target — and "browse<newline>" as "browse", a different file. Go keeps
+  # the newline, so the two readers would also have mounted in different
+  # places. dir_path prints no newline of its own for the "x" to keep.
+  mp="$(dir_path "$mp"; printf x)"; mp="${mp%x}"
+  if [[ -L "$mp" ]]; then
+    die "mount point $(esc_str "$mp") is a symlink (-> $(esc_str "$(readlink -- "$mp" 2>/dev/null || true)")); mount(8) follows it and would mount the image over whatever it points at — pass the directory itself"
+  fi
   (( EUID == 0 )) || die "mounting requires root"
   secure_staging "$ENC_DIR" "$RESTORE_DIR"
   resolve_identity
@@ -2251,10 +3262,20 @@ cmd_mount() {
   enc="$(printf '%s/disc%02d.squashfs.age' "$ENC_DIR" "$n")"
   [[ -f "$enc" ]] || die "no image for disc $n in $ENC_DIR"
   prepare_image "$enc"; img="$PREPARED_IMG"
+  # Created under the umask 077 secure_staging set, so every directory made here
+  # is 0700, as Mount's MkdirAll makes it: the parents decide whether another
+  # account can reach the decrypted tree at all.
   mkdir -p -- "$mp"
-  mount -o loop,ro "$img" "$mp" || die "mount failed"
+  # nosuid,nodev because the image is a backup, not this host's system: ro alone
+  # leaves the kernel's suid and dev defaults on, so a setuid-root binary from a
+  # backup of / — an old sudo with a known local root bug — or a device node in
+  # the image would act on this host for any account that can reach the mount.
+  # Browsing and copying out lose nothing; the reasoning is at length on
+  # mountArgs in go/internal/restore/mount.go, which passes this same list. And
+  # "--", so a mount point with a leading dash is not read as options.
+  mount -o loop,ro,nosuid,nodev -- "$img" "$mp" || die "mount failed"
   ok "disc $n mounted read-only at $mp"
-  step "unmount with: umount $mp"
+  step "unmount with: umount $(printf '%q' "$mp")"
 }
 
 # Render C0 control bytes, DEL and the C1 controls visibly, sparing the tab that
@@ -2369,10 +3390,22 @@ esc_out() { if [[ -t 1 ]]; then esc_controls; else cat; fi; }
 # the newline between them, so a newline INSIDE the string is turned into the
 # two characters \n first; esc_controls leaves a backslash alone, so the result
 # is exactly what a single pass over the bytes would give.
-esc_str() { local s="${1//$'\n'/\\n}"; printf '%s\n' "$s" | esc_controls; }
+#
+# awk joins the lines with \n, one record at a time and only when there is a
+# newline to join. ${1//$'\n'/\\n} gave the same string in time quadratic in
+# its length, because for every replacement bash's pattern matcher walks the
+# rest of the string again: verify-disc prints a listed name it cannot match,
+# and one line of an escaped SHA512SUMS unescapes to half a million newlines,
+# which took most of a minute to print.
+esc_str() {
+  if [[ "$1" != *$'\n'* ]]; then printf '%s\n' "$1" | esc_controls; return; fi
+  printf '%s\n' "$1" | LC_ALL=C awk '{ printf "%s%s", (NR > 1 ? "\\n" : ""), $0 } END { print "" }' \
+    | esc_controls
+}
 
 cmd_index() {
-  need age
+  # sha512sum for check_index_intact, which hashes the index before it is read.
+  need age; need sha512sum
   # Before resolve_identity, for the reason cmd_restore gives: the identity a
   # public set is read with comes out of $ENC_DIR, and so does the ciphertext
   # this decrypts, so that directory has to be one of ours before either is
@@ -2384,16 +3417,72 @@ cmd_index() {
   resolve_identity
   local idx="$ENC_DIR/index.tsv.gz.age"
   [[ -f "$idx" ]] || die "no index at $idx — run '$PROG ingest' first"
+  # Before a byte of it is believed, as Index in go/internal/restore/extract.go
+  # does: a mismatch is the index (or its sidecar) having rotted, and par2 can
+  # put either back on the spot.
+  check_index_intact || die "$INDEX_FAULT"
   local pattern="${1:-}"
+  local -a ps=()
   # gunzip, matching build_index: the index is deliberately the one artifact a
   # person can unpack with tooling that predates this script by thirty years.
+  #
+  # When the pipeline fails, its statuses are read from the RIGHT, because a
+  # failure on the output side explains everything to its left: `index | head`
+  # closes the pipe, esc_out dies of it, and everything upstream then fails to
+  # write — of SIGPIPE ordinarily, or with EPIPE and an exit of 1 or 2 where
+  # SIGPIPE is ignored, as systemd services ignore it — none of which says
+  # anything about the index. Only once the output side and the filter are
+  # accounted for is a failing age or gunzip the index failing to read, and
+  # only grep's 1 with everything else clean is a search that found nothing.
+  # Both used to come out as "no match": a rotted index, or one the identity
+  # cannot open, was reported as an archive without the file, even after
+  # printing the rows that came out before the damage.
   if [[ -z "$pattern" ]]; then
-    age_d "$idx" | gunzip -c | esc_out
+    age_d "$idx" | gunzip -c | esc_out || {
+      ps=( "${PIPESTATUS[@]}" )
+      (( ps[2] == 0 )) || return 1
+      die "could not read $idx (age exited ${ps[0]}, gunzip ${ps[1]}) — $(sidecar_repair_hint 0), then retry"; }
   else
-    # pipefail carries grep's "no match" through esc_out, so the || still fires.
-    age_d "$idx" | gunzip -c | grep -i -- "$pattern" | esc_out || {
-      warn "no match for '$pattern'"; return 1; }
+    age_d "$idx" | gunzip -c | index_match "$pattern" | esc_out || {
+      ps=( "${PIPESTATUS[@]}" )
+      (( ps[3] == 0 && ps[2] <= 1 )) || return 1
+      (( ps[0] == 0 && ps[1] == 0 )) \
+        || die "could not read $idx (age exited ${ps[0]}, gunzip ${ps[1]}) — $(sidecar_repair_hint 0), then retry"
+      warn "no match for '$(esc_str "$pattern")'"; return 1; }
   fi
+}
+
+# index_match PATTERN — the index rows containing PATTERN, matched as
+# filterIndex in go/internal/restore/extract.go matches them: as a literal,
+# case-insensitive substring, and never as a regular expression. Exits 1 when
+# nothing matched, as grep does.
+#
+# -F, because this was `grep -i` and so read the pattern as a basic regular
+# expression: a name with a bracket in it — "notes[1].txt", "Photo [2019].jpg"
+# — matched nothing, an unbalanced one ("a[1") made grep fail outright, and
+# both came out as "no match" for a file that is in the index — from the very
+# command this script's own refusals send the operator to ('check brb.sh index
+# ...') — while a dot or a star quietly matched more than was typed.
+#
+# -a, because GNU grep in a UTF-8 locale takes a row holding a name that is not
+# valid UTF-8 — an old Latin-1 name, say — for binary data, prints "binary file
+# matches" in its place, and exits 0: the row is neither shown nor reported
+# missing. GNU and BSD grep accept the flag. busybox grep is believed to accept
+# it and ignore it, having no binary-file test to switch off — read from its
+# source, not tested.
+#
+# A newline cannot be in the pattern: grep -F would split it into several
+# patterns and print any row matching one of them, and no row can contain one,
+# since the index escapes it. Such a pattern matches nothing — after the index
+# has been read to the end like any other, so that an index that will not read
+# still says so, as it does in Go.
+#
+# What is left of the difference is case folding, which grep takes from the
+# locale (busybox's grep -F -i, by its source, from ASCII alone) and Go from
+# Unicode; README's table of reader differences has it.
+index_match() {
+  if [[ "$1" == *$'\n'* ]]; then cat >/dev/null; return 1; fi
+  grep -a -i -F -- "$1"
 }
 
 cmd_list() {
@@ -2439,10 +3528,10 @@ COMMANDS
                              says its disc holds, because the discs of one set
                              have to agree with each other
                                --only <path>   extract one path, relative to the
-                                               archive root, no leading '/';
-                                               located via the encrypted index,
-                                               so only the discs holding it are
-                                               decrypted
+                                               archive root (a leading '/' or
+                                               './' is dropped); located via
+                                               the encrypted index, so only the
+                                               discs holding it are decrypted
                                --disc <n>      only this disc
   mount <n> <mountpoint>     decrypt one disc's image and mount it read-only
   list <n>                   list the contents of one disc's image
@@ -2484,7 +3573,12 @@ RESTORING WITHOUT THIS SCRIPT
 
     sha512sum -c discNN.squashfs.age.sha512 || par2 repair -- discNN.squashfs.age.par2
     age -d -i identity.txt -o discNN.squashfs discNN.squashfs.age
-    mount -o loop,ro discNN.squashfs /mnt          # needs only the kernel
+    mkdir -p image && sudo mount -o loop,ro,nosuid,nodev discNN.squashfs image
+
+  The mount needs only the kernel. Not over /mnt if the disc is mounted there:
+  the image would hide the disc's data/ directory. And nosuid,nodev because ro
+  alone leaves a setuid program or a device node in the backup working on the
+  machine that reads it.
 
   If a .sha512 sidecar has rotted but par2 says the image is whole, it is the
   sidecar that is corrupt: repair it with 'par2 repair -- sidecars.par2' from

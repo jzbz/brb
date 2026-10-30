@@ -14,13 +14,17 @@ import (
 )
 
 // Burn writes a staged disc set to optical media. which is a disc number, a
-// range ("7-20", "7-"), or "all", exactly as brb.sh accepts them.
+// range ("7-20", "7-"), or "all" — the selection `brb iso` takes too (see
+// iso.ParseRange). There is no shell counterpart: brb.sh is the reader only,
+// and refuses burn by name.
 //
 // The ISOs are not assumed to exist. Under the default ISO_MODE=ondemand
 // nothing has built them, and under KEEP_ISOS=0 each one is deleted again as
-// soon as its disc is written, so what a set is made of is its disc
-// DIRECTORIES: the queue comes from those, each disc's ISO is built at the
-// moment it is needed, and gaps in the numbering are simply a shorter queue.
+// soon as its disc is written — unless there is no disc directory to rebuild
+// it from, when it is kept (see burnOne) — so what a set is made of is its
+// disc DIRECTORIES: the queue comes from those, each disc's ISO is built at
+// the moment it is needed, and gaps in the numbering are simply a shorter
+// queue. Only a tree carried in as ISOs alone is queued from its ISOs.
 //
 // The disc count in the label and in "disc 3 of 20" comes from MANIFEST.txt for
 // the same reason — a set half burned would otherwise renumber itself.
@@ -33,6 +37,20 @@ func Burn(ctx context.Context, o Options, which string) error {
 		return err
 	}
 	defer unlock()
+	// lockStaging secures the staging root and nothing under it, and burn
+	// writes into iso/ — each image is built there, burned from there and
+	// deleted there — and masters every image from discs/. Both are secured
+	// here as backup's preflight and `brb iso` secure them: a symlinked iso/
+	// used to have each ISO built, burned and deleted wherever the link
+	// pointed, and a hand-made one kept whatever mode it was made with while
+	// holding a second copy of every disc. A tree backup laid out is refused
+	// nothing new; one carried in as ISOs only gains an empty discs/.
+	//
+	// Before the tool requirement, so the refusal is about the tree whatever
+	// is installed, and a machine without xorriso can test it.
+	if err := o.secureStaging(o.dirs().Discs, o.dirs().ISO); err != nil {
+		return err
+	}
 	if err := o.Tools.Require(tools.Xorriso); err != nil {
 		return fmt.Errorf("restore: %w", err)
 	}
@@ -79,8 +97,15 @@ func Burn(ctx context.Context, o Options, which string) error {
 				return fmt.Errorf("restore: %w", err)
 			}
 			if !more {
-				o.UI.Warn("stopped after disc %d", queue[i-1])
-				return nil
+				// Stopping is not the end of the report. Whatever was burned
+				// before this still has to be counted and read back, so the
+				// queue is cut to the discs actually offered and the loop is
+				// left for the closing lines below — returning here used to
+				// skip both, after real burns. "before" and this disc's number,
+				// not "after" the previous one: that one may have been skipped.
+				o.UI.Warn("stopped before disc %d", n)
+				queue = queue[:i]
+				break
 			}
 		}
 		wrote, err := o.burnOne(ctx, n, total)
@@ -93,7 +118,9 @@ func Burn(ctx context.Context, o Options, which string) error {
 	}
 	// The closing line is the one that ends up pasted into notes, so it must
 	// count what reached the media, not what was offered: a declined per-disc
-	// confirmation skips the burn and stays in the queue.
+	// confirmation skips the burn and stays in the queue. A campaign stopped
+	// early counts the discs it got to; the warning above says where it
+	// stopped.
 	if burned == len(queue) {
 		o.UI.OK("burned %d disc(s)", burned)
 	} else {
@@ -117,8 +144,8 @@ func (o Options) isoOptions() iso.Options {
 // and then — only then — drops the ISO again. burned reports whether anything
 // actually reached the medium.
 //
-// A declined confirmation is not an error: it skips that disc, exactly as
-// brb.sh does.
+// A declined confirmation is not an error: it skips that disc, and the
+// campaign moves on to the next.
 func (o Options) burnOne(ctx context.Context, n, total int) (burned bool, err error) {
 	path, err := o.isoOptions().Ensure(ctx, n, total)
 	if err != nil {
@@ -158,6 +185,18 @@ func (o Options) burnOne(ctx context.Context, n, total int) (burned bool, err er
 	// copy in staging has served its purpose. Every path above that did not burn
 	// has already returned.
 	if o.Cfg.KeepISOs {
+		return true, nil
+	}
+	// The ISO is a cache only while its disc directory is there to build it
+	// from again. In a staging tree carried here as ISOs and nothing else —
+	// what `brb iso all` makes, and what iso.DiscNumbers falls back to — it is
+	// the only copy of the disc this machine holds, and the disc just written
+	// has not been read back. Deleting it then, with a promise that it could
+	// be rebuilt from a directory that does not exist, left a disc that fails
+	// verify-disc with nothing to burn again from.
+	if !o.isoOptions().CanRebuild(n) {
+		o.UI.Step("kept %s — it is the only copy here (there is no disc directory in %s to rebuild it "+
+			"from); delete it yourself once the disc reads back", filepath.Base(path), o.dirs().Discs)
 		return true, nil
 	}
 	if err := os.Remove(path); err != nil && !errors.Is(err, fs.ErrNotExist) {

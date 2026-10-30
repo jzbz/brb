@@ -89,6 +89,28 @@ func (o Options) Path(n int) string { return filepath.Join(o.Cfg.Dirs().ISO, Nam
 // sourceDir returns the disc directory disc n's ISO is built from.
 func (o Options) sourceDir(n int) string { return filepath.Join(o.Cfg.Dirs().Discs, dirName(n)) }
 
+// CanRebuild reports whether disc n's ISO can be built again from staging,
+// which is whether its disc directory is there.
+//
+// Usually it is, and the ISO is a cache: burn deletes it after a successful
+// burn and builds it again for a second copy. A staging tree carried to another
+// machine as ISOs and nothing else — what `brb iso all` is for, and what
+// DiscNumbers falls back to — has no disc directories at all, and there each
+// ISO is the only copy of its disc the machine holds. Every caller that would
+// delete one, or skip a check because it cannot be repeated, asks this first.
+//
+// The directory is looked at with Lstat, so a symlink at its name is not a
+// disc directory — which is how DiscNumbers already counts them, a DirEntry's
+// type being the link's own. Backup never makes one, and securing discs/ stops
+// at discs/ itself, so following it would master an image from whatever tree
+// the link names, label it as this set, and measure an existing ISO against
+// that tree; and in burn it would have the only copy deleted on the strength
+// of a directory that is not in staging at all.
+func (o Options) CanRebuild(n int) bool {
+	st, err := os.Lstat(o.sourceDir(n))
+	return err == nil && st.IsDir()
+}
+
 // BuildOne builds one disc's ISO from the directory already laid out for it,
 // overwriting any ISO that is there.
 //
@@ -113,13 +135,21 @@ func (o Options) BuildOne(ctx context.Context, n, total int) error {
 	if err := ctx.Err(); err != nil {
 		return fmt.Errorf("iso: aborted: %w", err)
 	}
+
+	// The missing disc directory is answered before the missing tool: no
+	// xorriso can build an image from a directory that is not there, so it is
+	// the refusal the operator has to act on first, and it is one a machine
+	// without xorriso can test.
+	src := o.sourceDir(n)
+	if !o.CanRebuild(n) {
+		if target, err := os.Readlink(src); err == nil {
+			return fmt.Errorf("iso: %s is a symlink (-> %s), not a disc directory — an image is mastered "+
+				"only from the directory backup laid out, never from wherever a link points", src, target)
+		}
+		return fmt.Errorf("iso: no disc directory at %s — run 'brb backup' first", src)
+	}
 	if err := o.Tools.Require(tools.Xorriso); err != nil {
 		return fmt.Errorf("iso: %w", err)
-	}
-
-	src := o.sourceDir(n)
-	if st, err := os.Stat(src); err != nil || !st.IsDir() {
-		return fmt.Errorf("iso: no disc directory at %s — run 'brb backup' first", src)
 	}
 	isoDir := o.Cfg.Dirs().ISO
 	if err := os.MkdirAll(isoDir, 0o700); err != nil {
@@ -212,15 +242,35 @@ func (o Options) remove(path string) {
 // rebuilding it is strictly better than burning it. It used to be enough for
 // the file to be non-empty, which is how a truncated ISO got burned.
 //
-// When the disc directory is gone the bound cannot be measured and the ISO
-// cannot be rebuilt either; a non-empty file is then taken as it is, since
-// refusing would only leave the operator with nothing at all.
+// When the disc directory is gone the lower bound cannot be measured and the
+// ISO cannot be rebuilt either; a non-empty file that fits the media is then
+// taken as it is, since refusing would only leave the operator with nothing at
+// all. The upper bound needs nothing but the file and the configuration, so it
+// still applies — see complete.
+//
+// The ISO itself is looked at with Lstat, and a symlink at its name is never
+// what gets burned. Ensure is the one place an existing ISO is accepted rather
+// than rebuilt — `brb iso` and an eager backup always rebuild, and MakeISO's
+// removal of the old file acts on a link, never on its target — so following
+// a link here handed the burner whatever file it named, in or out of staging,
+// and a link to a big enough file passed both bounds. With the disc directory
+// there, the link is replaced by a fresh image built in iso/; without it,
+// there is nothing to build from, and the refusal says to copy the image in.
 func (o Options) Ensure(ctx context.Context, n, total int) (string, error) {
 	if err := o.check(); err != nil {
 		return "", err
 	}
 	path := o.Path(n)
-	switch st, err := os.Stat(path); {
+	switch st, err := os.Lstat(path); {
+	case err == nil && st.Mode()&fs.ModeSymlink != 0:
+		target, _ := os.Readlink(path)
+		if !o.CanRebuild(n) {
+			return "", fmt.Errorf("iso: %s is a symlink (-> %s), and burning it would put whatever "+
+				"file it points at on the disc; there is no disc directory at %s to rebuild it from, "+
+				"so copy the image itself into %s", path, target, o.sourceDir(n), o.Cfg.Dirs().ISO)
+		}
+		o.UI.Warn("%s is a symlink (-> %s); building a fresh image in its place rather than burning "+
+			"whatever it points at — the link is replaced, its target is left alone", Name(n), target)
 	case err == nil && st.Mode().IsRegular() && st.Size() > 0:
 		complete, err := o.complete(ctx, n, st.Size())
 		if err != nil {
@@ -239,8 +289,9 @@ func (o Options) Ensure(ctx context.Context, n, total int) (string, error) {
 }
 
 // complete reports whether an existing ISO of size bytes passes both bounds
-// BuildOne applies to a fresh one. A missing disc directory counts as complete
-// — see Ensure — and a short file is reported, with why it will be rebuilt.
+// BuildOne applies to a fresh one. A missing disc directory skips only the
+// lower bound — see Ensure — and a short file is reported, with why it will be
+// rebuilt.
 //
 // The upper bound is an error rather than a rebuild, which is the one place
 // this differs from BuildOne. An ISO that is too big for the media was built
@@ -251,25 +302,43 @@ func (o Options) Ensure(ctx context.Context, n, total int) (string, error) {
 // setting to change. Without it, Ensure applied only the lower bound and burn
 // handed the oversized image straight to xorriso — the operator found out with
 // a blank already in the tray.
+//
+// It is checked first, ahead of the missing-directory exception and ahead of
+// the lower bound. The exception's reason — the bound cannot be measured, and
+// refusing would leave nothing — is true of the lower bound only: this one
+// needs nothing but the file and the configuration, and its refusal keeps the
+// file. An ISO-only tree carried to a machine set up for smaller blanks used to
+// skip it and hand the burner an image that cannot fit. Ahead of the lower
+// bound because a file both short and oversized means a tree bigger than the
+// media, which no rebuild can fit either; and the rebuild is offered only
+// where one could fit — never with no disc directory, where deleting the file
+// would destroy the only copy.
 func (o Options) complete(ctx context.Context, n int, size int64) (bool, error) {
-	src := o.sourceDir(n)
-	if st, err := os.Stat(src); err != nil || !st.IsDir() {
-		return true, nil
+	haveSrc := o.CanRebuild(n)
+	var srcSize int64
+	if haveSrc {
+		var err error
+		if srcSize, err = fsx.DirBytes(ctx, o.sourceDir(n)); err != nil {
+			return false, fmt.Errorf("iso: %w", err)
+		}
 	}
-	srcSize, err := fsx.DirBytes(ctx, src)
-	if err != nil {
-		return false, fmt.Errorf("iso: %w", err)
+	if capacity := o.Cfg.Capacity(); capacity > 0 && size > capacity {
+		rebuild := ""
+		if haveSrc && srcSize <= capacity {
+			rebuild = fmt.Sprintf(", or delete %s and let this run rebuild it", o.Path(n))
+		}
+		return false, fmt.Errorf("iso: disc %d ISO is %s, larger than the %s media this run is "+
+			"configured for — it was built for larger media, so set DISC_TYPE (or "+
+			"DISC_CAPACITY_BYTES) to match the blanks you are burning%s",
+			n, ui.HumanBytes(size), ui.HumanBytes(capacity), rebuild)
+	}
+	if !haveSrc {
+		return true, nil
 	}
 	if size < srcSize {
 		o.UI.Warn("%s is %s but its disc directory holds %s — the file is truncated (a run died while "+
 			"writing it); rebuilding it rather than burning it", Name(n), ui.HumanBytes(size), ui.HumanBytes(srcSize))
 		return false, nil
-	}
-	if capacity := o.Cfg.Capacity(); capacity > 0 && size > capacity {
-		return false, fmt.Errorf("iso: disc %d ISO is %s, larger than the %s media this run is "+
-			"configured for — it was built for larger media, so set DISC_TYPE (or "+
-			"DISC_CAPACITY_BYTES) to match the blanks you are burning, or delete %s and let "+
-			"this run rebuild it", n, ui.HumanBytes(size), ui.HumanBytes(capacity), o.Path(n))
 	}
 	return true, nil
 }
@@ -299,9 +368,6 @@ func Build(ctx context.Context, o Options, spec string) error {
 	if err := o.check(); err != nil {
 		return err
 	}
-	if err := o.Tools.Require(tools.Xorriso); err != nil {
-		return fmt.Errorf("iso: %w", err)
-	}
 	nums, err := DiscNumbers(o.Cfg.Dirs())
 	if err != nil {
 		return err
@@ -329,13 +395,16 @@ func Build(ctx context.Context, o Options, spec string) error {
 	// thing they have to fix, instead of about the lock file inside it.
 	//
 	// `brb iso` was the one staging-writing command that skipped this; backup
-	// secures in preflight and burn/restore secure in their own lockStaging, so
-	// the refusal here is the same one those commands already make rather than
-	// new behaviour. The ISO directory is secured alongside the root because
-	// BuildOne creates it with os.MkdirAll, whose mode reaches only what it
-	// makes: an iso/ the operator made by hand keeps whatever the umask gave
-	// it, and it holds a full second copy of every disc.
-	if err := fsx.SecureStaging(o.Cfg.Staging, o.Cfg.Dirs().ISO); err != nil {
+	// secures in preflight and restore in its lockStaging, so the refusal here
+	// is the same one those commands already make rather than new behaviour.
+	// The ISO directory is secured alongside the root because BuildOne creates
+	// it with os.MkdirAll, whose mode reaches only what it makes: an iso/ the
+	// operator made by hand keeps whatever the umask gave it, and it holds a
+	// full second copy of every disc. The disc directories are secured too,
+	// because every image is mastered from them and a discs/ that is a symlink
+	// masters whatever it points at. burn secures the same two, and backup all
+	// five.
+	if err := fsx.SecureStaging(o.Cfg.Staging, o.Cfg.Dirs().Discs, o.Cfg.Dirs().ISO); err != nil {
 		return fmt.Errorf("iso: %w", err)
 	}
 	// Locked here rather than at the top, and the order is the point twice
@@ -354,6 +423,13 @@ func Build(ctx context.Context, o Options, spec string) error {
 			o.UI.Warn("could not release the staging lock: %v", err)
 		}
 	}()
+	// The tool last, after every refusal that is about the staging tree,
+	// which is how burn orders it too. Those refusals are the ones the
+	// operator has to act on whatever is installed, and in this order a
+	// machine without xorriso still tests them.
+	if err := o.Tools.Require(tools.Xorriso); err != nil {
+		return fmt.Errorf("iso: %w", err)
+	}
 	rng, err := ParseRange(spec)
 	if err != nil {
 		return fmt.Errorf("iso: %w", err)
@@ -426,8 +502,17 @@ func numbered(dir string, wantDir bool, suffix string) ([]int, error) {
 	return out, nil
 }
 
-// manifestDiscs matches MANIFEST.txt's "discs : N" line.
-var manifestDiscs = regexp.MustCompile(`^discs[ \t]*:[ \t]*([0-9]+)`)
+// manifestDiscs matches MANIFEST.txt's "discs" line and captures its value,
+// whatever that is; Total then believes it only if it is digits and nothing
+// else. That is the rule both readers apply — expectedDiscs in
+// internal/restore and brb.sh's expected_discs — and it used to be a prefix
+// match here, so a damaged or hand-edited "discs : 1/data" labelled every
+// volume "OF 01" where the readers said they could not tell how many discs
+// the set has.
+var manifestDiscs = regexp.MustCompile(`^discs[ \t]*:[ \t]*(.*)$`)
+
+// allDigits matches a value that is one or more ASCII digits and nothing else.
+var allDigits = regexp.MustCompile(`^[0-9]+$`)
 
 // Total resolves how many discs the set is supposed to have.
 //
@@ -449,6 +534,12 @@ func Total(staging string, fallback int) int {
 		m := manifestDiscs.FindStringSubmatch(sc.Text())
 		if m == nil {
 			continue
+		}
+		// The first "discs" line decides, as it does for the readers: a value
+		// that is not a number is a damaged manifest, not a cue to look
+		// further down for a better one.
+		if !allDigits.MatchString(m[1]) {
+			break
 		}
 		if n, err := strconv.Atoi(m[1]); err == nil && n > 0 {
 			return n

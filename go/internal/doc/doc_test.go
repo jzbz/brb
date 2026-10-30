@@ -113,7 +113,7 @@ func TestRenderDiscREADMESubstitutions(t *testing.T) {
 		{"the sidecar parity is explained", "carry their own parity\nin `sidecars.par2`"},
 		{"repairing a rotted sidecar is spelled out", "par2 repair -- sidecars.par2"},
 		{"restore recipe copies the image and its sidecars", "cp /mnt/data/disc03.squashfs.age* ."},
-		{"kernel mount recipe", "sudo mount -o loop,ro disc03.squashfs image"},
+		{"kernel mount recipe", "sudo mount -o loop,ro,nosuid,nodev disc03.squashfs image"},
 		{"ddrescue section", "ddrescue -d -r3 /mnt/data/disc03.squashfs.age"},
 		{"ddrescue section fetches the parity too", "cp /mnt/data/disc03.squashfs.age.* ."},
 		{"the static binary restores with unsquashfs, not mksquashfs",

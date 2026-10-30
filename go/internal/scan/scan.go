@@ -23,7 +23,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"sort"
+	"slices"
 	"strings"
 )
 
@@ -574,6 +574,17 @@ func isPattern(s string) bool { return strings.ContainsAny(s, "*?[") }
 
 // cleanPatterns drops empty patterns, trims surrounding slashes, and rejects
 // malformed globs up front so a typo cannot silently exclude nothing.
+//
+// The result is sorted, and a pattern that is listed twice once trimmed is kept
+// once — "cache", "/cache/" and " cache/ " are one pattern. The walk tries
+// every glob prune and every mask against every entry it sees, so each copy
+// was another round of matching across the whole tree for an answer that
+// cannot change: matching is an OR, and a predicate ORed with itself is the
+// same predicate. (Literal prunes go into a map, which already kept one of
+// each.) Duplicates are dropped only after every element has been validated,
+// so a malformed one is refused however many times it appears, and only from
+// this scanner-owned copy: the configured lists, which the manifest and help
+// print, are left as written.
 func cleanPatterns(in []string, field string) ([]string, error) {
 	out := make([]string, 0, len(in))
 	for _, p := range in {
@@ -586,6 +597,6 @@ func cleanPatterns(in []string, field string) ([]string, error) {
 		}
 		out = append(out, p)
 	}
-	sort.Strings(out)
-	return out, nil
+	slices.Sort(out)
+	return slices.Compact(out), nil
 }

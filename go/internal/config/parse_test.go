@@ -248,13 +248,15 @@ func TestParseErrorNamesOffendingText(t *testing.T) {
 }
 
 func TestParseHomeUnsetIsAnError(t *testing.T) {
-	// With no HOME at all, expansion cannot be faked silently.
+	// With no HOME at all, expansion cannot be faked silently. There used to be
+	// a skip here for a home directory found some other way; homeDir reads
+	// $HOME and nothing else, so it could never fire, and a skipped refusal
+	// test is one nobody notices has stopped testing.
 	t.Setenv("HOME", "")
-	if homeDir() != "" {
-		t.Skip("os.UserHomeDir still resolves a home directory here")
-	}
-	if _, err := Parse("SOURCE_DIR=$HOME/x\n", "test"); err == nil {
-		t.Error("Parse with no HOME succeeded, want an error")
+	for _, in := range []string{"SOURCE_DIR=$HOME/x\n", "SOURCE_DIR=~/x\n", "SOURCE_DIR=${HOME}\n"} {
+		if _, err := Parse(in, "test"); err == nil {
+			t.Errorf("Parse(%q) with no HOME succeeded, want an error", in)
+		}
 	}
 }
 
@@ -452,5 +454,153 @@ func TestDollarFormsBashLeavesAloneAreStillAccepted(t *testing.T) {
 				t.Errorf("ARCHIVE_NAME = %q, want %q (what bash gives)", got, tc.want)
 			}
 		})
+	}
+}
+
+// TestWordBoundariesMatchBash pins where a value starts and where a comment
+// does, against what bash makes of the same line.
+//
+// A '#' begins a comment only after whitespace, so straight after the '=' it is
+// the value's first byte. readWord used to start a comment wherever no word had
+// begun, and STAGING=#photos loaded as an empty value — the default
+// /var/tmp/brb — while brb.sh's `source` set STAGING to "#photos": one file,
+// two staging directories. Every expectation below was produced by sourcing the
+// line under bash 5.3 with HOME=/home/tester, the way brb.sh loads it.
+func TestWordBoundariesMatchBash(t *testing.T) {
+	setHome(t, "/home/tester")
+	for _, tc := range []struct {
+		name, in, want string
+	}{
+		{"hash straight after the equals sign", "STAGING=#photos\n", "#photos"},
+		{"hash after export", "export STAGING=#q\n", "#q"},
+		{"hash after a continuation", "STAGING=\\\n#b\n", "#b"},
+		{"hash after an empty quote", "STAGING=\"\"#x\n", "#x"},
+		{"hash inside a tilde path", "STAGING=~/x#y\n", "/home/tester/x#y"},
+		{"space then comment is an empty value", "STAGING= # c\n", ""},
+		{"tab then comment is an empty value", "STAGING=\t# c\n", ""},
+		{"the README's blank sample line", "STAGING=            # override\n", ""},
+		{"tilde then comment", "STAGING=~ # c\n", "/home/tester"},
+		// bash does not continue a comment with a trailing backslash, so the
+		// second assignment is not swallowed. A review claimed it was; it is
+		// pinned here so the claim cannot be acted on.
+		{"a comment does not continue", "STAGING=/first\n# c \\\nSTAGING=/second\n", "/second"},
+		{"a trailing comment does not continue", "STAGING=/x # c \\\n", "/x"},
+		// ~ after a QUOTED ':' is not expanded by bash, and neither is one
+		// after the first '=' inside the value; only the unquoted ':' case is
+		// refused below.
+		{"tilde after a double-quoted colon", "STAGING=/a\":\"~/b\n", "/a:~/b"},
+		{"tilde after an escaped colon", "STAGING=/a\\:~/b\n", "/a:~/b"},
+		{"quoted tilde after a colon", "STAGING=/a:\"~\"/b\n", "/a:~/b"},
+		{"tilde after a second equals sign", "STAGING=a=~/b\n", "a=~/b"},
+		// A continuation after $HOME that does not carry the name on: bash
+		// joins the lines and reads $HOME followed by the rest, as this parser
+		// does. Only the forms that run the name on are refused below.
+		{"HOME then a continuation and a slash", "STAGING=$HOME\\\n/x\n", "/home/tester/x"},
+		{"quoted HOME then a continuation and a slash", "STAGING=\"$HOME\\\n/x\"\n", "/home/tester/x"},
+		{"HOME then a continuation and an escape", "STAGING=$HOME\\\n\\x\n", "/home/testerx"},
+		{"HOME then a continuation and a blank line", "STAGING=$HOME\\\n\n", "/home/tester"},
+		{"braced HOME then a continuation and a letter", "STAGING=${HOME}\\\nx\n", "/home/testerx"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			v, err := Parse(tc.in, "test")
+			if err != nil {
+				t.Fatalf("Parse(%q): %v", tc.in, err)
+			}
+			if got := v["STAGING"]; got.IsArray || got.Scalar != tc.want {
+				t.Errorf("Parse(%q): STAGING = %+v, want %q (what bash gives)", tc.in, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestFormsBashReadsDifferentlyAreRefused is the other half: lines bash gives a
+// meaning this parser used to get wrong, and which are now refused rather than
+// guessed at, so the two readers cannot silently disagree about them. What bash
+// does with each is in the comment beside it (bash 5.3, HOME=/home/tester).
+//
+// Each case was accepted before, with a different value from bash's, except
+// the space-after-'=' ones that bash itself mostly refuses: those were taken
+// as the value here while brb.sh died or, for `STAGING= :`, kept the default.
+// The $HOME-runs-on ones are the same kind: bash reads a longer variable name,
+// which brb.sh's set -u makes fatal when it is unset and which is that
+// variable's value when it is not.
+func TestFormsBashReadsDifferentlyAreRefused(t *testing.T) {
+	setHome(t, "/home/tester")
+	for _, tc := range []struct {
+		name, in, want string
+	}{
+		// STAGING= is empty to bash, which then runs /srv as a command: 126.
+		{"space after the equals sign", "STAGING= /srv\n", "space after '='"},
+		// Runs the no-op ':' with STAGING= in its environment: the default stays.
+		{"space then a no-op command", "STAGING= :\n", "space after '='"},
+		// export STAGING= and export x: STAGING is set to "".
+		{"export with a space", "export STAGING= x\n", "space after '='"},
+		// Two assignments: STAGING="" and OTHER=x.
+		{"space then another assignment", "STAGING= OTHER=x\n", "space after '='"},
+		{"tab after the equals sign", "STAGING=\t/srv\n", "space after '='"},
+		// The continuation is removed first, leaving STAGING= /srv.
+		{"space then a continuation", "STAGING= \\\n/srv\n", "space after '='"},
+		// A quote in the tilde-prefix stops the expansion: "~/x", "~/x", "~".
+		{"tilde then a double quote", "STAGING=~\"/x\"\n", "quote straight after ~"},
+		{"tilde then a single quote", "STAGING=~'/x'\n", "quote straight after ~"},
+		{"tilde then an empty quote", "STAGING=~\"\"\n", "quote straight after ~"},
+		// Looked up as the user "#x" and left as typed: "~#x".
+		{"tilde then a hash", "STAGING=~#x\n", "~user"},
+		{"tilde then a hash in an array", "PRUNE_DIRS=( ~#x )\n", "~user"},
+		// Expanded after an unquoted ':': "/a:/home/tester/b".
+		{"tilde after a colon", "STAGING=/a:~/b\n", "after a ':'"},
+		{"tilde after a colon with export", "export STAGING=/a:~/b\n", "after a ':'"},
+		{"tilde after a colon across a continuation", "STAGING=/a:\\\n~/b\n", "after a ':'"},
+		{"bare tilde after a leading colon", "STAGING=:~\n", "after a ':'"},
+		{"tilde after HOME and a colon", "STAGING=$HOME:~/x\n", "after a ':'"},
+		// The continuation is deleted before the '$' is read: "/home/tester",
+		// "/home/tester", "x" (that is, $'x'), "/home/tester". Here the '$' was
+		// a literal and the backslash an ordinary byte after it.
+		{"dollar then a continuation", "STAGING=$\\\nHOME\n", "straight after '$'"},
+		{"quoted dollar then a continuation", "STAGING=\"$\\\nHOME\"\n", "straight after '$'"},
+		{"dollar then a continuation and a quote", "STAGING=$\\\n'x'\n", "straight after '$'"},
+		{"dollar then a continuation and a brace", "STAGING=$\\\n{HOME}\n", "straight after '$'"},
+		{"dollar then a continuation in an array", "PRUNE_DIRS=( $\\\nHOME )\n", "straight after '$'"},
+		// The variable HOMEX, HOME_x, HOME1: unset, so fatal under set -u.
+		{"HOME run on by a continuation", "STAGING=$HOME\\\nX\n", "runs on past a line continuation"},
+		{"quoted HOME run on by a continuation", "STAGING=\"$HOME\\\nX\"\n", "runs on past a line continuation"},
+		{"HOME run on past a bare backslash line", "STAGING=$HOME\\\n\\\n_x\n", "runs on past a line continuation"},
+		{"HOME run on by a digit", "STAGING=$HOME\\\n1\n", "runs on past a line continuation"},
+		// Not an array with a comment: the string "(a)#x".
+		{"hash glued to the closing paren", "PRUNE_DIRS=( a )#x\n", "unexpected text"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			v, err := Parse(tc.in, "test")
+			if err == nil {
+				t.Fatalf("Parse(%q) accepted it as %+v; bash reads it differently", tc.in, v)
+			}
+			if !errors.Is(err, ErrSyntax) {
+				t.Errorf("error does not wrap ErrSyntax: %v", err)
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Errorf("Parse(%q) error %q does not say %q", tc.in, err, tc.want)
+			}
+		})
+	}
+
+	// The companions that keep those refusals honest: the same shapes where
+	// bash agrees with this parser must still load.
+	for _, tc := range []struct {
+		in   string
+		want []string
+	}{
+		{"PRUNE_DIRS=( a ) #x\n", []string{"a"}},
+		{"PRUNE_DIRS=( a:~/b )\n", []string{"a:~/b"}}, // array elements are words, not assignments
+		{"PRUNE_DIRS=( a#b \"c\"#d )\n", []string{"a#b", "c#d"}},
+		{"PRUNE_DIRS=( \\\n#x\n b )\n", []string{"b"}}, // after a blank, '#' is a comment
+	} {
+		v, err := Parse(tc.in, "test")
+		if err != nil {
+			t.Errorf("Parse(%q): %v", tc.in, err)
+			continue
+		}
+		if got := v["PRUNE_DIRS"]; !got.IsArray || !reflect.DeepEqual(got.Array, tc.want) {
+			t.Errorf("Parse(%q): PRUNE_DIRS = %+v, want %q (what bash gives)", tc.in, got, tc.want)
+		}
 	}
 }

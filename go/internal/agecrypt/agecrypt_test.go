@@ -688,7 +688,15 @@ func TestParseRecipientsFileNeverEchoesASecretKey(t *testing.T) {
 	// The redaction is for secret keys only: a mistyped public key still gets
 	// age's message with the line in it, which is what makes the typo findable.
 	typo := filepath.Join(dir, "typo.txt")
-	bad := pub[:len(pub)-1] + "x"
+	// The last character swapped for another one. Always "x" was no typo at
+	// all for the one key in 32 that already ends in x, and the test failed
+	// on it; any other character breaks the bech32 checksum, which catches
+	// every single substitution.
+	sub := "x"
+	if strings.HasSuffix(pub, sub) {
+		sub = "q"
+	}
+	bad := pub[:len(pub)-1] + sub
 	writeFile(t, typo, []byte(pub+"\n"+bad+"\n"))
 	_, err := ParseRecipientsFile(typo)
 	if err == nil {
@@ -758,4 +766,146 @@ func TestCheckRecipientAdditionRefusesAMixedSet(t *testing.T) {
 	if err := ProbeRecipients(nil); !errors.Is(err, ErrNoRecipients) {
 		t.Errorf("ProbeRecipients over no keys = %v, want ErrNoRecipients", err)
 	}
+}
+
+// TestMaxRecipientsIsAgesLimit pins MaxRecipients to the decoder actually
+// vendored. The limit lives in age's internal/format, unexported, so a copy of
+// the number is the only way to check it before encrypting; an age upgrade
+// that moved it would leave the copy quietly wrong in one direction or the
+// other. A file encrypted to exactly MaxRecipients copies of one key must
+// decrypt, and one encrypted to one more must not — and Encrypt must accept
+// both, which is the whole reason the check exists.
+func TestMaxRecipientsIsAgesLimit(t *testing.T) {
+	id := mustIdentity(t)
+	encryptTo := func(n int) []byte {
+		recs := make([]age.Recipient, n)
+		for i := range recs {
+			recs[i] = id.Recipient()
+		}
+		var buf bytes.Buffer
+		w, err := age.Encrypt(&buf, recs...)
+		if err != nil {
+			t.Fatalf("age.Encrypt to %d recipients: %v", n, err)
+		}
+		if _, err := w.Write([]byte("brb")); err != nil {
+			t.Fatal(err)
+		}
+		if err := w.Close(); err != nil {
+			t.Fatal(err)
+		}
+		return buf.Bytes()
+	}
+	if _, err := age.Decrypt(bytes.NewReader(encryptTo(MaxRecipients)), id); err != nil {
+		t.Errorf("age cannot decrypt a file encrypted to MaxRecipients=%d recipients: %v — "+
+			"the vendored age lowered its limit", MaxRecipients, err)
+	}
+	if _, err := age.Decrypt(bytes.NewReader(encryptTo(MaxRecipients+1)), id); err == nil {
+		t.Errorf("age decrypts a file encrypted to MaxRecipients+1=%d recipients — "+
+			"the vendored age raised or dropped its limit; move MaxRecipients with it", MaxRecipients+1)
+	}
+}
+
+// TestProbeRecipientsRefusesMoreThanAgeCanDecrypt: the probe asks age's
+// encoder, which writes any number of stanzas, so the decoder's limit has to
+// be checked by count — and init-key, through CheckRecipientAddition, must not
+// add the key that crosses it. Neither refusal may carry the advice about
+// mixing key types, which is a different problem.
+func TestProbeRecipientsRefusesMoreThanAgeCanDecrypt(t *testing.T) {
+	id := mustIdentity(t)
+	recs := make([]age.Recipient, MaxRecipients+1)
+	for i := range recs {
+		recs[i] = id.Recipient()
+	}
+	if err := ProbeRecipients(recs[:MaxRecipients]); err != nil {
+		t.Errorf("ProbeRecipients over %d recipients: %v", MaxRecipients, err)
+	}
+	err := ProbeRecipients(recs)
+	if !errors.Is(err, ErrTooManyRecipients) {
+		t.Fatalf("ProbeRecipients over %d recipients = %v, want ErrTooManyRecipients", len(recs), err)
+	}
+
+	dir := t.TempDir()
+	full := filepath.Join(dir, "recipients.txt")
+	writeFile(t, full, []byte(strings.Repeat(id.Recipient().String()+"\n", MaxRecipients)))
+	err = CheckRecipientAddition(full, mustIdentity(t).Recipient().String())
+	if !errors.Is(err, ErrTooManyRecipients) {
+		t.Fatalf("CheckRecipientAddition past the limit = %v, want ErrTooManyRecipients", err)
+	}
+	if strings.Contains(err.Error(), "post-quantum") || !strings.Contains(err.Error(), full) {
+		t.Errorf("the refusal should name the file and leave out the key-mixing advice:\n%v", err)
+	}
+	short := filepath.Join(dir, "short.txt")
+	writeFile(t, short, []byte(strings.Repeat(id.Recipient().String()+"\n", MaxRecipients-1)))
+	if err := CheckRecipientAddition(short, mustIdentity(t).Recipient().String()); err != nil {
+		t.Errorf("CheckRecipientAddition refused the key that reaches the limit exactly: %v", err)
+	}
+}
+
+// TestNewKeyFilesSyncTheirDirectories. A key file's fsync makes its bytes
+// durable and nothing more: its name, and the name of any directory MkdirAll
+// just made for it, are entries one level up, which only a directory fsync
+// commits. On FAT mounted without "flush" a crash after init-key reported
+// success could lose the identity while the recipients file survived, and
+// every later backup was encrypted to a key nobody had. Durability itself is
+// not observable from a test, so this checks the calls: every directory from
+// the key's own up to the root is synced, and only once the file is complete.
+func TestNewKeyFilesSyncTheirDirectories(t *testing.T) {
+	var synced []string
+	var complete []bool
+	var watch string
+	old := syncDir
+	t.Cleanup(func() { syncDir = old })
+	syncDir = func(dir string) {
+		synced = append(synced, dir)
+		fi, err := os.Stat(watch)
+		complete = append(complete, err == nil && fi.Size() > 0)
+		old(dir)
+	}
+	wantAll := func(t *testing.T, path string) {
+		t.Helper()
+		var want []string
+		for d := filepath.Dir(path); ; d = filepath.Dir(d) {
+			want = append(want, d)
+			if filepath.Dir(d) == d {
+				break
+			}
+		}
+		if strings.Join(synced, "\n") != strings.Join(want, "\n") {
+			t.Errorf("synced %q, want every directory from the file's up: %q", synced, want)
+		}
+		for i, ok := range complete {
+			if !ok {
+				t.Errorf("%s was synced before %s was complete", synced[i], path)
+			}
+		}
+	}
+	id := mustIdentity(t)
+	// Two levels that do not exist yet, as init-key meets them on a fresh
+	// stick: both are MkdirAll's, and both names need committing.
+	base := filepath.Join(t.TempDir(), "keys", "brb")
+
+	t.Run("identity", func(t *testing.T) {
+		synced, complete = nil, nil
+		watch = filepath.Join(base, "identity.txt")
+		if err := WriteIdentityFile(watch, id); err != nil {
+			t.Fatal(err)
+		}
+		wantAll(t, watch)
+	})
+	t.Run("rescue identity", func(t *testing.T) {
+		synced, complete = nil, nil
+		watch = filepath.Join(base, "rescue-identity.txt.age")
+		if err := WriteEncryptedIdentityFile(watch, id, "correct horse"); err != nil {
+			t.Fatal(err)
+		}
+		wantAll(t, watch)
+	})
+	t.Run("recipients", func(t *testing.T) {
+		synced, complete = nil, nil
+		watch = filepath.Join(base, "recipients.txt")
+		if err := AppendRecipient(watch, id.Recipient().String()); err != nil {
+			t.Fatal(err)
+		}
+		wantAll(t, watch)
+	})
 }

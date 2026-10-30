@@ -140,9 +140,11 @@ func TestBuildRanges(t *testing.T) {
 // disturb: "run 'brb backup' first" is a far better answer to an empty staging
 // area than a permissions or lock error, so the cheap disc-set check keeps
 // coming before fsx.SecureStaging and fsx.LockStaging.
+//
+// It no longer needs xorriso: Build asks for the tool after every refusal
+// about the staging tree, this one included.
 func TestBuildWithoutADiscSet(t *testing.T) {
 	o := testOptions(t)
-	needXorriso(t, o)
 	err := Build(context.Background(), o, "all")
 	if err == nil || !strings.Contains(err.Error(), "run 'brb backup' first") {
 		t.Fatalf("Build over an empty staging area = %v, want a pointer at backup", err)
@@ -457,5 +459,164 @@ func TestEnsureRefusesAnISOTooLargeForTheMedia(t *testing.T) {
 	o.Cfg.DiscType = ""
 	if got, err := o.Ensure(ctx, 1, 1); err != nil || got != path {
 		t.Errorf("Ensure with no known capacity = %q, %v; want the existing ISO", got, err)
+	}
+}
+
+// TestBuildRefusesASymlinkedDiscsDirectory is the disc directories' half of
+// `brb iso`'s staging rules. Every image is mastered from discs/, so a discs/
+// that is a symlink images whatever tree it points at and labels it as this
+// set. burn and backup refuse it; Build used to secure only the root and iso/.
+// The refusal comes before the tool requirement, so this runs without xorriso.
+func TestBuildRefusesASymlinkedDiscsDirectory(t *testing.T) {
+	o := testOptions(t)
+	far := filepath.Join(t.TempDir(), "other-set")
+	if err := os.MkdirAll(filepath.Join(far, dirName(1), "data"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(o.Cfg.Staging, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(far, o.Cfg.Dirs().Discs); err != nil {
+		t.Fatal(err)
+	}
+
+	err := Build(context.Background(), o, "all")
+	if err == nil || !strings.Contains(err.Error(), "is a symlink") || !strings.Contains(err.Error(), "discs") {
+		t.Fatalf("Build over a symlinked discs/ = %v, want a refusal naming it", err)
+	}
+	if got := isoNumbers(t, o); len(got) != 0 {
+		t.Errorf("Build imaged %v from a symlinked discs/", got)
+	}
+}
+
+// TestBuildOneRefusesASymlinkedDiscDirectory is the level below discs/, which
+// securing discs/ does not reach. CanRebuild used os.Stat, so a discs/disc01
+// that was a link to a directory counted as the disc directory: BuildOne
+// mastered the image from wherever it pointed and labelled it as this set,
+// and burn measured an existing ISO against that tree and then deleted the
+// ISO as rebuildable. DiscNumbers never counted such a link as a disc, and now
+// nothing else does either. The refusal names the link, comes before the tool
+// requirement, and builds nothing.
+func TestBuildOneRefusesASymlinkedDiscDirectory(t *testing.T) {
+	o := testOptions(t)
+	far := filepath.Join(t.TempDir(), "elsewhere")
+	if err := os.MkdirAll(filepath.Join(far, "data"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(far, "data", "payload.bin"), []byte("not this set\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(o.Cfg.Dirs().Discs, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(far, o.sourceDir(1)); err != nil {
+		t.Fatal(err)
+	}
+
+	if o.CanRebuild(1) {
+		t.Error("CanRebuild counts a symlink as a disc directory")
+	}
+	err := o.BuildOne(context.Background(), 1, 1)
+	if err == nil || !strings.Contains(err.Error(), "is a symlink") {
+		t.Fatalf("BuildOne from a symlinked disc directory = %v, want a refusal naming the link", err)
+	}
+	if got := isoNumbers(t, o); len(got) != 0 {
+		t.Errorf("BuildOne imaged %v through a symlinked disc directory", got)
+	}
+}
+
+// TestEnsureRefusesAnOversizedISOWithoutItsDiscDirectory is the media bound in
+// an ISO-only staging tree — the files `brb iso all` makes to carry to another
+// machine, whose DISC_TYPE may name smaller blanks. complete used to return
+// "complete" as soon as it found no disc directory, before the capacity check
+// that needs nothing but the file and the configuration, so burn handed the
+// burner an image that could not fit. It is refused now, the file is kept —
+// it is the only copy — and the message does not suggest deleting it to be
+// rebuilt, which with nothing to rebuild from would destroy it. Runs without
+// xorriso: nothing is built.
+func TestEnsureRefusesAnOversizedISOWithoutItsDiscDirectory(t *testing.T) {
+	ctx := context.Background()
+	o := testOptions(t)
+	if err := os.MkdirAll(o.Cfg.Dirs().ISO, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	path := o.Path(1)
+	if err := os.WriteFile(path, bytes.Repeat([]byte{'i'}, 4096), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	o.Cfg.DiscCapacityBytes = 4095
+	_, err := o.Ensure(ctx, 1, 1)
+	if err == nil || !strings.Contains(err.Error(), "larger than the") {
+		t.Fatalf("Ensure of a 4096-byte ISO onto 4095-byte media = %v, want the media refusal", err)
+	}
+	if strings.Contains(err.Error(), "rebuild") {
+		t.Errorf("the refusal offers a rebuild with no disc directory to rebuild from: %v", err)
+	}
+	if fi, statErr := os.Stat(path); statErr != nil || fi.Size() != 4096 {
+		t.Fatalf("the only copy did not survive the refusal: %v", statErr)
+	}
+
+	// Media it fits, and media of unknown size: both take the file as it is.
+	o.Cfg.DiscCapacityBytes = 4096
+	if got, err := o.Ensure(ctx, 1, 1); err != nil || got != path {
+		t.Errorf("Ensure onto media the ISO fits = %q, %v; want the existing ISO", got, err)
+	}
+	o.Cfg.DiscCapacityBytes = 0
+	o.Cfg.DiscType = ""
+	if got, err := o.Ensure(ctx, 1, 1); err != nil || got != path {
+		t.Errorf("Ensure with no known capacity = %q, %v; want the existing ISO", got, err)
+	}
+}
+
+// TestEnsureOffersARebuildOnlyWhereOneCouldFit pins the advice on the media
+// refusal when the disc directory IS there. Deleting the ISO and rebuilding is
+// worth suggesting only when the tree itself fits the media; when it does not,
+// a rebuild is certain to hit BuildOne's own capacity refusal, which deletes
+// what it built. That case used to be offered the rebuild anyway, and when the
+// ISO was also shorter than its tree it was rebuilt outright, at the cost of
+// a whole build, before being refused. Runs without xorriso: nothing is built.
+func TestEnsureOffersARebuildOnlyWhereOneCouldFit(t *testing.T) {
+	ctx := context.Background()
+	o := testOptions(t)
+	stageDiscs(t, o, 1)
+	srcSize, err := fsx.DirBytes(ctx, o.sourceDir(1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(o.Cfg.Dirs().ISO, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	write := func(size int64) {
+		t.Helper()
+		if err := os.WriteFile(o.Path(1), bytes.Repeat([]byte{'i'}, int(size)), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// The tree fits; the ISO, built for something bigger, does not.
+	write(srcSize + 10)
+	o.Cfg.DiscCapacityBytes = srcSize + 5
+	if _, err := o.Ensure(ctx, 1, 1); err == nil || !strings.Contains(err.Error(), "rebuild") {
+		t.Errorf("Ensure = %v, want the media refusal offering a rebuild", err)
+	}
+
+	// The tree itself is bigger than the media: no rebuild can fit, so none is
+	// offered — and a file that is also shorter than its tree is refused and
+	// left alone, not rebuilt. A rebuild would need xorriso, and where it is
+	// installed it used to replace the file and then refuse what it built.
+	for _, size := range []int64{srcSize + 10, srcSize - 10} {
+		write(size)
+		o.Cfg.DiscCapacityBytes = srcSize - 20
+		_, err := o.Ensure(ctx, 1, 1)
+		if err == nil || !strings.Contains(err.Error(), "larger than the") {
+			t.Errorf("Ensure of %d bytes onto %d-byte media for a %d-byte tree = %v, want the media refusal",
+				size, srcSize-20, srcSize, err)
+		} else if strings.Contains(err.Error(), "rebuild") {
+			t.Errorf("the refusal offers a rebuild that cannot fit: %v", err)
+		}
+		if fi, statErr := os.Stat(o.Path(1)); statErr != nil || fi.Size() != size {
+			t.Errorf("the %d-byte ISO was not left as it was: %v", size, statErr)
+		}
 	}
 }

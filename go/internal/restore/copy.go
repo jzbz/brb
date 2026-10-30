@@ -1,6 +1,7 @@
 package restore
 
 import (
+	"bufio"
 	"context"
 	"crypto/sha512"
 	"encoding/hex"
@@ -287,6 +288,14 @@ func assessSalvage(src, out, mapfile string) (int64, error) {
 	return missing, nil
 }
 
+// maxMapfileLine bounds one line of a ddrescue map file. The longest line
+// ddrescue writes is the "# Command line:" comment, which echoes the three
+// paths it was given — a few KiB even at PATH_MAX each — and every other line
+// is two hex numbers and a status character. A megabyte is the ceiling the
+// sums and manifest readers put on a line too (maxSumLine, maxManifestLine),
+// and it leaves room for a map from a ddrescue somebody ran by hand.
+const maxMapfileLine = 1 << 20
+
 // mapfileMissing sums the regions a ddrescue map file reports as anything other
 // than finished. ok is false when there is no map file at all.
 //
@@ -294,17 +303,31 @@ func assessSalvage(src, out, mapfile string) (int64, error) {
 // where the second is a status character, and then data lines of
 // "<pos> <size> <status>" with numbers in hex. Only '+' means the region was
 // read successfully; '-', '?', '*' and '/' are all unread to some degree.
+//
+// The file is streamed a line at a time, never read whole. It used to be:
+// os.ReadFile, a string copy of that, and a slice of one string header per
+// line from strings.Split — about eighteen times the file's size in heap, so a
+// map of a few gigabytes took the ingest out through the allocator before a
+// line of it was judged. A map is written by ddrescue and stays small, but
+// ingest used to stage any file a disc's data/ carried under its own name,
+// map files included, and the size of a file is the one thing about it that
+// costs memory before anything has looked at it. A line past [maxMapfileLine]
+// is an error naming the file rather than a line skipped: no ddrescue wrote
+// it.
 func mapfileMissing(path string) (bytes int64, ok bool, err error) {
-	data, err := os.ReadFile(path)
+	mf, err := os.Open(path)
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
 			return 0, false, nil
 		}
 		return 0, false, fmt.Errorf("restore: reading %s: %w", path, err)
 	}
+	defer mf.Close()
 	seen := false
-	for _, raw := range strings.Split(string(data), "\n") {
-		line := strings.TrimSpace(strings.TrimRight(raw, "\r"))
+	sc := bufio.NewScanner(mf)
+	sc.Buffer(make([]byte, 0, 4<<10), maxMapfileLine)
+	for sc.Scan() {
+		line := strings.TrimSpace(strings.TrimRight(sc.Text(), "\r"))
 		if line == "" || strings.HasPrefix(line, "#") {
 			continue
 		}
@@ -328,6 +351,9 @@ func mapfileMissing(path string) (bytes int64, ok bool, err error) {
 		if f[2] != "+" && size > 0 {
 			bytes += size
 		}
+	}
+	if err := sc.Err(); err != nil {
+		return 0, false, fmt.Errorf("restore: reading %s: %w", path, err)
 	}
 	return bytes, seen, nil
 }

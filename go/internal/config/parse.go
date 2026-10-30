@@ -41,8 +41,12 @@ var ErrSyntax = errors.New("config syntax error")
 //
 // Everything else is rejected rather than guessed at: command substitution
 // ($( ) or backticks), arithmetic ($((...)) and the deprecated $[...]), any
-// variable other than HOME, bash's $'...' and $"..." quoting forms, and shell
-// syntax such as pipelines, redirections, conditionals or function definitions.
+// variable other than HOME, bash's $'...' and $"..." quoting forms, a ~ that is
+// followed by anything but a '/' or the end of the word (~user, ~"...") or that
+// follows a ':' in a value, whitespace between the '=' and the value, a line
+// continuation that splits a '$' from what follows it or $HOME from more of a
+// name, and shell syntax such as pipelines, redirections, conditionals or
+// function definitions.
 // Rejecting rather than keeping as literal text is the point: brb.sh sources
 // this same file, so any form bash expands and this parser did not would make
 // one file mean two different things to the two readers. Every error names the
@@ -113,6 +117,37 @@ func (p *parser) advanceLine() bool {
 	p.li++
 	p.col = 0
 	return p.li < len(p.lines)
+}
+
+// atContinuation reports whether the position is on a backslash that ends its
+// line: a line continuation, which the shell deletes, newline and all, before
+// it reads either line. Whatever the two lines spell together is read as one
+// piece of text.
+func (p *parser) atContinuation() bool {
+	return !p.eol() && p.peek() == '\\' && p.col+1 == len(p.cur())
+}
+
+// nameContinues reports whether a variable name ending at the position runs on
+// past a line continuation: the line ends in a backslash, and the next line
+// that is not itself a lone backslash starts with a byte a name may contain.
+// The shell joins the lines first, so $HOME\<newline>X is the variable HOMEX
+// to it.
+func (p *parser) nameContinues() bool {
+	if !p.atContinuation() {
+		return false
+	}
+	for j := p.li + 1; j < len(p.lines); j++ {
+		l := p.lines[j]
+		if l == `\` {
+			continue
+		}
+		if l == "" {
+			return false
+		}
+		c := l[0]
+		return c == '_' || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')
+	}
+	return false
 }
 
 // errf builds a syntax error naming the source, the line number and the text
@@ -207,9 +242,17 @@ func (p *parser) readName() string {
 
 // endStatement checks that nothing but whitespace and a comment follows a
 // completed assignment.
+//
+// The comment has to be separated from the value by whitespace, because that is
+// the only place the shell starts one: a '#' glued to the end of a word is part
+// of the word. Only an array can end right at a '#' here — readWord carries a
+// glued '#' into a scalar's value itself — and `PRUNE_DIRS=( a )#x` is not a
+// one-element list with a comment to bash, which assigns it the STRING "(a)#x".
+// Refused rather than reproduced, like any other text after the value.
 func (p *parser) endStatement() error {
+	begin := p.col
 	p.skipSpace()
-	if p.eol() || p.peek() == '#' {
+	if p.eol() || (p.peek() == '#' && p.col > begin) {
 		return nil
 	}
 	return p.errf(p.li+1, "unexpected text after the value")
@@ -240,7 +283,9 @@ func (p *parser) readArray(start int) ([]string, error) {
 			p.col++
 			return items, nil
 		}
-		w, ok, err := p.readWord(')', start)
+		// blank is true: every element starts after whitespace or the '(',
+		// which is where the shell begins a comment.
+		w, ok, err := p.readWord(')', start, true)
 		if err != nil {
 			return nil, err
 		}
@@ -251,39 +296,78 @@ func (p *parser) readArray(start int) ([]string, error) {
 }
 
 // readWordOnly reads a scalar value: exactly one shell word, with no array
-// terminator in play.
+// terminator in play. It starts straight after the '=', which is not a blank,
+// so a '#' there begins the value rather than a comment.
 func (p *parser) readWordOnly(start int) (string, error) {
-	w, _, err := p.readWord(0, start)
+	w, _, err := p.readWord(0, start, false)
 	return w, err
 }
 
 // readWord reads one shell word. term, when non-zero, is a byte that ends the
 // word without being consumed (')' inside an array). ok is false when the
 // input held no word at all — end of line, or a comment.
-func (p *parser) readWord(term byte, start int) (string, bool, error) {
+//
+// blank says whether the position is just after whitespace (or an array's
+// '('), and readWord keeps it up to date as it skips more. It decides two
+// things the shell decides the same way, and both used to be got wrong for a
+// scalar, where the word starts right after the '=' and blank is false:
+//
+//   - A '#' starts a comment only after a blank. KEY=#x is the value "#x" to
+//     bash and was an empty value here, which leaves the default in force: one
+//     file, two staging directories. A value commented out in place,
+//     STAGING=#/mnt/luks/brb, is the likely way to write it; it was
+//     /var/tmp/brb here and the relative directory "#/mnt/luks/brb" to brb.sh,
+//     and it is that relative directory to both now. Refusing a leading '#'
+//     would catch the slip, but in this reader only, and a refusal one reader
+//     makes is a difference of its own.
+//   - Whitespace after the '=' ends the assignment. KEY= value is an empty
+//     KEY to the shell, which then runs `value` as a command with KEY= in its
+//     environment, so brb.sh either dies (127, 126) or, for `STAGING= :` or
+//     `export STAGING= x`, quietly keeps the default. This parser used to skip
+//     the blank and take "value". It is refused instead: there is no reading
+//     of the line both readers share.
+//
+// A backslash-newline changes neither, because the shell removes it before it
+// looks at the word at all.
+func (p *parser) readWord(term byte, start int, blank bool) (string, bool, error) {
 	var b strings.Builder
 	started := false
+	// colon is true when the byte just consumed was an unquoted ':', the one
+	// place inside an assignment's value where bash expands a ~ again — see the
+	// '~' case below.
+	colon := false
 	for {
 		if p.eol() {
 			return b.String(), started, nil
 		}
 		c := p.peek()
+		if !started && blank && term == 0 && c != ' ' && c != '\t' && c != '#' && !p.atContinuation() {
+			return "", false, p.errf(p.li+1, "a space after '=' ends the value: the shell assigns "+
+				"nothing and reads what follows as a separate word (a command, or another assignment), "+
+				"so the two readers would not agree on this line — remove the space, or quote the value")
+		}
+		afterColon := colon
+		colon = false
 		switch {
 		case c == ' ' || c == '\t':
 			if started {
 				return b.String(), true, nil
 			}
+			blank = true
 			p.col++
 
 		case term != 0 && c == term:
 			return b.String(), started, nil
 
 		case c == '#':
-			if !started {
+			if !started && blank {
 				p.col = len(p.cur())
 				return "", false, nil
 			}
-			// A '#' inside a word is literal, exactly as in the shell.
+			// A '#' that does not follow a blank is literal, exactly as in the
+			// shell: inside a word, and also as a word's first byte straight
+			// after the '='.
+			started = true
 			b.WriteByte('#')
 			p.col++
 
@@ -308,10 +392,12 @@ func (p *parser) readWord(term byte, start int) (string, bool, error) {
 		case c == '\\':
 			p.col++
 			if p.eol() {
-				// Backslash-newline: a line continuation.
+				// Backslash-newline: a line continuation. The shell removes it
+				// before reading the word, so a ':' before it still counts.
 				if !p.advanceLine() {
 					return "", false, p.errf(start, "line continuation at end of file")
 				}
+				colon = afterColon
 				continue
 			}
 			started = true
@@ -334,6 +420,18 @@ func (p *parser) readWord(term byte, start int) (string, bool, error) {
 			started = true
 			b.WriteString(s)
 
+		case c == '~' && afterColon && term == 0:
+			// An assignment is the one context where bash expands a ~ after an
+			// unquoted ':' as well as after the '=' — the rule that makes
+			// PATH=~/bin:~/go/bin work — so STAGING=/a:~/b is /a:$HOME/b to
+			// brb.sh. Array elements are words, not assignments, and keep it
+			// literal, as this parser always did. Refused rather than
+			// implemented, like ~user: a path that needs it is rare enough to
+			// spell out.
+			return "", false, p.errf(p.li+1, "~ after a ':' is not supported: in an assignment the "+
+				"shell expands it there too, so brb.sh would read a different path — write the path out, "+
+				"or quote the ~")
+
 		case c == '`':
 			return "", false, p.errf(p.li+1, "command substitution is not supported")
 
@@ -342,6 +440,7 @@ func (p *parser) readWord(term byte, start int) (string, bool, error) {
 
 		default:
 			started = true
+			colon = c == ':'
 			b.WriteByte(c)
 			p.col++
 		}
@@ -439,11 +538,31 @@ func (p *parser) readDoubleQuoted(start int) (string, error) {
 // both readers already agree on that, so refusing them would reject a file
 // brb.sh accepts. $- and $[...] expand in either context and are refused in
 // both.
+//
+// A line continuation is the other way to put text after a '$' that bash reads
+// differently, in either context, because bash deletes it before it looks at
+// the '$' at all. $\<newline>HOME is $HOME to bash and was the literal text
+// "$HOME" here, which took the backslash as an ordinary byte after the '$';
+// $\<newline>'x' was $'x', the very form refused above. So a continuation
+// straight after a '$' is refused, whatever the next line holds. After $HOME
+// it matters only when the next line carries the name on — $HOME\<newline>X is
+// the variable HOMEX to bash, unset and fatal under brb.sh's set -u, and was
+// $HOME followed by "X" here — so only that is refused, and $HOME\<newline>/x,
+// which both read as $HOME/x, still loads. ${HOME} needs nothing: the braces
+// end the name. readName could have learned to follow continuations instead,
+// but nobody splits a variable reference across lines on purpose, and a
+// refusal names the line where a reproduction would have to be right about
+// every case.
 func (p *parser) readDollar(inDouble bool) (string, error) {
 	line := p.li + 1
 	p.col++ // consume '$'
 	if p.eol() {
 		return "$", nil // a trailing '$' is a literal dollar sign
+	}
+	if p.atContinuation() {
+		return "", p.errf(line, "a line continuation straight after '$' is not supported: the shell "+
+			"joins the lines first and reads the '$' with what follows, so brb.sh would expand something "+
+			"this reader kept as text — keep the reference on one line, or escape the dollar as \\$")
 	}
 	switch c := p.peek(); {
 	case c == '(':
@@ -476,6 +595,11 @@ func (p *parser) readDollar(inDouble bool) (string, error) {
 		if name != "HOME" {
 			return "", p.errf(line, "variable expansion is not supported: $%s (only $HOME is)", name)
 		}
+		if p.nameContinues() {
+			return "", p.errf(line, "$HOME runs on past a line continuation: the shell joins the lines "+
+				"first and reads one longer variable name, which brb.sh would expand (or die on) instead "+
+				"of $HOME — write ${HOME}, whose braces end the name, or keep the line whole")
+		}
 		return p.homeOrErr(line)
 	case c >= '0' && c <= '9', c == '@', c == '*', c == '#', c == '?', c == '!', c == '$', c == '-':
 		return "", p.errf(line, "variable expansion is not supported: $%s", string(c))
@@ -485,13 +609,27 @@ func (p *parser) readDollar(inDouble bool) (string, error) {
 }
 
 // readTilde expands a leading ~ that stands alone or introduces a path.
+//
+// Only what ends the shell's tilde-prefix unquoted counts as "alone": a '/', a
+// blank, or the ')' closing an array. A quote or a '#' straight after the ~
+// used to count too, and does not to bash. A quote anywhere in the prefix stops
+// the expansion outright, so STAGING=~"/My Backups" is a directory literally
+// named ~ to brb.sh — and was $HOME/My Backups here. A '#' is part of the word,
+// so ~#x is looked up as a user named "#x" and, failing that, left as typed.
+// Both are refused now, the way ~user always was, which is the safe side of
+// the difference: brb.sh still accepts them and the README's table of reader
+// differences says so.
 func (p *parser) readTilde() (string, error) {
 	line := p.li + 1
 	p.col++ // consume '~'
 	if !p.eol() {
 		switch p.peek() {
-		case '/', ' ', '\t', ')', '#', '"', '\'':
+		case '/', ' ', '\t', ')':
 			// A bare ~ or the start of a ~/path.
+		case '"', '\'':
+			return "", p.errf(line, "a quote straight after ~ stops the shell expanding it, so brb.sh "+
+				"would read a directory literally named ~ — quote only what follows the slash "+
+				"(~/\"My Backups\"), or write the path out")
 		default:
 			return "", p.errf(line, "~user expansion is not supported (only a leading ~ or ~/ is)")
 		}
@@ -506,22 +644,33 @@ func (p *parser) homeOrErr(line int) (string, error) {
 	return p.home, nil
 }
 
-// homeDir returns the user's home directory the way the shell would: $HOME
-// first, falling back to the password database. It returns "" when neither is
-// available, and callers turn that into an error only if expansion is asked for.
+// homeDir returns $HOME, or "" when it is unset or empty, and callers turn ""
+// into an error only if expansion is asked for.
+//
+// It does not consult the password database. Its comment used to say it fell
+// back to one through os.UserHomeDir, but on Unix that function is the same
+// $HOME lookup and nothing more, so the fallback never existed — and the
+// refusals that rest on "no HOME" (checkHomeDerived, homeOrErr, the empty
+// DefaultConfigPath) are only reachable because it does not. With no HOME,
+// then, every expansion is refused.
+//
+// brb.sh treats the two halves of "no HOME" differently, and agrees with this
+// in one place only: $HOME with HOME unset, which set -u makes fatal there too.
+// A leading ~ with HOME unset is resolved by bash through getpwuid. With HOME
+// set but empty, bash expands both $HOME and ~ to nothing without complaint,
+// so $HOME/brb is /brb to brb.sh and refused here. The README's table of
+// reader differences records both.
 func homeDir() string {
-	if h := os.Getenv("HOME"); h != "" {
-		return h
-	}
-	if h, err := os.UserHomeDir(); err == nil {
-		return h
-	}
-	return ""
+	return os.Getenv("HOME")
 }
 
 // expandHomePath applies the same HOME expansion to a value that did not come
 // from the configuration file — an environment variable, whose quoting the
 // shell has already removed.
+//
+// brb.sh's env_home_expand is its twin, applied to the environment values that
+// script reads, and the two have to change together: a difference between
+// them is one exported STAGING naming two directories.
 func expandHomePath(s string) string {
 	home := homeDir()
 	if home == "" {

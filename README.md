@@ -24,7 +24,7 @@ bin-pack the tree into disc-sized groups
 every other disc still restores on its own. The last step of a restore is
 
 ```bash
-mount -o loop,ro disc07.squashfs /mnt
+mount -o loop,ro,nosuid,nodev disc07.squashfs /mnt
 ```
 
 which needs nothing but the Linux kernel — no `brb`, no Python, no bespoke
@@ -239,9 +239,9 @@ sign for one.
 
 None of this is the [`SHA512SUMS` a disc carries](#what-ends-up-on-each-disc).
 That file is written at backup time over the files of that one disc, is what
-`sha512sum -c` checks during a restore, and nothing signs it — a disc is in your
-hand, and the question it answers is whether the plastic still reads back, not
-who published it.
+`verify-disc` and `ingest` check a disc's files against (and `sha512sum -c` by
+hand), and nothing signs it — a disc is in your hand, and the question it
+answers is whether the plastic still reads back, not who published it.
 
 ---
 
@@ -290,6 +290,15 @@ The source tarball vendors its dependencies, so it rebuilds with no network:
 ```bash
 tar xzf brb-src.tar.gz && cd brb-*/go && go build -mod=vendor ./cmd/brb
 ```
+
+That leaves the binary at `go/brb`, inside the tree, and `build-dist.sh` will
+not run from that tree until it is moved out. The script copies `go/` whole
+into `brb-src.tar.gz`, so it refuses to run while `go/` holds anything that is
+not source — a stray binary, profile or key there would otherwise ride along in
+plaintext on every disc. In a git checkout that means any file git does not
+track, ignored ones included, apart from the `go/vendor` the script rewrites
+itself; in an unpacked tarball, anything but `*.go`, `*.tmpl`, `go.mod`,
+`go.sum` and `go/vendor`. It names each file it refuses.
 
 ## Quick start
 
@@ -367,7 +376,7 @@ here.
 | `brb init-key --rescue-key` | additionally add a second recipient whose identity is passphrase-protected. It asks for the passphrase on the terminal, so it is refused under `--yes` |
 | `brb plan` | scan and show the disc layout without building anything |
 | `brb backup` | build, encrypt, protect and image every disc. `--verify-roundtrip` decrypts each image back and compares hashes before the plaintext is deleted — it needs a readable, *unencrypted* `AGE_IDENTITY` and refuses to start without one |
-| `brb burn <n\|n-m\|n-\|all>` | burn ISOs, confirming before each; builds each ISO if it is missing and removes it again after a successful burn |
+| `brb burn <n\|n-m\|n-\|all>` | burn ISOs, confirming before each; builds each ISO if it is missing and removes it again after a successful burn, unless there is no disc directory to rebuild it from, when it is kept |
 | `brb iso <n\|n-m\|n-\|all>` | build ISO images without burning, for burning elsewhere |
 
 **Reading a set — either implementation.** Substitute `brb.sh` for `brb` below
@@ -385,9 +394,22 @@ a promise that nothing else does.
 | `doctor` | checks backup readiness; exits 1 with an identity but no recipients file | checks restore readiness; exits 0 on the same config |
 | flags after `--` | left alone: `brb index -- -y` searches for `-y` | `-y` and `-c` are stripped from anywhere on the line, so the same command searches for something else |
 | `$'...'`, `$"..."`, `$-`, `$[...]` in a config | refused, naming the line: they cannot be expanded faithfully outside a shell, and `$-` not at all | expanded, because the file is `source`d — so a config using any of them is one the Go build will not load |
+| a backslash-newline in a config straight after a `$`, or one that runs `$HOME` on into a longer name | refused, naming the line | the lines are joined first: `$` and then `HOME` on the next line is `$HOME`, and `$HOME` and then `X` is the variable `HOMEX`, fatal under `set -u` when it is unset |
+| `KEY= value` in a config — a space after the `=` | refused, naming the line | an empty `KEY`, and `value` run as a command: usually an error, but `STAGING= :` quietly keeps the default |
+| `~` in a config other than alone or before a `/`: `~user`, `~"..."`, `~#`, or after a `:` in a value | refused, naming the line | the shell's rules: `~user` is that user's home if there is one, a quote stops the expansion, an unquoted `:` starts another |
+| a leading `~` in a config with `HOME` unset | refused, naming the line | resolved from the password database — but only when `BRB_CONFIG` and `AGE_RECIPIENTS_FILE` are both exported; otherwise `brb.sh` dies on `HOME: unbound variable` before it reads the file, `-c` or not |
+| `HOME` set but empty | treated as unset: `$HOME` and a leading `~` in a config are refused, naming the line, and so is a run that needs a home-derived default (the config path, `AGE_RECIPIENTS_FILE`) | the empty string: `$HOME/brb` is `/brb`, and the defaults are looked for under `/.config/brb` |
+| text glued to an array's `)`, as in `PRUNE_DIRS=( a )#x` | refused, naming the line | the string `(a)#x`; only the Go build reads these keys |
+| a config path that `stat` cannot answer for any reason but a missing file: a directory that cannot be searched, a component that is a regular file, a symlink loop | refused, with the error: "permission denied", "not a directory", "too many levels of symbolic links" | `-c`: "config file not found"; `BRB_CONFIG`: "no config file", and the defaults are used — `test -e` cannot tell any of these from a missing file |
+| `help`, or no command at all, with a config `brb.sh` cannot load: a `-c` that names nothing, a path that is not a regular file, a bash syntax error | prints help on the built-in defaults, as for any config it cannot load | stops with the config error |
 | `ingest` with no terminal | runs unattended | prompts on `/dev/tty` between discs even with a mount path and `--yes`, and fails outright without one |
-| a foreign disc | staged first, refused at restore, leaving the file behind | refused before anything is staged |
+| a disc `ingest` refuses — another set's index or published key, a missing `data/`, or one with no file at its top level | refused before anything from it is staged; interactively the run offers another disc and exits non-zero at the end, under `--yes` it exits non-zero at once | refused before anything from it is staged; the run ends there |
+| a disc whose own copy of the index cannot be read back | stages the files that sort before the index — its image — then fails that disc at the index | refused as another set's, with nothing staged, when nothing on the disc records the index's hash; when something does, the copy is taken for rot and the rest of the disc is ingested |
+| `verify-disc`, a `SHA512SUMS` naming an absolute path or a `..` component | reported as a mismatch, with the par2 hint | refused outright as a checksum file brb did not write; the exit status is the same |
+| `verify-disc` with no `ARCHIVE_NAME` in the config or the environment | compares the disc's archive name with the one it derives for a backup, `<basename of SOURCE_DIR>-<today>`, so it warns that nearly every real disc "belongs to archive …" — advice only, the exit status is unaffected | says nothing: it compares only an `ARCHIVE_NAME` that is set |
+| `ingest`, a disc whose `SHA512SUMS` has a line that does not parse (a mangled digest, a BSD-style line, leading whitespace) | no copy is checked against it, with a warning | that line is skipped and the lines that do parse are still used, so every other copy is still checked |
 | `--only` | repeat the flag per path | as documented below |
+| case in an `index` pattern | folded by Unicode rules: `ÉTÉ` finds `Été.txt` in any locale | folded by `grep -i` in the current locale: ASCII only under `C`/`POSIX` (and, going by its source, on busybox in any locale), so `ÉTÉ` finds nothing there, and under UTF-8 not quite Go's either (`longss` finds `longſs.txt`). Both match the pattern as a literal substring, not a regular expression |
 
 `KEEP_IMAGES` and `ASSUME_YES` used to belong on that list and no longer do:
 both readers now take them from the config file, so one file drives both.
@@ -470,6 +492,16 @@ interrupted run, or the resume stops rather than write two different trees into
 one set. Without `--resume`, a `backup` that finds finished discs in staging
 refuses to start rather than overwrite days of work.
 
+One change to the tree is refused: a path a finished disc holds that has since
+changed kind — a directory moved elsewhere and symlinked back to free space, a
+file replaced by a directory. The finished discs cannot be rewritten, so the
+set would hold that path as one kind on them and as another on every later
+disc, and a restore cannot reliably lay one over the other. The resume names
+each path with what it was and what it is now; put them back, or start the set
+over. A resume with nothing left to write, interrupted after its last disc,
+only warns, because no further disc carries the change — unless the path is
+now a file, which would itself need one.
+
 The resume also refuses anything that would make the finished discs and the
 ones still to come disagree about what set they belong to. The state file
 records the recipients the first disc was encrypted to, the disc geometry
@@ -492,7 +524,9 @@ of roughly 2.2x it for the whole length of a burn campaign — an ISO is a full
 second copy of its disc directory. Set `KEEP_ISOS=1` to keep them, or
 `ISO_MODE=eager` for the old behaviour of building every ISO before the first
 burn. To materialise them as files without burning — to take to another machine,
-or a different burner — use `brb iso all`.
+or a different burner — use `brb iso all`. On that other machine, with ISOs and no
+disc directories, `burn` keeps each ISO after burning it whatever `KEEP_ISOS`
+says, since there is nothing to rebuild it from.
 
 ---
 
@@ -506,7 +540,9 @@ environment variable.
 set was built — source tree, disc geometry, compression, pack ratio, par2
 parameters, ISO mode — was decided when it was written and is recorded in
 `MANIFEST.txt` on every disc. The bash reader ignores all of it and uses only
-`STAGING`, `AGE_IDENTITY`, `AGE_RECIPIENTS_FILE`, `BURNER` and `KEEP_IMAGES`.
+`STAGING`, `AGE_IDENTITY`, `AGE_RECIPIENTS_FILE`, `BURNER`, `KEEP_IMAGES` and
+`ASSUME_YES` (and, if a writer config happens to set `ARCHIVE_NAME`,
+`verify-disc` warns when a disc names a different archive).
 
 **`brb.sh` `source`s the config file — it executes it as bash.** Anything in it
 runs with your privileges, not just `KEY=value` lines: a config containing `rm
@@ -521,16 +557,26 @@ The Go build does not source anything: it parses the file, accepts only
 error naming the line. Pointing it at the same hostile file is an error message,
 not an execution.
 
-**One sharp edge if you share a config between them.** Because `brb.sh` sources
-the file, an unknown key is simply a variable nobody reads. The Go build
-*validates*, and rejects an unknown key by refusing to run at all. `KEEP_IMAGES`
-is the case that bites today: it is a real bash setting, and putting it in a
-shared config stops the Go build dead. Use its `--keep-images` flag instead, or
-keep the readers on separate config files. Booleans, by contrast, really do
-travel: both readers take `1`/`0`, `true`/`false`, `yes`/`no` and `on`/`off`, in
-any case, so a value written for one is not misread by the other. A spelling
-neither of them can read as a boolean stops the Go build at load, naming the key
-and the line, rather than being quietly taken as false.
+**One config can drive both readers, with care.** Every key `brb.sh` reads is
+one the Go build knows, and both readers take `KEEP_IMAGES` and `ASSUME_YES`
+from the file. So mind what `ASSUME_YES=1` in a shared config does: it answers
+every confirmation, from either reader, including the one in front of a
+`restore` that overwrites its destination. And anything in the file the Go
+build cannot accept still stops it where `brb.sh` carries on. The Go build
+*validates* the whole file, writer keys included, on every command but `help`
+and `version` — an `index` or a `restore` as much as a `backup` — and refuses
+to run at all, naming the line. That covers a key it does not know: `brb.sh`
+sources the file, so an unknown key is simply a variable nobody reads. It
+covers a value it cannot read for a key it does know, even a writer key
+`brb.sh` never looks at: `PACK_RATIO=abc` or `DISC_TYPE=floppy` is invisible to
+`brb.sh` and fatal to the Go build. And it covers shell beyond a plain
+assignment — any command, and the shell-only syntax listed in the table of
+reader differences under [Commands](#commands) — which `brb.sh` runs or
+expands. Booleans, on the other hand, do travel: both readers take `1`/`0`,
+`true`/`false`, `yes`/`no` and `on`/`off`, in any case, so a value written for
+one is not misread by the other. A spelling neither of them can read as a
+boolean stops the Go build at load, naming the key and the line, rather than
+being quietly taken as false.
 
 ```bash
 SOURCE_DIR=/home/you
@@ -560,6 +606,19 @@ EXCLUDE_MASKS=( "*.pyc" "core.[0-9]*" )               # filename patterns
 That is the useful subset, not the whole set of keys. Since the Go build rejects
 a key it does not know, take the authoritative list from `brb help`, which prints
 every setting with the value actually in force.
+
+A few rules hold on both readers. `KEY=` with nothing after it means "not set"
+and leaves the default in force: that is how the sample above leaves
+`DISC_CAPACITY_BYTES` and `DIST_DIR` alone, and `STAGING=` is `/var/tmp/brb` to
+both. (The two lists are the exception: an empty `PRUNE_DIRS` or
+`EXCLUDE_MASKS` switches its defaults off.) `-c` and `BRB_CONFIG` must name a
+regular file or a symlink to one; a directory, a FIFO, a device or a `<(...)`
+pipe is refused rather than read or skipped (by every command but the Go
+build's `help`, which prints on the built-in defaults instead, and its
+`version`, which reads no config). And an environment value that carries a
+literal `~/` or `$HOME` — from a systemd `Environment=` line or an env file,
+where no shell expanded it — has it expanded when `HOME` is set, so
+`STAGING=~/brb` there names the same directory to both.
 
 **Note the mask is `core.[0-9]*`, not `core`.** A bare `core` matches every
 *directory* named `core/` as well as the dump files, and a matching directory is
@@ -676,8 +735,18 @@ finished disc feeds its measured ratio back and the next disc is planned from th
 worst of the last `PACK_RATIO_WINDOW` (3) discs times `PACK_RATIO_MARGIN` (1.05).
 The estimate moves in both directions, so a stretch of incompressible files
 raises it again rather than packing the rest of the set to a ratio only the early
-discs achieved. `PACK_RATIO` is then the starting guess for disc 1. Set
-`PACK_RATIO_ADAPT=0` to hold the configured value fixed for the whole set.
+discs achieved. `PACK_RATIO` is then the starting guess for disc 1.
+
+Set `PACK_RATIO_ADAPT=0` to stop learning the ratio from finished discs and plan
+from the configured value instead. That does not hold the value fixed. A disc
+that overshoots is still measured and re-packed as above, and the ratio that
+re-pack used stays in force for every later disc, and through `--resume`:
+dropping back would have the next disc overshoot the same way and rebuild its
+whole image again, once per disc. So with adaptation off the ratio only ever
+moves up, and only on an overshoot — and one disc of incompressible files then
+packs the rest of the set as if it were incompressible too, even where the
+configured value would have fitted. That is the case the adaptive window exists
+for; leave it on unless you have a reason not to.
 
 ### Why two compressors
 
@@ -693,9 +762,10 @@ installed at the time.**
 | `brb-src.tar.gz` | gzip | ~1–2 MB | a **person**, with `tar xzf` |
 
 zstd costs nothing on the images, because SquashFS-zstd is decompressed by the
-Linux kernel itself. The promise that `mount -o loop,ro disc07.squashfs /mnt`
-needs no userspace tooling survives intact, and across hundreds of gigabytes the
-ratio is worth real money in media.
+Linux kernel itself. The promise that
+`mount -o loop,ro,nosuid,nodev disc07.squashfs /mnt` needs no userspace tooling
+survives intact, and across hundreds of gigabytes the ratio is worth real money
+in media.
 
 The index inverts that calculus. It is the artifact you reach for when a disc has
 been **lost** — you are asking "what was on it?", quite possibly from a rescue
@@ -781,11 +851,15 @@ age -d -i /path/to/identity.txt -o disc07.squashfs disc07.squashfs.age
 ```
 
 ```bash
-mkdir -p image && sudo mount -o loop,ro disc07.squashfs image
+mkdir -p image && sudo mount -o loop,ro,nosuid,nodev disc07.squashfs image
 ```
 
 Not `/mnt` — the disc is mounted there, and mounting the image over it hides the
-`data/` directory the first line reads from for every remaining disc.
+`data/` directory the first line reads from for every remaining disc. And
+`nosuid,nodev` because `ro` alone leaves setuid bits and device nodes working: a
+setuid program or a device node in the backup — an old `sudo` from a backup of
+`/`, say — would otherwise act on the machine reading it, for anyone who can
+reach the mount. `brb mount` uses the same options.
 
 That is the whole restore path. `unsquashfs -d /dest disc07.squashfs` extracts
 instead of mounting; run it as root if you want original ownership back, and add
@@ -973,7 +1047,24 @@ never will be.
   deletes each one as soon as its contents are on disk, so by default nothing is
   left there but what a failed run dropped. `KEEP_IMAGES=1` (or `--keep-images`)
   keeps them all, and `list` and `mount` leave the image they decrypted behind
-  by design. Remove them when you are done: `rm -rf $STAGING/restore`.
+  by design. Remove them when you are done: `rm -rf "$STAGING/restore"`.
+- **`$STAGING` must never have been writable by another account.** Each run
+  makes every staging directory it uses mode 0700 and refuses one that another
+  account owns, so nothing can be planted there once `brb` has secured it.
+  What it cannot vouch for is what was planted *before* that: in a staging
+  directory you made group- or world-writable by hand, or adopted from another
+  account with `chown -R`, which leaves everything inside it in place. The
+  writer trusts little of what it finds — each disc directory is emptied and
+  laid out afresh on every run (one that is a mount point, or holds one, is
+  refused instead, since emptying it would empty what is mounted there; a
+  directory bind-mounted from the filesystem `$STAGING/discs` is on is
+  recognised only on Linux with `/proc` mounted), and `MANIFEST.txt` and the
+  documents beside it are written under a new name and renamed into place, so
+  none of them follows a link left at the name — but the resume state
+  (`$STAGING/state.json`), the plaintext index in `work/` and the ciphertext
+  in `enc/` *are* the set, read back as they are, and a file planted there
+  cannot be told from one `brb` wrote. If staging was ever shared, remove it
+  and start the set over.
 - **The recipients file contains public keys only** and is harmless. The identity
   file is the secret, and it is never written to a disc — the one exception being
   a [public archive](#a-public-archive-with-no-secret-at-all), whose freshly
@@ -981,7 +1072,10 @@ never will be.
 - Encrypting to multiple recipients is supported: append more `age1...` public
   keys to the recipients file and every image becomes decryptable by any of them.
   `brb init-key --rescue-key` is that mechanism applied to your own second key —
-  see [Keys, and the rescue key](#keys-and-the-rescue-key).
+  see [Keys, and the rescue key](#keys-and-the-rescue-key). The ceiling is 1024
+  keys: age will encrypt a file to more, but no age from 1.3.2 on will decrypt
+  it, so `backup` refuses a recipients file that long and `init-key` will not
+  add a key past it.
 - **An identity can be passphrase-protected** (`age -p`) and used exactly like a
   plain one on the restore side; `brb` unlocks it once per command. The
   passphrase is read from `/dev/tty` and nowhere else, so it is the one prompt
@@ -998,6 +1092,30 @@ never will be.
 - Run `brb backup` as root if you want to capture files you cannot read as your
   own user, and to record real ownership. As a non-root user, unreadable files are
   skipped and ownership is recorded as yours.
+- **`brb mount` is a browse mount, not this machine's system.** Both readers
+  mount the image `nosuid,nodev`, so a setuid binary or a device node in the
+  backup does nothing on the host; copying out with `cp -a`, `tar` or `rsync`
+  still keeps both. What it does not change is who can read the tree: any local
+  account that can reach the mount point reads the decrypted files under their
+  archived permissions, and an archived uid may be somebody else here. The
+  directories `brb mount` creates are 0700; on a shared machine, mount somewhere
+  only you can enter.
+- **Back up a tree other accounts can change from a snapshot.** `brb` scans
+  `SOURCE_DIR` and then hands the names it recorded to mksquashfs, once per
+  disc and hours later on a long set. mksquashfs, like the scan itself,
+  resolves each path again. Neither follows a symlink it finds inside the tree,
+  but either will follow a directory that was renamed and replaced by a symlink
+  in the meantime. An account that can rename `SOURCE_DIR`, a directory above
+  it or a directory inside it can therefore have files from elsewhere archived
+  under the recorded names, read with the backing-up user's privileges and with
+  no warning. Run as root, that can put files the account could never read
+  onto the discs. The images are encrypted to your keys, so this discloses
+  something only to whoever can read the set, which for a
+  [public archive](#a-public-archive-with-no-secret-at-all) is anyone. As on
+  the restore side (see [Limitations](#limitations)), `brb` cannot close the
+  window: no descriptor survives into a subprocess that takes a path. Back such
+  a tree up from a read-only snapshot (LVM, btrfs, ZFS) mounted where only root
+  can write, and make a public archive of it no other way.
 
 ---
 
@@ -1016,7 +1134,9 @@ Known and deliberate, but you should hear them before you rely on this:
   `$STAGING`; if staging has been cleared, the set is built again from scratch.
   A resume re-scans the source and skips what is already on a disc, so files
   added since the run started are picked up on later discs and a set can span
-  two points in time — it warns when the tree's measured size has changed.
+  two points in time — it warns when the tree's measured size has changed. It
+  refuses a path a finished disc holds that has changed kind since, such as a
+  directory moved away and symlinked back, while discs remain to be written.
 - **One filesystem at a time.** The scan does not descend into a mounted
   *directory* under `SOURCE_DIR`: the mount point is reported at `plan` and
   `backup` time, appears on the discs as an empty directory, and nothing
@@ -1056,8 +1176,31 @@ Known and deliberate, but you should hear them before you rely on this:
   all. It gives nothing when a single self-consistent forged disc is all you
   have. And a filename containing a newline cannot survive the line-based
   listing the check reads, so for a set holding one the check says out loud
-  that it could not be made exact, and does not refuse. It is not a signature;
-  the format has no signing key.
+  that it could not be made exact, and does not refuse. The same happens when
+  the index fails the hash recorded beside it, in `index.tsv.gz.age.sha512` —
+  and that file, unlike the index, is not pinned: a later disc carrying the
+  genuine index and a different `.sha512` replaces the staged one, and the
+  check is then skipped, with that warning, for every disc of the set. A forger
+  gains nothing by it that a newline in a filename on their own disc does not
+  already give them. It is not a signature; the format has no signing key.
+
+  The same listing limits what `restore --only` can prove. A requested path
+  whose name holds a newline (or a carriage return) cannot be looked up in an
+  image's listing at all, and an ordinary one can be found there falsely, in a
+  piece of a newline-named entry — `--only foo` against an image holding
+  `$'foo\nbar'`, whose listing prints a line reading `foo`. In both cases the
+  two readers take the destination as the proof: the path counts as restored if
+  it is there once `unsquashfs` has run. **If the destination already held that
+  path, the proof proves nothing** — a disc that never had it still ends in
+  "restore complete", with the old copy left in place. With a readable index
+  and no `--disc`, both readers refuse a path the index does not list before
+  opening any image, so this needs one of three things, each the same on both
+  readers. A missing or unreadable index, which both warn about and search
+  past. A `--disc N` naming a disc that lacks the path when the index does not
+  list the path at all: both search disc N anyway, because `--disc` names it,
+  and refuse only when the index puts the path on another disc. Or an image
+  that disagrees with its index. Restore such a path into an empty directory,
+  or move the existing copy aside first.
 
 - **A restore overwrites its destination.** `unsquashfs -f` replaces existing
   files with the backup's versions, mode and mtime included, and `--yes` answers
@@ -1082,6 +1225,13 @@ Known and deliberate, but you should hear them before you rely on this:
   staging somewhere whose parent directories are yours or root's — the default
   `/var/tmp/brb` qualifies, because `/var/tmp` is root-owned and sticky and no
   other account can put anything in `brb`'s way.
+- **The same holds for a mount point.** Both readers refuse a `brb mount` point
+  that is itself a symlink, since `mount(8)` would mount the image over whatever
+  it points at — which also refuses a root-owned link such as `/mnt` on Fedora
+  Atomic desktops; pass the real directory (`/var/mnt`). But they trust every
+  directory above it, and hand `mount(8)` a path it resolves again, so a link
+  planted in between is followed. Mount under a directory only root can write,
+  never inside a group-writable directory or another user's.
 - **A restore needs room for the extracted tree plus one decrypted image.** Each
   image is removed as soon as its contents are on disk, so only one exists at a
   time. `KEEP_IMAGES=1` (or `--keep-images` on the Go build) keeps them all for
@@ -1102,7 +1252,10 @@ Known and deliberate, but you should hear them before you rely on this:
 ## Testing
 
 Two suites, with no overlap. Both build real disc sets with the real tools —
-mksquashfs, age, par2, xorriso — and restore them; neither mocks anything.
+mksquashfs, age, par2, xorriso — and restore them with the real tools too. The
+only stand-ins are in a few `xcompat-test.sh` checks, which put one first on
+`PATH` to reach a condition a well-formed set cannot produce: a `mount(8)` that
+records its arguments, and wrappers that make `unsquashfs` or `sha512sum` fail.
 
 ```bash
 ./go-e2e-test.sh
@@ -1136,6 +1289,15 @@ given the archive's directory mode, owner and times. Each refusal is checked
 alongside the cases that must still restore, so neither guard can pass by
 refusing everything.
 
+`mount` needs root to do for real, so it is held to what can be checked without
+it: both readers refuse a mount point that is a symlink, in every spelling the
+kernel would resolve through and before either touches staging, and both hand
+`mount(8)` the same `-o loop,ro,nosuid,nodev --` list and create the same 0700
+directories. That last check runs the readers as root of a user namespace
+(`unshare -r`) with a stand-in `mount`; where user namespaces are refused it
+skips, and only the script's mount line is checked, by reading it. CI does not
+let it skip (see [Continuous integration](#continuous-integration)).
+
 Where the two differ in a way that ought to be fixed, the check is written the
 way it ought to pass and marked `XFAIL` with the divergence named. An `XFAIL`
 that starts passing is reported as `XPASS` and **counted as a failure**, so a
@@ -1168,7 +1330,10 @@ is the only arrangement that catches a machine-specific path getting baked into 
 default again. For `build-dist.sh` that is taken literally: no output argument,
 `BRB_DIST_OUT` unset, and `HOME` pointed at a fresh, empty directory for that one
 step, so the script's own `~/brb-dist` fallback is what decides where the
-payload lands, and the checks that follow look only there.
+payload lands, and the checks that follow look only there. (One later step runs
+it twice more with a throwaway output directory, on purpose: those runs exist
+to be refused, as described below, and must not land anywhere the payload
+checks look.)
 
 Every third-party action the workflow uses is pinned to a **40-character commit
 SHA**, with the release tag it came from in a trailing comment. A `@v5`-style
@@ -1190,13 +1355,17 @@ external tool is present *before* running anything, and it checks for more than
 the suites themselves require. The quiet failures are the reason. A
 tool-dependent Go test calls `t.Skip` when detection fails, so a runner missing
 `par2` would report a green `go test ./...` in which the integration tests never
-ran at all; and `xcompat-test.sh` treats `script(1)`, `flock(1)` and an
-`en_US.UTF-8` locale as *optional*, skipping the pty, staging-lock and locale
-checks and still exiting 0 without them — so CI checks for those three by name.
+ran at all; and `xcompat-test.sh` treats `script(1)`, `flock(1)`, an
+`en_US.UTF-8` locale and a working `unshare -r` as *optional*, skipping the pty,
+staging-lock, locale and `mount(8)`-argument checks and still exiting 0 without
+them — so CI checks for those four by name.
 Both are right on a laptop and dangerously quiet on a build runner. A tool
 the suites do require is loud already — `xcompat-test.sh` exits 77 and
 `go-e2e-test.sh` exits 2, either of which fails the step — so for those the
 check only buys a named tool up front instead of a dead suite forty minutes in.
+The `unshare -r` check has a step of its own before it: Ubuntu 24.04 refuses
+unprivileged user namespaces through an AppArmor setting, which CI switches off
+on its throwaway runner.
 
 The release job rebuilds `brb-src.tar.gz` with `GOPROXY=off`, so the offline
 rebuild the on-disc README promises is re-proven on every run rather than resting
@@ -1204,6 +1373,19 @@ on the last time somebody tried it by hand. It also checks the two cross-compile
 binaries are genuinely x86-64 and aarch64 and both static, and that `go.mod` and
 `go.sum` are already tidy — `build-dist.sh` runs `go mod tidy` itself, so any
 drift there means the committed module no longer describes what ships on a disc.
+
+The release assets are checked as the set a releaser will upload: the
+`SHA256SUMS` that gets signed must name exactly the four assets, no more and no
+fewer, since `sha256sum -c` checks only the lines that are there; the release
+directory must hold those four and `SHA256SUMS` and nothing else; and each
+asset must be the payload file it was renamed from, byte for byte. And
+`build-dist.sh`'s refusal to pack a non-source file under `go/` is tripped on
+every run, in both of its modes: an untracked file in the checkout, and the
+`go/brb` the offline rebuild recipe leaves in an unpacked tarball. Each run must
+fail by naming that file and nothing else, so a build broken for some other
+reason cannot pass for the refusal, and a new kind of source file the tarball
+allowlist does not know fails CI here rather than `build-dist.sh` in every
+unpacked tarball afterwards.
 
 ---
 

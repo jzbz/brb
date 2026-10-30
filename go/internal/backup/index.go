@@ -229,15 +229,25 @@ func rewriteIndex(ctx context.Context, path string, maxDisc int) (sum indexSumma
 //
 // That it is gzip at all is part of the on-disc format: brb.sh reads the index
 // with `gunzip -c`. The LEVEL is not — a decompressor cannot tell — so -9 is
-// only a choice about a file of a few hundred kilobytes.
+// only a choice about how long one compression takes and how big one file
+// comes out, once per set: a tree of about a million files makes an index of
+// the order of a hundred megabytes, which -9 brings to somewhere between 7 and
+// 20 MB in about two seconds. Where in that range depends on how alike the
+// names are, and on how thinly the packer spread neighbouring files across the
+// discs, since each disc's lines are sorted on their own. (Measured: 1.09
+// million paths from one real tree, 113 MB to 7.3 MB in 1.2 s; 1.2 million from
+// another, dealt at random over twenty discs, 143 MB to 21 MB in 2.2 s.) The
+// README's "perhaps 40 MB" at two million files is the top of that range. A
+// small tree's index is kilobytes either way.
 //
 // gzip rather than zstd, and deliberately so. The disc images use zstd because
 // the KERNEL decompresses them on mount, so it costs no userspace dependency.
 // The index is the opposite case: it is what a person reads when a disc has been
 // lost, possibly from a rescue USB, and gunzip has been on every Unix since 1992
-// where zstd dates from 2016. On a text file this small the size difference is a
-// rounding error, and it is not a trade worth making in the one code path that
-// runs after something has already gone wrong.
+// where zstd dates from 2016. Against a disc of tens of gigabytes the size
+// difference is a rounding error even for the largest index, and it is not a
+// trade worth making in the one code path that runs after something has
+// already gone wrong.
 func gzipFile(ctx context.Context, src, dst string) (err error) {
 	in, err := os.Open(src)
 	if err != nil {

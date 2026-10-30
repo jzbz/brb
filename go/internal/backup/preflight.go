@@ -1,11 +1,9 @@
 package backup
 
 import (
-	"bufio"
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -130,11 +128,30 @@ func (r *runner) loadRecipients() error {
 	if len(recs) == 0 {
 		return fmt.Errorf("backup: recipients file %s has no age1... keys", path)
 	}
-	keys, err := readPubkeys(path)
+	keys, err := pubkeyStrings(path, recs)
 	if err != nil {
 		return err
 	}
-	if err := probeRecipients(recs); err != nil {
+	// agecrypt.ProbeRecipients says why the set is probed at all. This used to
+	// call a second copy of it kept here, so a check added to agecrypt's — the
+	// recipient count age's decoder allows, agecrypt.MaxRecipients — would have
+	// passed by the one path that writes discs.
+	if err := agecrypt.ProbeRecipients(recs); err != nil {
+		if errors.Is(err, agecrypt.ErrTooManyRecipients) {
+			// Removing keys is the way out only for a set not yet under way.
+			// A resume is held to the keys its discs were encrypted to
+			// (checkRecipients), so for one that advice would only have
+			// traded this refusal for that one.
+			if r.opts.Resume {
+				return fmt.Errorf("backup: recipients file %s: %w — a resumed set must keep the keys its "+
+					"discs were encrypted to, so this one cannot go on: start it over with no more than %d "+
+					"(a disc already encrypted to this file opens only with age 1.3.1 or earlier, which had "+
+					"no such limit)", path, err, agecrypt.MaxRecipients)
+			}
+			return fmt.Errorf("backup: recipients file %s: %w — remove the keys you no longer need, "+
+				"and re-run (a disc already encrypted to this file opens only with age 1.3.1 or "+
+				"earlier, which had no such limit)", path, err)
+		}
 		return fmt.Errorf("backup: recipients file %s: age refuses to encrypt to this set of keys: %w — "+
 			"a set may not mix post-quantum (age1pq1...) and classic (age1...) recipients; edit the file so "+
 			"it holds one kind only, and re-run", path, err)
@@ -142,25 +159,6 @@ func (r *runner) loadRecipients() error {
 	r.recipients, r.pubkeys = recs, keys
 	r.p.OK("recipients: %d key(s) from %s", len(recs), path)
 	return nil
-}
-
-// probeRecipients encrypts a few bytes to recs, in memory and to nowhere, and
-// returns whatever age refuses with. It exists because parsing a recipients
-// file proves each key well-formed and nothing about the set: age (1.3 on)
-// refuses to encrypt to a set that mixes post-quantum and classic recipients,
-// AppendRecipient and ParseRecipientsFile both accept such a file, and the
-// refusal used to land in protect() — after disc 1's mksquashfs, an hour in.
-// The probe is the same call Encrypt makes, so anything age will object to
-// about the set is objected to here, in preflight, at the cost of one header.
-func probeRecipients(recs []age.Recipient) error {
-	w, err := age.Encrypt(io.Discard, recs...)
-	if err != nil {
-		return err
-	}
-	if _, err := w.Write([]byte("brb")); err != nil {
-		return err
-	}
-	return w.Close()
 }
 
 // preparePublicIdentity establishes the keypair a public archive is encrypted
@@ -249,28 +247,35 @@ func (r *runner) publicIdentityPath() string {
 	return filepath.Join(r.dirs.Enc, doc.PublicIdentityName)
 }
 
-// readPubkeys returns the age1 public keys of a recipients file verbatim, for
-// the manifest — verbatim because the manifest's job is to tell a restorer
-// which key opens this set, and a re-encoded or re-wrapped key is one they
-// cannot compare with the one in their own keyring.
-func readPubkeys(path string) ([]string, error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return nil, fmt.Errorf("backup: reading recipients %s: %w", path, err)
-	}
-	defer f.Close()
-	var out []string
-	sc := bufio.NewScanner(f)
-	for sc.Scan() {
-		line := strings.TrimSpace(sc.Text())
-		if strings.HasPrefix(line, "age1") {
-			out = append(out, line)
+// pubkeyStrings returns the public keys of recs as text, for the manifest and
+// the resume state's pin. They are taken from the recipients encryption will
+// use, never from a second read of the file: that is what this used to do,
+// and a file changed between the two opens — init-key --rescue-key appending
+// a key is the writer brb itself provides — left the images encrypted to one
+// set of keys while MANIFEST.txt and state.json recorded another, so the
+// manifest could name a rescue key as opening discs it cannot open, and every
+// later resume checked against keys nothing had been encrypted to.
+//
+// Re-encoding a key gives back the very line it was parsed from, which is what
+// the manifest needs: it tells a restorer which key opens the set, and a key
+// spelled differently is one they cannot compare with their own. age accepts
+// a recipient line only as canonical lowercase bech32 with nothing around it
+// — mixed case, a stray space and a bad checksum are all refused at parse —
+// and String() encodes the same bytes the same way, post-quantum keys
+// included.
+func pubkeyStrings(path string, recs []age.Recipient) ([]string, error) {
+	keys := make([]string, len(recs))
+	for i, rc := range recs {
+		s, ok := rc.(fmt.Stringer)
+		if !ok {
+			// No age recipient type lacks one today; a future one is refused
+			// here, in preflight, rather than recorded as nothing.
+			return nil, fmt.Errorf("backup: recipients file %s: key %d (%T) has no printable form "+
+				"to record in the manifest", path, i+1, rc)
 		}
+		keys[i] = s.String()
 	}
-	if err := sc.Err(); err != nil {
-		return nil, fmt.Errorf("backup: reading recipients %s: %w", path, err)
-	}
-	return out, nil
+	return keys, nil
 }
 
 // loadIdentity resolves the secret key used by the optional round-trip
@@ -326,13 +331,14 @@ func (r *runner) loadIdentity() error {
 // and restore/, and a writer that accepted it would be the same defect in the
 // other implementation. And what they hold is worth the check on its own:
 // img/ holds unencrypted squashfs images until each one is encrypted and
-// verified, enc/ the ciphertext, and work/ the index and the resume state,
-// whose Assigned list is what a continued run consults to decide which files
-// it may skip. A tampered state file does not corrupt a set loudly; it makes
-// the set quietly incomplete.
+// verified, enc/ the ciphertext, and work/ the plaintext index. The resume
+// state is in none of them: it is state.json in the root itself, one more
+// reason the root goes first. Its Assigned list is what a continued run
+// consults to decide which files it may skip, and a tampered state file does
+// not corrupt a set loudly; it makes the set quietly incomplete.
 //
 // This runs before checkSpace, which measures the filesystem under STAGING,
-// and before prepareState, which reads work/state.json — so nothing is
+// and before prepareState, which reads <STAGING>/state.json — so nothing is
 // measured through a symlink and no resume decision is taken on a file another
 // account could have written.
 func (r *runner) makeDirs() error {
@@ -470,8 +476,12 @@ func (r *runner) prepareState(ctx context.Context) error {
 		return err
 	}
 	if _, err := os.Stat(indexPath); errors.Is(err, fs.ErrNotExist) {
-		// A run that got as far as encrypting the index deletes the plaintext
-		// one; resuming such a set only has the later steps left to do.
+		// Only finish deletes the plaintext index, as the step before it
+		// deletes this state file. A resume that finds the state and only the
+		// encrypted index is one whose last run stopped between the two, or
+		// could not remove the state, and only the later steps are left to do.
+		// A run stopped anywhere earlier, even after buildIndex, still has its
+		// plaintext index and resumes below, building the encrypted one again.
 		if _, encErr := os.Stat(filepath.Join(r.dirs.Enc, indexName)); encErr != nil {
 			return fmt.Errorf("backup: --resume: neither %s nor the encrypted index exists, "+
 				"so the file-to-disc map is lost; staging is inconsistent, start over", indexPath)

@@ -2,13 +2,18 @@ package backup
 
 import (
 	"context"
+	"crypto/sha512"
+	"encoding/hex"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
+	"github.com/jzbz/brb/internal/agecrypt"
 	"github.com/jzbz/brb/internal/config"
+	"github.com/jzbz/brb/internal/disc"
 	"github.com/jzbz/brb/internal/fsx"
+	"github.com/jzbz/brb/internal/tools"
 )
 
 // stagingRunner is a runner with nothing set but the staging paths, which is
@@ -279,4 +284,431 @@ func TestAFailedPreflightReleasesTheStagingLock(t *testing.T) {
 		t.Fatalf("the failed preflight leaked the staging lock: %v", err)
 	}
 	lock.Release()
+}
+
+// layoutRunner is a stagingRunner able to lay out, document and checksum disc
+// directories without the external tools: no par2 (protectSidecars warns and
+// carries on), and a budget no test fixture can outgrow.
+func layoutRunner(t *testing.T, staging string) *runner {
+	t.Helper()
+	r := stagingRunner(t, staging)
+	r.tools = tools.NewSet(nil)
+	r.budget = disc.Budget{Usable: 1 << 40}
+	r.discCipher = map[int]string{}
+	return r
+}
+
+// plantEncArtefacts puts into enc/ what discPayload requires of disc 1 — the
+// ciphertext, both sidecars, the index and its sidecar, and one par2 file — as
+// an earlier run would have left them. The ciphertext sidecars hold the real
+// digests, because writeSums holds a disc this run did not encrypt to the
+// digest its sidecar recorded.
+func plantEncArtefacts(t *testing.T, r *runner) {
+	t.Helper()
+	base := imageName(1)
+	bodies := map[string]string{
+		base + ".age":      "ciphertext of disc 1",
+		base + ".age.par2": "parity over it",
+		indexName:          "the encrypted index",
+	}
+	for name, body := range bodies {
+		if err := os.WriteFile(filepath.Join(r.dirs.Enc, name), []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, name := range []string{base + ".age", indexName} {
+		sum := sha512.Sum512([]byte(bodies[name]))
+		if err := agecrypt.WriteSumFile(filepath.Join(r.dirs.Enc, name+".sha512"), hex.EncodeToString(sum[:]), name); err != nil {
+			t.Fatal(err)
+		}
+	}
+	plain := sha512.Sum512([]byte("plaintext of disc 1"))
+	if err := agecrypt.WriteSumFile(filepath.Join(r.dirs.Enc, base+".sha512"), hex.EncodeToString(plain[:]), base); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// writeCanary creates a file outside staging whose bytes must survive the
+// run, and returns its path.
+func writeCanary(t *testing.T, dir, name string) string {
+	t.Helper()
+	p := filepath.Join(dir, name)
+	if err := os.WriteFile(p, []byte("PRECIOUS "+name), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return p
+}
+
+func assertCanary(t *testing.T, p string) {
+	t.Helper()
+	got, err := os.ReadFile(p)
+	if err != nil {
+		t.Fatalf("canary %s: %v", p, err)
+	}
+	if want := "PRECIOUS " + filepath.Base(p); string(got) != want {
+		t.Errorf("%s was written through a planted link: it now holds %d byte(s) beginning %q",
+			p, len(got), firstLine(string(got)))
+	}
+}
+
+func assertRegular(t *testing.T, p string) {
+	t.Helper()
+	fi, err := os.Lstat(p)
+	if err != nil {
+		t.Errorf("%s: %v", p, err)
+		return
+	}
+	if !fi.Mode().IsRegular() {
+		t.Errorf("%s is %v, want a regular file this run wrote", p, fi.Mode().Type())
+	}
+}
+
+// TestDiscLayoutDoesNotTrustInheritedEntries. makeDirs secures the staging
+// root and its five subdirectories, and nothing below them; a staging tree is
+// reused across a resume, so whatever an earlier period left inside it was
+// taken as found. In a tree another account could once write — made g+w or
+// o+w by hand, or adopted with chown -R — that was a way to have a backup,
+// run as root as the README recommends, write wherever the planter chose, and
+// to put files of the planter's choosing on the discs as though brb had.
+func TestDiscLayoutDoesNotTrustInheritedEntries(t *testing.T) {
+	ctx := context.Background()
+
+	// Documents: a symlink at STAGING/MANIFEST.txt (the staging root is never
+	// emptied), and symlinks at a disc's README.md and identity.txt. The
+	// O_TRUNC writes the first two went through truncated the link's target
+	// and filled it with manifest or README text. identity.txt was removed
+	// before it was written, and is here so that it stays safe.
+	//
+	// Leftovers: plain files a disc directory held from before, at names this
+	// run does not overwrite. With no dist payload, copySelf kept any file
+	// already at brb-linux-<arch> — the planted one here, or an older brb an
+	// interrupted run had copied — and a planted brb.sh, never written by a
+	// payload-less run, stayed too. Both went into SHA512SUMS, and the README
+	// offered them to a restorer as copies of the tool.
+	t.Run("planted links and leftovers", func(t *testing.T) {
+		root := t.TempDir()
+		staging := filepath.Join(root, "staging")
+		outside := filepath.Join(root, "outside")
+		if err := os.MkdirAll(outside, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		r := layoutRunner(t, staging)
+		dd := filepath.Join(r.dirs.Discs, discDirName(1))
+		if err := os.MkdirAll(filepath.Join(dd, "data"), 0o777); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(dd, 0o777); err != nil {
+			t.Fatal(err)
+		}
+		manifestCanary := writeCanary(t, outside, "manifest-canary")
+		readmeCanary := writeCanary(t, outside, "readme-canary")
+		keyCanary := writeCanary(t, outside, "key-canary")
+		for link, target := range map[string]string{
+			filepath.Join(staging, "MANIFEST.txt"): manifestCanary,
+			filepath.Join(dd, "README.md"):         readmeCanary,
+			filepath.Join(dd, "identity.txt"):      keyCanary,
+		} {
+			if err := os.Symlink(target, link); err != nil {
+				t.Fatal(err)
+			}
+		}
+		for name, body := range map[string]string{
+			"brb.sh":                              "#!/bin/sh\necho planted\n",
+			SelfCopyName():                        "OLD BRB BINARY",
+			filepath.Join("data", "extra.sha512"): "planted sidecar",
+		} {
+			if err := os.WriteFile(filepath.Join(dd, name), []byte(body), 0o755); err != nil {
+				t.Fatal(err)
+			}
+		}
+
+		if err := r.makeDirs(); err != nil {
+			t.Fatalf("makeDirs: %v", err)
+		}
+		plantEncArtefacts(t, r)
+		// A public archive, so identity.txt is one of the documents written.
+		id, err := agecrypt.GenerateIdentity()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := agecrypt.WriteIdentityFile(r.publicIdentityPath(), id); err != nil {
+			t.Fatal(err)
+		}
+		r.publicIdentity = id
+
+		if err := r.buildDiscDirs(ctx, 1); err != nil {
+			t.Fatalf("buildDiscDirs: %v", err)
+		}
+		if err := r.writeManifest(ctx, 1); err != nil {
+			t.Fatalf("writeManifest: %v", err)
+		}
+		if err := r.writeReadmes(ctx, 1); err != nil {
+			t.Fatalf("writeReadmes: %v", err)
+		}
+		if err := r.writeSums(ctx, 1); err != nil {
+			t.Fatalf("writeSums: %v", err)
+		}
+
+		for _, c := range []string{manifestCanary, readmeCanary, keyCanary} {
+			assertCanary(t, c)
+		}
+		for _, p := range []string{
+			filepath.Join(staging, "MANIFEST.txt"),
+			filepath.Join(dd, "MANIFEST.txt"),
+			filepath.Join(dd, "README.md"),
+			filepath.Join(dd, "identity.txt"),
+		} {
+			assertRegular(t, p)
+		}
+		if fi, err := os.Stat(filepath.Join(dd, "identity.txt")); err == nil && fi.Mode().Perm() != 0o644 {
+			t.Errorf("identity.txt has mode %04o, want 0644", fi.Mode().Perm())
+		}
+
+		for _, gone := range []string{"brb.sh", filepath.Join("data", "extra.sha512")} {
+			if _, err := os.Lstat(filepath.Join(dd, gone)); err == nil {
+				t.Errorf("the planted %s is still on the disc", gone)
+			}
+		}
+		self, err := os.ReadFile(filepath.Join(dd, SelfCopyName()))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(self) == "OLD BRB BINARY" {
+			t.Errorf("the disc still carries the %s it held before this run, not the running program",
+				SelfCopyName())
+		}
+		sums := readFileString(t, filepath.Join(dd, agecrypt.SumsName))
+		for _, name := range []string{"./brb.sh", "./data/extra.sha512"} {
+			if strings.Contains(sums, "  "+name+"\n") {
+				t.Errorf("%s vouches for the planted %s", agecrypt.SumsName, name)
+			}
+		}
+		if readme := readFileString(t, filepath.Join(dd, "README.md")); strings.Contains(readme, "brb.sh") {
+			t.Error("the README offers a restorer the planted brb.sh")
+		}
+
+		// And the directories are staging directories now, not whatever mode
+		// they were inherited with.
+		for _, d := range []string{dd, filepath.Join(dd, "data")} {
+			fi, err := os.Lstat(d)
+			if err != nil {
+				t.Errorf("%s: %v", d, err)
+			} else if !fi.IsDir() || fi.Mode().Perm() != 0o700 {
+				t.Errorf("%s is %v, want a directory of mode 0700", d, fi.Mode())
+			}
+		}
+	})
+
+	// A symlink at the disc directory itself sent every artefact of that disc,
+	// the documents and a copy of this program outside staging. It is refused,
+	// and the link is left for the operator to see rather than quietly removed.
+	t.Run("a symlinked disc directory", func(t *testing.T) {
+		root := t.TempDir()
+		staging := filepath.Join(root, "staging")
+		outside := filepath.Join(root, "outside")
+		if err := os.MkdirAll(outside, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		r := layoutRunner(t, staging)
+		if err := r.makeDirs(); err != nil {
+			t.Fatalf("makeDirs: %v", err)
+		}
+		dd := filepath.Join(r.dirs.Discs, discDirName(1))
+		if err := os.Symlink(outside, dd); err != nil {
+			t.Fatal(err)
+		}
+		plantEncArtefacts(t, r)
+
+		err := r.buildDiscDirs(ctx, 1)
+		if err == nil || !strings.Contains(err.Error(), "is a symlink") || !strings.Contains(err.Error(), dd) {
+			t.Fatalf("buildDiscDirs = %v, want a refusal naming the symlink %s", err, dd)
+		}
+		if ents, _ := os.ReadDir(outside); len(ents) != 0 {
+			t.Errorf("buildDiscDirs wrote %d entr(ies) through the symlink into %s", len(ents), outside)
+		}
+		if fi, err := os.Lstat(dd); err != nil || fi.Mode()&os.ModeSymlink == 0 {
+			t.Errorf("the refused link is gone (Lstat: %v, %v); it should be left for the operator", fi, err)
+		}
+	})
+
+	// A hard link at the manifest's name shares its inode with a file
+	// elsewhere, so a truncating write rewrote that file's contents too. Only
+	// a link to a file the planter could already write survives
+	// fs.protected_hardlinks, but that is still a file the victim did not mean
+	// to touch.
+	t.Run("a hard link at the manifest", func(t *testing.T) {
+		root := t.TempDir()
+		staging := filepath.Join(root, "staging")
+		r := layoutRunner(t, staging)
+		if err := r.makeDirs(); err != nil {
+			t.Fatalf("makeDirs: %v", err)
+		}
+		canary := writeCanary(t, root, "hardlink-canary")
+		if err := os.Link(canary, filepath.Join(staging, "MANIFEST.txt")); err != nil {
+			t.Skipf("cannot make a hard link here: %v", err)
+		}
+		plantEncArtefacts(t, r)
+		if err := r.buildDiscDirs(ctx, 1); err != nil {
+			t.Fatalf("buildDiscDirs: %v", err)
+		}
+		if err := r.writeManifest(ctx, 1); err != nil {
+			t.Fatalf("writeManifest: %v", err)
+		}
+		assertCanary(t, canary)
+		if !strings.HasPrefix(readFileString(t, filepath.Join(staging, "MANIFEST.txt")), "brb (Blu-ray Backup) manifest") {
+			t.Error("STAGING/MANIFEST.txt does not hold the manifest")
+		}
+	})
+}
+
+// TestBuildDiscDirsKeepsTheDiscCopyWhenEncIsShort. The disc directory is
+// emptied only once discPayload has found everything it needs in enc/. On a
+// staging tree that spans filesystems the disc directory's artefacts are
+// copies rather than links, so a resume that found one missing from enc/ and
+// emptied the disc directory first would delete what may be the last copy,
+// and then fail anyway.
+func TestBuildDiscDirsKeepsTheDiscCopyWhenEncIsShort(t *testing.T) {
+	r := layoutRunner(t, filepath.Join(t.TempDir(), "staging"))
+	if err := r.makeDirs(); err != nil {
+		t.Fatal(err)
+	}
+	plantEncArtefacts(t, r)
+	if err := r.buildDiscDirs(context.Background(), 1); err != nil {
+		t.Fatal(err)
+	}
+	img := imageName(1) + ".age"
+	discCopy := filepath.Join(r.dirs.Discs, discDirName(1), "data", img)
+	if err := os.Remove(filepath.Join(r.dirs.Enc, img)); err != nil {
+		t.Fatal(err)
+	}
+	err := r.buildDiscDirs(context.Background(), 1)
+	if err == nil || !strings.Contains(err.Error(), "missing") {
+		t.Fatalf("buildDiscDirs with %s gone from enc/ = %v, want the missing-artefact refusal", img, err)
+	}
+	if _, err := os.Stat(discCopy); err != nil {
+		t.Errorf("the refusal took the disc directory's copy with it: %v", err)
+	}
+}
+
+// TestBuildDiscDirsRefusesAMountedDiscDirectory. Emptying a disc directory is
+// a RemoveAll, and RemoveAll walks into a filesystem mounted at the disc
+// directory or below it: it deleted everything on that volume and only then
+// failed, EBUSY, on the mount point. A mount there is refused before anything
+// is removed, as a symlink there is.
+//
+// Mounting a filesystem takes a privilege an ordinary test run does not have,
+// so this stands a mount in for one directory through deviceOf (another
+// filesystem) or mountPointsUnder (a bind mount from the same one), and
+// everything else about the run is real. The mounts themselves are exercised,
+// where the system allows it, by TestFreshDiscDirOverARealMount. Not
+// parallel: deviceOf and mountPointsUnder are package state.
+func TestBuildDiscDirsRefusesAMountedDiscDirectory(t *testing.T) {
+	ctx := context.Background()
+	// otherDevice makes every directory for which on reports true read as
+	// being on a device of its own, and leaves the rest on their real one.
+	otherDevice := func(t *testing.T, on func(p string) bool) {
+		t.Helper()
+		was := deviceOf
+		t.Cleanup(func() { deviceOf = was })
+		deviceOf = func(p string, fi os.FileInfo) (uint64, bool) {
+			dev, ok := was(p, fi)
+			if ok && on(p) {
+				dev++
+			}
+			return dev, ok
+		}
+	}
+	// mountedAt adds mp to the kernel's list of mount points and leaves its
+	// device alone, which is what a bind mount from the same filesystem
+	// looks like.
+	mountedAt := func(t *testing.T, mp string) {
+		t.Helper()
+		was := mountPointsUnder
+		t.Cleanup(func() { mountPointsUnder = was })
+		mountPointsUnder = func(dir string) ([]string, bool, error) {
+			mps, ok, err := was(dir)
+			if mp == dir || strings.HasPrefix(mp, dir+string(os.PathSeparator)) {
+				mps = append(mps, mp)
+			}
+			return mps, ok, err
+		}
+	}
+	// laidOut is a staging tree whose disc 1 has been laid out once, with a
+	// file of the operator's added to the disc directory and to its data/.
+	laidOut := func(t *testing.T) (r *runner, dd string, canaries []string) {
+		t.Helper()
+		r = layoutRunner(t, filepath.Join(t.TempDir(), "staging"))
+		if err := r.makeDirs(); err != nil {
+			t.Fatal(err)
+		}
+		plantEncArtefacts(t, r)
+		if err := r.buildDiscDirs(ctx, 1); err != nil {
+			t.Fatalf("buildDiscDirs: %v", err)
+		}
+		dd = filepath.Join(r.dirs.Discs, discDirName(1))
+		return r, dd, []string{
+			writeCanary(t, dd, "on-the-disc-volume"),
+			writeCanary(t, filepath.Join(dd, "data"), "on-the-data-volume"),
+		}
+	}
+
+	for _, tc := range []struct{ name, below string }{
+		{"a filesystem mounted at the disc directory", ""},
+		{"a filesystem mounted at its data/", "data"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r, dd, canaries := laidOut(t)
+			mp := filepath.Join(dd, tc.below)
+			otherDevice(t, func(p string) bool { return p == mp || strings.HasPrefix(p, mp+string(os.PathSeparator)) })
+
+			err := r.buildDiscDirs(ctx, 1)
+			if err == nil || !strings.Contains(err.Error(), "different filesystem") || !strings.Contains(err.Error(), mp) {
+				t.Fatalf("buildDiscDirs = %v, want a refusal naming the mount point %s", err, mp)
+			}
+			for _, c := range canaries {
+				assertCanary(t, c)
+			}
+		})
+	}
+
+	// A bind mount from the filesystem discs/ is on has the device discs/ has,
+	// so only the kernel's list of mount points shows it.
+	for _, tc := range []struct{ name, below string }{
+		{"a same-filesystem bind mount at the disc directory", ""},
+		{"a same-filesystem bind mount at its data/", "data"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r, dd, canaries := laidOut(t)
+			mp := filepath.Join(dd, tc.below)
+			mountedAt(t, mp)
+
+			err := r.buildDiscDirs(ctx, 1)
+			if err == nil || !strings.Contains(err.Error(), mp+" is a mount point") {
+				t.Fatalf("buildDiscDirs = %v, want a refusal naming the mount point %s", err, mp)
+			}
+			for _, c := range canaries {
+				assertCanary(t, c)
+			}
+		})
+	}
+
+	// The way to give the discs a volume of their own is to mount it at
+	// discs/ as a whole, and that must keep working: everything below it is
+	// then on the one device, and discs/ is the only mount root.
+	t.Run("discs/ itself on another filesystem", func(t *testing.T) {
+		r, dd, canaries := laidOut(t)
+		discs := r.dirs.Discs
+		otherDevice(t, func(p string) bool { return p == discs || strings.HasPrefix(p, discs+string(os.PathSeparator)) })
+		mountedAt(t, discs)
+
+		if err := r.buildDiscDirs(ctx, 1); err != nil {
+			t.Fatalf("buildDiscDirs: %v", err)
+		}
+		for _, c := range canaries {
+			if _, err := os.Lstat(c); err == nil {
+				t.Errorf("%s survived; the disc directory was not emptied", c)
+			}
+		}
+		assertRegular(t, filepath.Join(dd, "data", imageName(1)+".age"))
+	})
 }

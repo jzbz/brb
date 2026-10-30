@@ -225,29 +225,97 @@ func TestHelpEscapesConfigValuesForATerminal(t *testing.T) {
 	}
 }
 
-// TestShellWord pins the rendering rule value by value: bare when nothing in
-// it means anything to either reader, single-quoted otherwise, empty left as
-// KEY= for both readers to take as the default.
-func TestShellWord(t *testing.T) {
-	tests := []struct{ in, want string }{
-		{"", ""},
-		{"zstd", "zstd"},
-		{"/var/tmp/brb", "/var/tmp/brb"},
-		{"1.05", "1.05"},
-		{"bd25", "bd25"},
-		{"a b", "'a b'"},
-		{"*.pyc", "'*.pyc'"},
-		{"core.[0-9]*", "'core.[0-9]*'"},
-		{"~/photos", "'~/photos'"},
-		{"$HOME/x", "'$HOME/x'"},
-		{"a#b", "'a#b'"},
-		{"it's", `'it'\''s'`},
-		{"tab\there", "'tab\there'"},
-		{"esc\x1bhere", "'esc\x1bhere'"},
+// TestConfigWord pins the one rule the configuration listing adds to
+// ui.ShellWord: an empty value stays bare, KEY=, for both readers to take as
+// the default. Everything else is rendered exactly as ShellWord renders it;
+// the value-by-value table lives beside ShellWord in internal/ui.
+func TestConfigWord(t *testing.T) {
+	if got := configWord(""); got != "" {
+		t.Errorf("configWord(%q) = %s, want it bare so the line reads KEY=", "", got)
 	}
-	for _, tc := range tests {
-		if got := shellWord(tc.in); got != tc.want {
-			t.Errorf("shellWord(%q) = %s, want %s", tc.in, got, tc.want)
+	for _, s := range []string{"zstd", "/var/tmp/brb", "a b", "*.pyc", "~/photos", "it's", "esc\x1bhere"} {
+		if got, want := configWord(s), ui.ShellWord(s); got != want {
+			t.Errorf("configWord(%q) = %s, want ShellWord's %s", s, got, want)
+		}
+	}
+}
+
+// helpCleanupLine returns the last line of TYPICAL RUN, the rm -rf that wipes
+// staging, with its indent removed.
+func helpCleanupLine(t *testing.T, cfg *config.Config) string {
+	t.Helper()
+	var out bytes.Buffer
+	writeHelp(&out, cfg, "")
+	_, typical, ok := strings.Cut(out.String(), "\nTYPICAL RUN\n")
+	if !ok {
+		t.Fatalf("help has no TYPICAL RUN section:\n%s", out.String())
+	}
+	lines := strings.Split(strings.TrimRight(typical, "\n"), "\n")
+	return strings.TrimSpace(lines[len(lines)-1])
+}
+
+// TestHelpCleanupCommandIsOneShellWord pins the rm -rf that closes TYPICAL
+// RUN. STAGING used to be pasted into it bare, so a valid STAGING of
+// "/srv/My Staging" came out as `rm -rf /srv/My Staging` — /srv/My and a
+// ./Staging wherever the operator pasted it, with the staging tree left where
+// it was — two screens below a CONFIGURATION listing that quoted the same value
+// correctly. The default must still read the way the README prints it.
+func TestHelpCleanupCommandIsOneShellWord(t *testing.T) {
+	isolate(t)
+	for _, tc := range []struct{ staging, want string }{
+		{"/var/tmp/brb", "rm -rf /var/tmp/brb"},
+		{"/srv/My Staging", "rm -rf '/srv/My Staging'"},
+		{"/srv/a'b", `rm -rf '/srv/a'\''b'`},
+		{"/srv/brb*", "rm -rf '/srv/brb*'"},
+		{"/srv/$HOME", "rm -rf '/srv/$HOME'"},
+	} {
+		cfg := config.Default()
+		cfg.Staging = tc.staging
+		cfg.ResolveDefaults()
+		if got := helpCleanupLine(t, cfg); got != tc.want {
+			t.Errorf("STAGING=%q: help ends with %q, want %q", tc.staging, got, tc.want)
+		}
+	}
+
+	// And bash reads each rendering back as exactly one word, the path itself.
+	// The glob case gets a sibling for an unquoted * to match, and the run
+	// happens in a directory holding a "Staging" for a split path to reach, so
+	// neither can pass by luck.
+	bash, err := exec.LookPath("bash")
+	if err != nil {
+		t.Skip("bash not on PATH; the rendered strings were checked above")
+	}
+	dir := t.TempDir()
+	for _, sub := range []string{"brbX", "Staging"} {
+		if err := os.Mkdir(filepath.Join(dir, sub), 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, staging := range []string{
+		filepath.Join(dir, "My Staging"),
+		filepath.Join(dir, "a'b c"),
+		filepath.Join(dir, "brb*"),
+		filepath.Join(dir, "$HOME x"),
+		filepath.Join(dir, "tab\there"),
+	} {
+		cfg := config.Default()
+		cfg.Staging = staging
+		cfg.ResolveDefaults()
+		line := helpCleanupLine(t, cfg)
+		words, ok := strings.CutPrefix(line, "rm -rf ")
+		if !ok {
+			t.Fatalf("STAGING=%q: help ends with %q, not an rm -rf", staging, line)
+		}
+		cmd := exec.Command(bash, "-c", `eval "set -- $1" || exit 3; printf '%s\n' "$#"; printf '%s' "$1"`, "bash", words)
+		cmd.Dir = dir
+		raw, err := cmd.Output()
+		if err != nil {
+			t.Errorf("STAGING=%q: bash could not read %q back: %v", staging, words, err)
+			continue
+		}
+		n, word, _ := strings.Cut(string(raw), "\n")
+		if n != "1" || word != staging {
+			t.Errorf("STAGING=%q: bash reads %q as %s word(s), first %q; want exactly the path", staging, words, n, word)
 		}
 	}
 }

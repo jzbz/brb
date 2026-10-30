@@ -36,7 +36,9 @@ type DiscData struct {
 	Total int
 	// Date is the creation timestamp, RFC 3339.
 	Date string
-	// Source is the absolute path of the directory that was backed up.
+	// Source is the absolute path of the directory that was backed up, as the
+	// caller renders it for a document: one holding a control character comes
+	// quoted, so the template prints it as it is. See ManifestData.Source.
 	Source string
 	// Redundancy is the par2 recovery percentage over the image, e.g. 10.
 	Redundancy int
@@ -101,7 +103,13 @@ type ManifestData struct {
 	Created string
 	// Host is the machine the backup was taken on ("unknown" if not known).
 	Host string
-	// Source is the absolute path of the directory that was backed up.
+	// Source is the absolute path of the directory that was backed up, as the
+	// caller renders it for a document. Text/template escapes nothing, and a
+	// newline here would start a line ahead of "discs", which both readers
+	// parse, taking the first such line (the only other field they read,
+	// "archive name", comes before this one), so the caller quotes a path that
+	// holds a control character (backup's docPath) and this package prints
+	// what it is given.
 	Source string
 	// Total is the number of discs in the set.
 	Total int
@@ -138,9 +146,12 @@ type ManifestData struct {
 	// DiscFiles maps a 1-based disc number to the files in that disc's
 	// data/ directory.
 	DiscFiles map[int][]FileEntry
-	// PruneDirs holds the directories that were pruned from the scan.
+	// PruneDirs holds the directories that were pruned from the scan, and any
+	// further entries the caller lists as missing from the set under the same
+	// heading, each already rendered for the document as Source is.
 	PruneDirs []string
-	// ExcludeMasks holds the file name patterns that were excluded.
+	// ExcludeMasks holds the file name patterns that were excluded, rendered
+	// as Source is.
 	ExcludeMasks []string
 }
 

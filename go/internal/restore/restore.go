@@ -6,11 +6,13 @@
 // Everything here is built on PrepareImage, which is the one operation that
 // stands between a damaged disc and a silently wrong restore. It checks the
 // ciphertext against its recorded hash, repairs it with par2 when the hash does
-// not match, re-checks, and refuses to decrypt anything that still does not
-// match. It returns a path and nothing else: brb.sh had to smuggle that path
-// through a global variable because par2's chatter would otherwise end up
-// inside it, and that whole class of mistake is avoided here by not capturing
-// subprocess output into values that are used as paths.
+// not match, re-checks, and refuses anything par2 cannot repair. A hash that
+// still disagrees after par2 has pronounced the image whole is blamed on its
+// sidecar (HL-2); age's authentication and the plaintext hash still stand
+// behind the decryption. It returns a path and nothing else: brb.sh had to
+// smuggle that path through a global variable because par2's chatter would
+// otherwise end up inside it, and that whole class of mistake is avoided here
+// by not capturing subprocess output into values that are used as paths.
 //
 // Two behaviours deliberately differ from brb.sh, both because the bash version
 // cannot finish otherwise:
@@ -27,8 +29,6 @@ import (
 	"bufio"
 	"bytes"
 	"context"
-	"crypto/sha512"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -334,10 +334,24 @@ func identityCandidates(c *config.Config) []string {
 	return append(cands, filepath.Join(d, "rescue-identity.txt"+ageExt))
 }
 
-// findIdentity returns the first identity candidate that exists and can be
-// opened, mirroring brb.sh's `-f && -r` test.
+// findIdentity returns the first identity candidate that is a regular file and
+// can be opened, mirroring brb.sh's `-f && -r` test: the Stat is `-f` and the
+// open is `-r`.
+//
+// The Stat is not optional, and it has to come first. Without it this took
+// anything os.Open could open, so an AGE_IDENTITY naming a directory, a FIFO or
+// a device — a slip of the operator's, since the setting is theirs — stopped
+// the search right there: a directory failed with "is a directory", a FIFO hung
+// in the open itself, and /dev/zero ran the identity sniff out of memory. brb.sh
+// skips every one of those and goes on to <AGE_IDENTITY>.age and the rescue
+// key, so the same set restored under one reader and not the other. Stat rather
+// than Lstat, because `-f` follows a symlink too: a linked identity is a fine
+// thing to have, and refusing it here would open the divergence the other way.
 func findIdentity(c *config.Config) (string, bool) {
 	for _, cand := range identityCandidates(c) {
+		if fi, err := os.Stat(cand); err != nil || !fi.Mode().IsRegular() {
+			continue
+		}
 		f, err := os.Open(cand)
 		if err != nil {
 			continue
@@ -348,22 +362,28 @@ func findIdentity(c *config.Config) (string, bool) {
 	return "", false
 }
 
+// identitySniffLimit bounds how much of an identity file is read to classify
+// it. The longest prefix compared is the 34-byte armor header, so this changes
+// no answer; it only stops a file with no newline in it from being read whole
+// to find the end of a first line nothing looks past the start of.
+const identitySniffLimit = 64
+
 // identityIsEncrypted reports whether the file is an age container rather than
 // a plaintext identity. Both container formats announce themselves on their
 // first line; an age-keygen identity starts with "# created:" or
-// "AGE-SECRET-KEY-".
+// "AGE-SECRET-KEY-". Only the first identitySniffLimit bytes are read.
 func identityIsEncrypted(path string) (bool, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return false, err
 	}
 	defer f.Close()
-	first, err := bufio.NewReader(f).ReadString('\n')
+	first, err := bufio.NewReader(io.LimitReader(f, identitySniffLimit)).ReadString('\n')
 	if err != nil && !errors.Is(err, io.EOF) {
 		return false, err
 	}
 	return strings.HasPrefix(first, "age-encryption.org/v1") ||
-		strings.HasPrefix(first, "-----BEGIN AGE ENCRYPTED FILE-----"), nil
+		strings.HasPrefix(first, armorHeader), nil
 }
 
 // stagedPublicIdentity is where a public archive's key sits in the staging
@@ -389,9 +409,11 @@ func (o Options) stagedPublicIdentity() string {
 // When there is no primary identity at all but the staged key is there, it is
 // used alone, with no error and no passphrase prompt: a public archive is
 // exactly the set that has no key beside the recipients file, and the disc
-// itself brought the only one there is. A staged key that exists but does not
-// parse is an error naming the file: it is the key to whatever was ingested,
-// and silently ignoring it would turn "cannot decrypt" into a mystery.
+// itself brought the only one there is. A staged key that is a regular file
+// but does not parse is an error naming the file: it is the key to whatever
+// was ingested, and silently ignoring it would turn "cannot decrypt" into a
+// mystery. Anything else at that name is ignored, as brb.sh's `[[ -f ]]`
+// ignores it.
 //
 // A copy of Options that already carries loaded identities reuses them; see the
 // ids field.
@@ -401,15 +423,19 @@ func (o Options) identities() ([]age.Identity, error) {
 	}
 	staged := o.stagedPublicIdentity()
 	var pub []age.Identity
-	switch _, err := os.Stat(staged); {
-	case err == nil:
+	// Only a regular file counts, as only one passes brb.sh's `[[ -f "$pub" ]]`:
+	// something else at that name is ignored by both readers. Handed to the
+	// parse, it would be refused as not a regular file and fail the restore
+	// that brb.sh lets go ahead.
+	switch fi, err := os.Stat(staged); {
+	case err == nil && fi.Mode().IsRegular():
 		pub, err = agecrypt.ParseIdentityFile(staged)
 		if err != nil {
 			return nil, fmt.Errorf("restore: %s is not a usable age identity — it should be the public archive's key, "+
 				"copied from the disc root by ingest; re-ingest a disc of the set, or copy identity.txt from any of its discs there: %w",
 				staged, err)
 		}
-	case !errors.Is(err, fs.ErrNotExist):
+	case err != nil && !errors.Is(err, fs.ErrNotExist):
 		return nil, fmt.Errorf("restore: %s: %w", staged, err)
 	}
 
@@ -543,9 +569,16 @@ const armorHeader = "-----BEGIN AGE ENCRYPTED FILE-----"
 //     only after it has been hashed and matched against the recorded
 //     plaintext hash. Anything else there is discarded and decrypted afresh.
 //  2. The ciphertext is hashed and compared with the hash recorded beside it.
-//  3. On a mismatch par2 repairs it — and the hash is checked again. If it
-//     still does not match, this refuses to decrypt garbage rather than
-//     handing unsquashfs an image that will extract silently wrong files.
+//     A ciphertext hash that is missing or no longer parses is HL-2 too: par2
+//     checks the ciphertext if it can, and otherwise age's authentication is
+//     the check.
+//  3. On a mismatch par2 verifies and repairs it, and the hash is checked
+//     again. If there is no par2 data, par2 is not installed, or par2 cannot
+//     repair it, this refuses and nothing decrypted from it is handed over.
+//     If par2 pronounces the ciphertext whole and the hash still disagrees,
+//     it is the 150-byte sidecar that rotted (HL-2): this warns, names the
+//     sidecar and decrypts anyway. age authenticates the ciphertext as it
+//     reads it, and step 4 still checks the plaintext against its own hash.
 //  4. The image is decrypted, and the plaintext hash is compared with the one
 //     recorded at backup time. A mismatch removes the plaintext again.
 //
@@ -825,6 +858,19 @@ var errCiphertextDamaged = errors.New("ciphertext does not match its recorded ha
 // mid-stream or decrypted cleanly against a wrong recording — the partial
 // plaintext is removed and errCiphertextDamaged comes back, so nothing is ever
 // promoted ahead of the check the two-pass path would have made first.
+//
+// Both digests run on goroutines of their own (agecrypt.AsyncHash), beside the
+// decryption rather than after it. Fed through io.TeeReader and io.MultiWriter
+// they ran on this goroutine one after the other — ciphertext SHA-512, AEAD,
+// plaintext SHA-512 — which is the serialization agecrypt removed from Encrypt.
+// Measured on a 1 GiB image in encrypted NVMe staging, that ran at 380-400
+// MB/s, no faster than the two-pass hash-then-decrypt the fusion exists to
+// beat; this runs at 820-930 MB/s on the same machine, and on one core within
+// two percent of what it was. The price is the hashers' 8 MB of buffers.
+// BenchmarkDecryptVerifying and BenchmarkDecryptVerifyingSynchronous, which
+// keeps the old pipeline, repeat the comparison anywhere. Every verdict below
+// is taken from the same bytes as before, and only once the digest it rests on
+// is final.
 func (o Options) decryptVerifying(ctx context.Context, encPath, dst, wantCipher string, ids []age.Identity, prog io.Writer) (plainSum string, err error) {
 	if len(ids) == 0 {
 		return "", agecrypt.ErrNoIdentities
@@ -835,13 +881,19 @@ func (o Options) decryptVerifying(ctx context.Context, encPath, dst, wantCipher 
 	}
 	defer in.Close()
 
-	cipher := sha512.New()
+	// The deferred releases cover every return that does not reach a Sum, so
+	// a cancelled or refused decryption never leaks either goroutine. Nothing
+	// writes to a hasher once its Sum has been taken: the tee and the age
+	// reader are not read again after it.
+	cipher := agecrypt.NewAsyncHash()
+	defer cipher.Release()
 	tee := io.TeeReader(in, cipher)
 	r, ageErr := age.Decrypt(tee, ids...)
 
 	part := dst + partExt
 	var copyErr error
-	plain := sha512.New()
+	plain := agecrypt.NewAsyncHash()
+	defer plain.Release()
 	promoted := false
 	var out *os.File
 	if ageErr == nil {
@@ -881,7 +933,11 @@ func (o Options) decryptVerifying(ctx context.Context, encPath, dst, wantCipher 
 		if err := copyChunks(ctx, io.Discard, tee); err != nil {
 			return "", fmt.Errorf("restore: reading %s: %w", encPath, err)
 		}
-		if !strings.EqualFold(hex.EncodeToString(cipher.Sum(nil)), wantCipher) {
+		got, err := cipher.Sum()
+		if err != nil {
+			return "", fmt.Errorf("restore: hashing %s: %w", encPath, err)
+		}
+		if !strings.EqualFold(got, wantCipher) {
 			return "", errCiphertextDamaged
 		}
 		if ageErr != nil {
@@ -890,13 +946,29 @@ func (o Options) decryptVerifying(ctx context.Context, encPath, dst, wantCipher 
 		return "", copyErr
 	}
 
-	// age stops at the end of its own framing; any trailing bytes are part of
-	// the file on disk and belong in its digest.
+	// age reads to the end of the file and refuses trailing bytes itself, in
+	// one of two ways: after a full-length final chunk as "trailing data after
+	// end of encrypted file", and after a short one as a chunk that fails
+	// authentication, since the bytes are read into it. Either way a file with
+	// bytes after age's framing comes back through the error branch above, so
+	// on this path the drain normally finds nothing. It stays so that the
+	// digest is always of the whole file on disk, whatever a future age does at
+	// that boundary.
 	if err := copyChunks(ctx, io.Discard, tee); err != nil {
 		return "", fmt.Errorf("restore: reading %s: %w", encPath, err)
 	}
-	if !strings.EqualFold(hex.EncodeToString(cipher.Sum(nil)), wantCipher) {
+	got, err := cipher.Sum()
+	if err != nil {
+		return "", fmt.Errorf("restore: hashing %s: %w", encPath, err)
+	}
+	if !strings.EqualFold(got, wantCipher) {
 		return "", errCiphertextDamaged
+	}
+	// Before the rename, so that a plaintext digest that cannot be had leaves
+	// the .part to be removed rather than an unaccounted-for image in place.
+	plainSum, err = plain.Sum()
+	if err != nil {
+		return "", fmt.Errorf("restore: hashing the plaintext of %s: %w", encPath, err)
 	}
 
 	if err := out.Sync(); err != nil {
@@ -909,7 +981,7 @@ func (o Options) decryptVerifying(ctx context.Context, encPath, dst, wantCipher 
 		return "", fmt.Errorf("restore: renaming %s: %w", part, err)
 	}
 	promoted = true
-	return hex.EncodeToString(plain.Sum(nil)), nil
+	return plainSum, nil
 }
 
 // copyChunks copies src into dst, checking ctx between chunks. The byte count

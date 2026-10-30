@@ -2,6 +2,7 @@ package agecrypt
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -10,7 +11,9 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
+	"syscall"
 	"testing"
+	"time"
 )
 
 func TestWriteSumFileFormat(t *testing.T) {
@@ -218,6 +221,155 @@ func TestReadSumFileRefusesAnEnormousChecksumFile(t *testing.T) {
 	}
 }
 
+// sumFileOfSize writes a SHA512SUMS of exactly size bytes made of valid,
+// distinct entries — the shape that is retained in the map line for line, which
+// a file of comments is not — each line ending in eol and the last one without
+// it when unterminated is set. Names run up to about a megabyte, inside
+// maxSumLine, so a few lines reach the byte cap.
+func sumFileOfSize(t *testing.T, path string, size int, eol string, unterminated bool) {
+	t.Helper()
+	const nameLen = 1_000_000
+	var b strings.Builder
+	for i := 0; ; i++ {
+		head := fmt.Sprintf("%s  ./%08d-", sumEmpty, i)
+		left := size - b.Len()
+		full := len(head) + nameLen + len(eol)
+		if left <= full {
+			// The last line takes exactly what is left.
+			tail := left - len(head)
+			if !unterminated {
+				tail -= len(eol)
+			}
+			if tail < 1 {
+				t.Fatalf("size %d leaves no room for a last name", size)
+			}
+			b.WriteString(head + strings.Repeat("n", tail))
+			if !unterminated {
+				b.WriteString(eol)
+			}
+			break
+		}
+		b.WriteString(head + strings.Repeat("n", nameLen) + eol)
+	}
+	if b.Len() != size {
+		t.Fatalf("built %d bytes, want %d", b.Len(), size)
+	}
+	writeFile(t, path, []byte(b.String()))
+}
+
+// TestReadSumFileRefusesMoreThanMaxSumBytes: the line cap and the per-line cap
+// were each a bound on one element, and every valid line is kept in the map, so
+// a file of a few thousand megabyte-long entries became gigabytes of heap. The
+// cap is on bytes READ, and these boundaries are the ones brb.sh's
+// sum_file_too_big (head -c, then wc -c) draws: one byte over refuses whatever
+// its line endings, exactly at the cap parses whether or not the last line
+// ends in a newline. A count of scanned lines plus one per newline gets the
+// CRLF file and the unterminated one wrong in opposite directions, which is how
+// a first draft of this disagreed with the bash reader.
+func TestReadSumFileRefusesMoreThanMaxSumBytes(t *testing.T) {
+	dir := t.TempDir()
+	cases := []struct {
+		name         string
+		size         int
+		eol          string
+		unterminated bool
+		refused      bool
+	}{
+		{"one byte over", maxSumBytes + 1, "\n", false, true},
+		{"one byte over, CRLF", maxSumBytes + 1, "\r\n", false, true},
+		{"one byte over, last line unterminated", maxSumBytes + 1, "\n", true, true},
+		{"exactly at the cap", maxSumBytes, "\n", false, false},
+		{"exactly at the cap, CRLF", maxSumBytes, "\r\n", false, false},
+		{"exactly at the cap, last line unterminated", maxSumBytes, "\n", true, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			p := filepath.Join(dir, SumsName)
+			sumFileOfSize(t, p, tc.size, tc.eol, tc.unterminated)
+			got, err := ReadSumFile(p)
+			if !tc.refused {
+				if err != nil {
+					t.Fatalf("ReadSumFile refused a file of exactly %d bytes: %v", tc.size, err)
+				}
+				if len(got) < 16 {
+					t.Errorf("got %d entries from a file of ~1 MB lines filling the cap", len(got))
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("ReadSumFile read %d bytes, returning %d entries", tc.size, len(got))
+			}
+			if !strings.Contains(err.Error(), "refusing to read it") || !strings.Contains(err.Error(), "larger than") ||
+				!strings.Contains(err.Error(), p) {
+				t.Errorf("the refusal does not name the file and say it was too large:\n%v", err)
+			}
+		})
+	}
+}
+
+// TestReadSumFileCountsBytesItReadNotBytesAStatReports: a FIFO, like a procfs
+// or FUSE file, reports a size of 0 and then streams. ReadSumFile reads through
+// whatever it is handed — VerifyDisc and discSums are what refuse a FIFO by
+// name — so the cap has to be on what the reads return. Here a writer streams
+// comment lines, which store nothing, well past the cap.
+func TestReadSumFileCountsBytesItReadNotBytesAStatReports(t *testing.T) {
+	p := filepath.Join(t.TempDir(), SumsName)
+	if err := syscall.Mkfifo(p, 0o600); err != nil {
+		t.Skipf("mkfifo: %v", err)
+	}
+	go func() {
+		w, err := os.OpenFile(p, os.O_WRONLY, 0)
+		if err != nil {
+			return
+		}
+		defer w.Close()
+		line := []byte("#" + strings.Repeat("x", 4094) + "\n")
+		for written := 0; written <= 2*maxSumBytes; written += len(line) {
+			if _, err := w.Write(line); err != nil {
+				return // the reader stopped, which is the point
+			}
+		}
+	}()
+	done := make(chan error, 1)
+	go func() {
+		_, err := ReadSumFile(p)
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err == nil || !strings.Contains(err.Error(), "larger than") {
+			t.Fatalf("ReadSumFile on a stream past the cap: %v, want the size refusal", err)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("ReadSumFile did not stop reading a stream past the cap")
+	}
+}
+
+// TestReadSumFileLineLengthBoundary pins where the per-line cap falls, because
+// brb.sh's SUM_AWK reproduces it by hand (length($0) >= 1048576 refuses): a line
+// of maxSumLine-1 bytes is an ordinary entry, and one of maxSumLine bytes
+// refuses the whole file even as a comment.
+func TestReadSumFileLineLengthBoundary(t *testing.T) {
+	dir := t.TempDir()
+	head := sumEmpty + "  ./"
+	ok := filepath.Join(dir, "ok")
+	writeFile(t, ok, []byte(head+strings.Repeat("n", maxSumLine-1-len(head))+"\n"))
+	if got, err := ReadSumFile(ok); err != nil || len(got) != 1 {
+		t.Fatalf("a line of %d bytes: %d entries, %v", maxSumLine-1, len(got), err)
+	}
+	for _, unterminated := range []bool{false, true} {
+		long := filepath.Join(dir, "long")
+		body := "#" + strings.Repeat("c", maxSumLine-1)
+		if !unterminated {
+			body += "\n"
+		}
+		writeFile(t, long, []byte(sumEmpty+"  ./a\n"+body))
+		if got, err := ReadSumFile(long); err == nil {
+			t.Errorf("a comment line of %d bytes (unterminated=%v) was read: %d entries", maxSumLine, unterminated, len(got))
+		}
+	}
+}
+
 // buildDiscDir lays out a directory shaped like one of ours.
 func buildDiscDir(t *testing.T) string {
 	t.Helper()
@@ -420,6 +572,177 @@ func TestVerifyDirRejectsEscapingNames(t *testing.T) {
 	}
 }
 
+// TestVerifyDirRefusesASumsFileThatListsNothing: an empty or comment-only
+// SHA512SUMS beside a corrupt image used to come back clean, because the loop
+// over its entries had nothing to do. GNU sha512sum -c refuses the same files,
+// and brb.sh with it; a "\r\n" line trims to blank, so it lists nothing too.
+func TestVerifyDirRefusesASumsFileThatListsNothing(t *testing.T) {
+	for name, body := range map[string]string{
+		"empty":             "",
+		"comments only":     "# nothing\n\n",
+		"a blank CRLF line": "\r\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			dir := buildDiscDir(t)
+			sumPath := filepath.Join(dir, SumsName)
+			writeFile(t, sumPath, []byte(body))
+			bad, err := VerifyDir(t.Context(), dir, sumPath)
+			if err == nil || !strings.Contains(err.Error(), "lists no files") {
+				t.Fatalf("VerifyDir = %v, %v; want a refusal of a sums file that lists nothing", bad, err)
+			}
+		})
+	}
+}
+
+// TestVerifyDirRequiresTheNamedFiles: the identity gate in VerifyDisc reads the
+// image's name, and nothing made the sums file vouch for it, so a SHA512SUMS
+// that listed only the manifest verified a disc whose image was corrupt.
+func TestVerifyDirRequiresTheNamedFiles(t *testing.T) {
+	dir := buildDiscDir(t)
+	sumPath := filepath.Join(dir, SumsName)
+	writeFile(t, sumPath, []byte(sumPayload+"  ./MANIFEST.txt\n"))
+	writeFile(t, filepath.Join(dir, "data", "disc01.squashfs.age"), []byte("corrupt\n"))
+	if bad, err := VerifyDir(t.Context(), dir, sumPath, "data/disc01.squashfs.age"); err == nil {
+		t.Fatalf("VerifyDir = %v, nil; a sums file without the required name must be refused", bad)
+	}
+	// Without the requirement the same file still verifies: it is the caller's
+	// rule, not a change to what a sums file may list.
+	if bad, err := VerifyDir(t.Context(), dir, sumPath); err != nil || len(bad) != 0 {
+		t.Fatalf("VerifyDir without a requirement = %v, %v", bad, err)
+	}
+	// Either spelling of the name satisfies it, as either resolves to the file.
+	writeFile(t, filepath.Join(dir, "data", "disc01.squashfs.age"), []byte("hello world\n"))
+	for _, listed := range []string{"./data/disc01.squashfs.age", "data/disc01.squashfs.age"} {
+		writeFile(t, sumPath, []byte(sumHelloWorld+"  "+listed+"\n"))
+		if bad, err := VerifyDir(t.Context(), dir, sumPath, "data/disc01.squashfs.age"); err != nil || len(bad) != 0 {
+			t.Errorf("listed as %q: VerifyDir = %v, %v", listed, bad, err)
+		}
+	}
+}
+
+// TestVerifyDirRefusesLinksAndNonRegularEntries is the rule hashInRoot and
+// brb.sh's verify_disc_sums share: no symbolic link anywhere on the way to a
+// listed name, nothing climbing out, and a regular file at the end. Every name
+// below carries the right digest for what it would read if followed, so only
+// the rule can put it in the bad list — and the plain spellings at the end must
+// stay out of it, or the rule is refusing more than it says.
+func TestVerifyDirRefusesLinksAndNonRegularEntries(t *testing.T) {
+	outside := t.TempDir()
+	writeFile(t, filepath.Join(outside, "host"), []byte("hello world\n"))
+	dir := t.TempDir()
+	writeFile(t, filepath.Join(dir, "x"), []byte("hello world\n"))
+	if err := os.MkdirAll(filepath.Join(dir, "data", "real"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, filepath.Join(dir, "data", "real", "x"), []byte("hello world\n"))
+	for link, target := range map[string]string{
+		"lnk":          "x",
+		"hostlink":     filepath.Join(outside, "host"),
+		"data/sublink": "real",
+		"nulllink":     os.DevNull,
+	} {
+		if err := os.Symlink(target, filepath.Join(dir, link)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	fifo := filepath.Join(dir, "fifo")
+	if err := syscall.Mkfifo(fifo, 0o600); err != nil {
+		t.Skipf("mkfifo: %v", err)
+	}
+	long := strings.Repeat("a", maxSumName)
+	var b strings.Builder
+	for _, n := range []string{
+		"./lnk", "./hostlink", "./data/sublink/x", "./fifo", "./data", "./data/../x",
+		"./data/real/x/", "./" + long,
+		"./x", "x", "./data//real/x", "./data/./real/x",
+	} {
+		b.WriteString(sumHelloWorld + "  " + n + "\n")
+	}
+	b.WriteString(sumEmpty + "  ./nulllink\n")
+	sumPath := filepath.Join(t.TempDir(), SumsName)
+	writeFile(t, sumPath, []byte(b.String()))
+
+	type result struct {
+		bad []string
+		err error
+	}
+	done := make(chan result, 1)
+	go func() {
+		bad, err := VerifyDir(t.Context(), dir, sumPath)
+		done <- result{bad, err}
+	}()
+	var r result
+	select {
+	case r = <-done:
+	case <-time.After(10 * time.Second):
+		// Unblock the open so the failure is reported rather than hung.
+		if w, err := os.OpenFile(fifo, os.O_WRONLY, 0); err == nil {
+			w.Close()
+		}
+		t.Fatal("VerifyDir blocked opening a listed FIFO")
+	}
+	if r.err != nil {
+		t.Fatalf("VerifyDir: %v", r.err)
+	}
+	want := []string{
+		"./" + long, "./data", "./data/../x", "./data/real/x/", "./data/sublink/x",
+		"./fifo", "./hostlink", "./lnk", "./nulllink",
+	}
+	if !reflect.DeepEqual(r.bad, want) {
+		t.Errorf("bad =\n  %q\nwant\n  %q", r.bad, want)
+	}
+}
+
+// TestVerifyDirRefusesANameLongerThanPathMax: an os.Root resolves one component
+// at a time, so it opens a real path of any length, while brb.sh resolves each
+// name relative to the disc root and the kernel stops it at PATH_MAX. A file at
+// the bottom of a deep enough tree, carrying its right digest, verified in one
+// reader and was a mismatch in the other.
+func TestVerifyDirRefusesANameLongerThanPathMax(t *testing.T) {
+	dir := t.TempDir()
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer root.Close()
+	comp := strings.Repeat("d", 200)
+	var rel []string
+	cur := root
+	for len(strings.Join(rel, "/")) < maxSumName {
+		if err := cur.Mkdir(comp, 0o755); err != nil {
+			t.Fatalf("mkdir at depth %d: %v", len(rel), err)
+		}
+		next, err := cur.OpenRoot(comp)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cur != root {
+			cur.Close()
+		}
+		cur = next
+		rel = append(rel, comp)
+	}
+	f, err := cur.Create("x")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString("hello world\n"); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	cur.Close()
+	name := "./" + strings.Join(rel, "/") + "/x"
+	sumPath := filepath.Join(t.TempDir(), SumsName)
+	writeFile(t, sumPath, []byte(sumHelloWorld+"  "+name+"\n"))
+	bad, err := VerifyDir(t.Context(), dir, sumPath)
+	if err != nil {
+		t.Fatalf("VerifyDir: %v", err)
+	}
+	if len(bad) != 1 {
+		t.Errorf("a real file %d bytes deep verified: bad = %d names, want it refused", len(name), len(bad))
+	}
+}
+
 func TestVerifyDirCancelled(t *testing.T) {
 	dir := buildDiscDir(t)
 	sumPath := filepath.Join(dir, SumsName)
@@ -570,5 +893,77 @@ func TestWriteSumsKnownSkipsOnlyTheSameInode(t *testing.T) {
 		"./data/disc01.squashfs.age": {Digest: "nonsense", Same: linked},
 	}); err == nil {
 		t.Error("WriteSumsKnown accepted a digest that is not a sha-512")
+	}
+}
+
+// TestWriteSumsKnownVerifiesWhatItReads. Verify holds a file to its recorded
+// digest whenever it is read rather than shortcut — because the caller gave no
+// Same, or because the inode check declined. Without it the read-back recorded
+// whatever the bytes hashed to by then, which attests a change rather than
+// catching it. The shortcut itself is untouched: a hard link to the measured
+// file is still believed without being read.
+func TestWriteSumsKnownVerifiesWhatItReads(t *testing.T) {
+	dir := buildDiscDir(t)
+	sumPath := filepath.Join(t.TempDir(), SumsName)
+	wrong := strings.Repeat("a", 128)
+
+	// Read, and matching: recorded as usual.
+	if err := WriteSumsKnown(t.Context(), dir, sumPath, map[string]KnownSum{
+		"./data/disc01.squashfs.age": {Digest: sumHelloWorld, Verify: true},
+	}); err != nil {
+		t.Fatalf("WriteSumsKnown over a matching file: %v", err)
+	}
+	before, err := os.ReadFile(sumPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Read, and not matching: refused, with what was found and what was
+	// expected, and nothing written.
+	err = WriteSumsKnown(t.Context(), dir, sumPath, map[string]KnownSum{
+		"./data/disc01.squashfs.age": {Digest: wrong, Verify: true},
+	})
+	var mm *DigestMismatchError
+	if !errors.As(err, &mm) {
+		t.Fatalf("WriteSumsKnown over a file that does not match its digest = %v, want *DigestMismatchError", err)
+	}
+	if mm.Name != "./data/disc01.squashfs.age" || mm.Got != sumHelloWorld || mm.Want != wrong {
+		t.Errorf("mismatch = %+v", mm)
+	}
+	if after, _ := os.ReadFile(sumPath); !bytes.Equal(after, before) {
+		t.Error("the refused WriteSumsKnown replaced the previous checksum file")
+	}
+
+	// The inode check declined (a decoy with the same bytes elsewhere), so the
+	// file is read — and held to the digest.
+	decoy := filepath.Join(t.TempDir(), "disc01.squashfs.age")
+	writeFile(t, decoy, []byte("hello world\n"))
+	if err := WriteSumsKnown(t.Context(), dir, sumPath, map[string]KnownSum{
+		"./data/disc01.squashfs.age": {Digest: wrong, Same: decoy, Verify: true},
+	}); !errors.As(err, &mm) {
+		t.Errorf("a file read because its inode did not match was not held to its digest: %v", err)
+	}
+
+	// The shortcut: the same inode is believed, not read, so there is nothing
+	// to compare and the recorded digest is what goes in.
+	linked := filepath.Join(t.TempDir(), "disc01.squashfs.age")
+	if err := os.Link(filepath.Join(dir, "data", "disc01.squashfs.age"), linked); err != nil {
+		t.Skipf("hard links unavailable: %v", err)
+	}
+	if err := WriteSumsKnown(t.Context(), dir, sumPath, map[string]KnownSum{
+		"./data/disc01.squashfs.age": {Digest: wrong, Same: linked, Verify: true},
+	}); err != nil {
+		t.Fatalf("WriteSumsKnown with the shortcut available: %v", err)
+	}
+	if got, _ := ReadSumFile(sumPath); got["./data/disc01.squashfs.age"] != wrong {
+		t.Error("Verify disabled the shortcut for the very inode the digest was taken from")
+	}
+
+	// A malformed digest given only for comparison is refused before any
+	// file is read, as one given for the shortcut always was.
+	if err := WriteSumsKnown(t.Context(), dir, sumPath, map[string]KnownSum{
+		"./data/disc01.squashfs.age": {Digest: "nonsense", Verify: true},
+	}); err == nil || errors.As(err, &mm) {
+		t.Errorf("WriteSumsKnown with a malformed digest to verify against = %v, want a refusal of the digest", err)
 	}
 }

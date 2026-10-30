@@ -12,10 +12,11 @@
 //     ciphertext as three separate steps would read a multi-gigabyte image
 //     three times to learn the same two numbers.
 //
-// The checksum files written here are byte-compatible with GNU sha512sum,
-// which is the program brb.sh verifies a disc with (`sha512sum -c --quiet
-// --strict SHA512SUMS`, brb.sh:852). Only the Go build writes a disc;
-// xcompat-test.sh pins that both readers accept what it wrote.
+// The checksum files written here are byte-compatible with GNU sha512sum, so
+// `sha512sum -c SHA512SUMS` checks a disc with no brb at all. brb.sh parses
+// them itself, with the grammar ReadSumFile uses, and hashes each name with
+// sha512sum(1). Only the Go build writes a disc; xcompat-test.sh pins that both
+// readers, and sha512sum alone, accept what it wrote.
 package agecrypt
 
 import (
@@ -53,6 +54,32 @@ var ErrNoRecipients = errors.New("agecrypt: no age recipients")
 // identity.
 var ErrNoIdentities = errors.New("agecrypt: no age identities")
 
+// MaxRecipients is the most recipients a file brb writes may be encrypted to.
+//
+// The limit is age's, and it is a decoder limit only. filippo.io/age v1.3.2's
+// header parser refuses a file carrying more than 1024 recipient stanzas
+// (maxRecipientStanzas, in its internal/format package and unexported, so it is
+// restated here), while its encoder writes as many as it is handed without a
+// word. A recipients file with one key too many therefore made a backup that
+// exited 0 and that neither this build's reader nor brb.sh, on an age CLI of
+// 1.3.2 or later, could open. age 1.3.1 and earlier have no such limit, so a
+// set written past it before this check existed is readable with one of those.
+//
+// Every recipient type [ParseRecipientsFile] yields, X25519 and the hybrid
+// post-quantum one, writes exactly one stanza, so counting recipients is
+// counting stanzas, and a key listed twice counts twice because age writes it
+// twice. The header's own 2 MiB cap is out of reach within the count for those
+// types: 1024 hybrid stanzas come to about 1.6 MB. TestMaxRecipientsIsAgesLimit
+// holds the number to the vendored decoder, so an age upgrade that moves it
+// fails a test instead of quietly misplacing this guard.
+const MaxRecipients = 1024
+
+// ErrTooManyRecipients is wrapped by [ProbeRecipients]' refusal of a set
+// larger than [MaxRecipients]. Callers test for it to leave out the advice
+// they attach to age's own refusals, which is about mixing key types and would
+// send the operator after the wrong problem.
+var ErrTooManyRecipients = errors.New("agecrypt: more recipients than age can decrypt")
+
 // Sums holds the two SHA-512 digests of one encryption, lowercase hex.
 type Sums struct {
 	// Plain is the digest of the plaintext, before encryption.
@@ -71,7 +98,12 @@ type Sums struct {
 // recipient %q"), so a secret key pasted onto the end of a public key's line
 // comes back in the error whole, and every caller prints it. An error that
 // carries secret key material is replaced by one that names the line instead.
+//
+// Only a regular file is opened; see [irregularKeyFile].
 func ParseRecipientsFile(path string) ([]age.Recipient, error) {
+	if err := irregularKeyFile("recipients", path); err != nil {
+		return nil, err
+	}
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, fmt.Errorf("agecrypt: open recipients file: %w", err)
@@ -130,7 +162,12 @@ func redactedRecipientsError(path string, f *os.File) error {
 // material out of error strings is not left to the library: nothing here may
 // put it there. ParseRecipientsFile above keeps age's message unless it
 // carries a secret key: its lines are public keys.
+//
+// Only a regular file is opened; see [irregularKeyFile].
 func ParseIdentityFile(path string) ([]age.Identity, error) {
+	if err := irregularKeyFile("identity", path); err != nil {
+		return nil, err
+	}
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, fmt.Errorf("agecrypt: open identity file: %w", err)
@@ -145,6 +182,28 @@ func ParseIdentityFile(path string) ([]age.Identity, error) {
 		return nil, redactedIdentityError(path, f)
 	}
 	return ids, nil
+}
+
+// irregularKeyFile refuses a key file that exists and is not a regular file,
+// before anything opens it.
+//
+// Every path these parsers are handed is the operator's AGE_RECIPIENTS_FILE or
+// AGE_IDENTITY, or a key in staging, and a slip there used to be opened as
+// given. A FIFO blocks in open(2) until something writes to it, and a goroutine
+// blocked there watches no context, so doctor, init-key and backup hung past
+// the first Ctrl-C; a directory opens and fails only on the read; a device such
+// as /dev/zero is a stream with no end. None of them is a key file, and none is
+// one the restore side would use: its findIdentity and brb.sh's `[[ -f ]]`
+// take a regular file only. Stat rather than Lstat, as `-f` follows a link: a
+// symlinked key file is fine. A path that cannot be stat'ed is left to the open
+// that follows, so a missing file still fails in the open's own words and with
+// fs.ErrNotExist, which callers test for.
+func irregularKeyFile(kind, path string) error {
+	fi, err := os.Stat(path)
+	if err != nil || fi.Mode().IsRegular() {
+		return nil
+	}
+	return fmt.Errorf("agecrypt: %s file %s is not a regular file (%s)", kind, path, fi.Mode().Type())
 }
 
 // ageIdentitiesTooLong is age's whole message for an identity file past its
@@ -270,6 +329,7 @@ func writeIdentityFile(path string, id *age.X25519Identity, mode os.FileMode) (e
 	if err := os.Chmod(path, mode); err != nil {
 		return fmt.Errorf("agecrypt: chmod identity file %s: %w", path, err)
 	}
+	syncAncestors(path)
 	return nil
 }
 
@@ -282,7 +342,7 @@ func writeIdentityFile(path string, id *age.X25519Identity, mode os.FileMode) (e
 // construction it stands in for is `age-keygen | age -p`, a pipe with nothing
 // to shred afterwards, and shred can promise nothing on a copy-on-write,
 // compressed or flash-translated filesystem anyway. This function is that
-// pipe. What brb.sh does with the result is read it: find_identity (brb.sh:206)
+// pipe. What brb.sh does with the result is read it: find_identity in brb.sh
 // tries rescue-identity.txt.age beside the recipients file, which is why
 // init-key writes it under that name and in that directory.
 //
@@ -338,6 +398,7 @@ func WriteEncryptedIdentityFile(path string, id *age.X25519Identity, passphrase 
 	if err := os.Chmod(path, 0o400); err != nil {
 		return fmt.Errorf("agecrypt: chmod identity file %s: %w", path, err)
 	}
+	syncAncestors(path)
 	return nil
 }
 
@@ -392,8 +453,50 @@ func AppendRecipient(path, pubkey string) (err error) {
 	if err := f.Sync(); err != nil {
 		return fmt.Errorf("agecrypt: sync recipients file %s: %w", path, err)
 	}
+	// For the file this may just have created. Syncing directories over an
+	// existing one costs a few fsyncs with nothing to write.
+	syncAncestors(path)
 	return nil
 }
+
+// syncAncestors makes a key file that was just created survive a crash, by
+// fsyncing the directory that holds it and every directory above that.
+//
+// A file's own fsync makes its bytes durable and, on POSIX's word, nothing
+// more. Its name is an entry in a directory, which has to be synced for that,
+// and a directory MkdirAll has only just made has its own name one level
+// further up. ext4, XFS, btrfs and f2fs commit all of it along with the file
+// anyway. FAT mounted without "flush" — a likely home for a key meant to be
+// carried away on a stick — writes the file's own entry and loses the new
+// directories above it, and there the failure is the bad one: init-key reports
+// success, a crash takes the identity with its fresh directory while
+// recipients.txt on another filesystem survives, and every later backup is
+// encrypted to a key nobody holds.
+//
+// Every ancestor rather than only the parent, because MkdirAll, here or in
+// init-key, may have made more than one level, and there is no record of
+// which. Walking to the root costs a handful of directory fsyncs once per key.
+// [fsx.SyncDir] ignores every error, so this cannot fail a key write; at each
+// call site the file's data is already fsynced.
+func syncAncestors(path string) {
+	dir := filepath.Dir(path)
+	if abs, err := filepath.Abs(dir); err == nil {
+		dir = abs
+	}
+	for {
+		syncDir(dir)
+		up := filepath.Dir(dir)
+		if up == dir {
+			return
+		}
+		dir = up
+	}
+}
+
+// syncDir is [fsx.SyncDir], as a variable only so a test can see which
+// directories a key write synced: what a crash would have kept is not
+// something a test can observe.
+var syncDir = fsx.SyncDir
 
 // ProbeRecipients encrypts a few bytes to recs, in memory and to nowhere, and
 // returns whatever age refuses with.
@@ -404,9 +507,18 @@ func AppendRecipient(path, pubkey string) (err error) {
 // [ParseRecipientsFile] and [AppendRecipient] both accept such a file happily.
 // The probe is the same call [Encrypt] makes, so anything age will object to
 // about the set is objected to here instead, at the cost of one header.
+//
+// That covers what the ENCODER objects to and nothing more, so the one limit
+// only age's decoder enforces, [MaxRecipients], is checked here by count
+// before the probe runs: the encoder would accept the set, and every disc
+// encrypted to it would be unreadable.
 func ProbeRecipients(recs []age.Recipient) error {
 	if len(recs) == 0 {
 		return ErrNoRecipients
+	}
+	if len(recs) > MaxRecipients {
+		return fmt.Errorf("%w: the set has %d, and age refuses to read a file encrypted to more than %d",
+			ErrTooManyRecipients, len(recs), MaxRecipients)
 	}
 	w, err := age.Encrypt(io.Discard, recs...)
 	if err != nil {
@@ -445,6 +557,10 @@ func CheckRecipientAddition(path, pubkey string) error {
 		return fmt.Errorf("agecrypt: invalid recipient %q: %w", pubkey, err)
 	}
 	if err := ProbeRecipients(append(existing, added...)); err != nil {
+		if errors.Is(err, ErrTooManyRecipients) {
+			return fmt.Errorf("agecrypt: adding %s to %s: %w — remove a key you no longer need from %s "+
+				"first, and re-run", pubkey, path, err, path)
+		}
 		return fmt.Errorf("agecrypt: adding %s to %s would make a set age refuses to encrypt to: %w — "+
 			"a set may not mix post-quantum (age1pq1...) and classic (age1...) recipients; edit %s so it "+
 			"holds one kind only, and re-run", pubkey, path, err, path)
@@ -607,7 +723,7 @@ func hashReader(ctx context.Context, r io.Reader) (string, error) {
 // staging, where the default STAGING under /var/tmp is world-executable and
 // every local account could otherwise read the whole decrypted archive for as
 // long as a restore runs. brb.sh gets 0600 there the other way, with a
-// `umask 077` around its staging writes (brb.sh:266).
+// `umask 077` around its staging writes (brb.sh's secure_staging).
 const (
 	partModePublic  os.FileMode = 0o644
 	partModePrivate os.FileMode = 0o600

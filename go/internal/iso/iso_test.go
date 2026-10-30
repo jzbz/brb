@@ -120,9 +120,26 @@ func TestTotalComesFromTheManifest(t *testing.T) {
 	if got := Total(dir, 3); got != 20 {
 		t.Errorf("Total = %d, want 20 from the manifest", got)
 	}
+	// Leading zeros are decimal, as Atoi and brb.sh's zero-stripping both read
+	// them.
+	if err := os.WriteFile(filepath.Join(dir, "MANIFEST.txt"), []byte("discs : 010\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if got := Total(dir, 3); got != 10 {
+		t.Errorf("Total of \"discs : 010\" = %d, want 10", got)
+	}
 
 	// A hand-edited or truncated manifest must never stop a burn.
-	for _, body := range []string{"discs           :\n", "discs : zero\n", "discs: -4\n", "", "junk\n"} {
+	//
+	// And the value has to be a whole number, exactly as both readers require
+	// it (expectedDiscs in internal/restore, expected_discs in brb.sh), or the
+	// label says one set size while restore says it cannot tell. The last five
+	// were all read as a number here, or could be: a prefix match took "1/data"
+	// as 1 and "3 " as 3, a first "discs" line that was not a number sent it
+	// looking further down where the readers stop, and Atoi alone takes "+7".
+	// None of them is the fallback, so a wrong answer cannot pass by luck.
+	for _, body := range []string{"discs           :\n", "discs : zero\n", "discs: -4\n", "", "junk\n",
+		"discs : 1/data\n", "discs : 12x\n", "discs : 3 \n", "discs : zero\ndiscs : 7\n", "discs : +7\n"} {
 		if err := os.WriteFile(filepath.Join(dir, "MANIFEST.txt"), []byte(body), 0o644); err != nil {
 			t.Fatal(err)
 		}

@@ -1,7 +1,6 @@
 package backup
 
 import (
-	"bytes"
 	"context"
 	"crypto/sha512"
 	"encoding/hex"
@@ -16,10 +15,12 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/jzbz/brb/internal/agecrypt"
 	"github.com/jzbz/brb/internal/config"
 	"github.com/jzbz/brb/internal/doc"
+	"github.com/jzbz/brb/internal/fsx"
 	"github.com/jzbz/brb/internal/iso"
 	"github.com/jzbz/brb/internal/pack"
 	"github.com/jzbz/brb/internal/scan"
@@ -140,17 +141,68 @@ func Run(ctx context.Context, o Options) error {
 // Two ways the tree can change between the runs break that equivalence, and
 // they get different answers because their consequences differ.
 //
-// A path a finished disc holds as a regular file, and which is now a directory,
-// a symlink or a device node, is REFUSED. A finished disc cannot be rewritten
-// and every later disc carries the whole skeleton, so such a set holds that
-// path as a file on one disc and as a non-file on all the rest; unsquashfs
-// refuses the second of them ("failed to lstat ..., because Not a directory")
-// and abandons the restore part way through the set. The refusal is here
-// because the alternative was silence: the assigned lookup used to sit inside
-// the KindFile branch, so a path that had changed kind never matched the set at
-// all, the run finished reporting a complete set, and the only warning fired
-// was the one below saying the file was "no longer in the source tree" — which
-// reads as reassurance.
+// A path a finished disc holds that has changed kind since — a file that is
+// now a directory, a directory that is now a symlink, a symlink that is now a
+// file — is REFUSED. A finished disc cannot be rewritten and every later disc
+// carries the whole skeleton, so such a set holds the path as one kind on the
+// finished discs and as another on all the rest, and restoring it means
+// extracting one over the other with unsquashfs -f. Whether that can work
+// depends on which two kinds they are and on the order — a whole-set restore
+// goes oldest disc first, and `restore --disc` extracts an older disc over a
+// newer one as readily as the reverse:
+//
+//   - With a directory on either side, no order works. A file that became a
+//     directory has the later disc's files under it, and unsquashfs abandons
+//     the restore at the first of them ("failed to lstat ..., because Not a
+//     directory"), as it does under a fifo or device node that became one. A
+//     directory cannot be replaced by a leaf, because -f has to remove it
+//     first, which no squashfs-tools does for a populated one and only 4.7
+//     does for an empty one. And a symlink where a disc holds a directory is
+//     what both readers' per-image guards refuse, because -f would write
+//     through it.
+//   - A regular file and a symlink, fifo or device node restore one way round
+//     only. -f unlinks whatever holds a path before creating a symlink, a
+//     fifo or a device node (not a socket: 4.5 and 4.6 create one without
+//     unlinking anything), but squashfs-tools 4.5 writes a regular file by
+//     opening the path with O_TRUNC, so a file extracted over the other is
+//     written through the symlink, into the device, or blocks on the fifo —
+//     and for a symlink that became a file, that is the order a whole-set
+//     restore takes. (Read from 4.5.1's source, not run; 4.6 lstats the path
+//     and unlinks it first.)
+//   - Between two non-file kinds — a symlink that became a fifo — it would
+//     usually restore either way, a socket on one side aside. It is refused
+//     all the same: it is too rare to earn an exception, and without one the
+//     rule fits in a sentence.
+//
+// That sentence: a path a finished disc holds keeps its kind for the rest of
+// the set. Regular files are checked against State.Assigned, everything else
+// against State.Skeleton (see State.writtenKinds for a state file written
+// before that existed).
+//
+// The refusal guards the discs still to be written, so it applies only when
+// there are some. A run interrupted after its last disc was recorded — in the
+// index, the payload, SHA512SUMS or the eager ISOs — resumes with nothing left
+// to pack, buildDiscs builds no further disc, and a path that has changed kind
+// since reaches none: the finished discs agree with one another, and a restore
+// gives the path back as they hold it. That is warned about rather than
+// refused, because moving a directory off a full disk and symlinking it back
+// is the natural answer to that interruption, and refusing would demand the
+// space back or a finished set thrown away. A path that has become a regular
+// file is refused even then. It is itself something left to write, which only
+// a new disc could take, and leaving it out instead would let the run report a
+// complete set that lacks a file the scan found.
+//
+// The refusal is here because the alternative was silence. The assigned lookup
+// used to sit inside the KindFile branch, so a written file that had changed
+// kind never matched the set at all, and a written directory had no record to
+// match: either way the run finished reporting a complete set, and the only
+// warning fired was the one below saying files were "no longer in the source
+// tree" — which reads as reassurance.
+//
+// When there is a disc still to write, it also adds this scan's skeleton to
+// State.Skeleton, the record the next resume checks against. Only in memory:
+// the state is saved when a disc is finished, so a run interrupted before its
+// first disc records nothing it did not write.
 //
 // A hard link added to an already-written inode is WARNED about and packed. It
 // cannot join the rest of its group — the disc holding the group is finished,
@@ -180,10 +232,18 @@ func (r *runner) resumeFilter(res *scan.Result) ([]scan.Entry, error) {
 			ui.HumanBytes(r.st.ScanRawSize), ui.HumanBytes(res.RawBytes))
 	}
 	if r.st.DiscsDone == 0 {
+		// Nothing is on a disc yet, so nothing constrains the tree, and the
+		// skeleton this run is about to write is the whole record.
+		r.st.recordSkeleton(nil, res.Entries)
 		return res.Entries, nil
 	}
 
 	assigned := r.st.assignedSet()
+	// The kind of every non-file path a finished disc holds.
+	was, err := r.st.writtenKinds()
+	if err != nil {
+		return nil, fmt.Errorf("backup: --resume: %w", err)
+	}
 
 	// Which inodes a finished disc already holds, and under which name, so the
 	// warning can say what the new link duplicates. Keyed on the pair, never on
@@ -199,13 +259,24 @@ func (r *runner) resumeFilter(res *scan.Result) ([]scan.Entry, error) {
 	}
 
 	out := make([]scan.Entry, 0, len(res.Entries))
-	var changed, relinked []scan.Entry
+	var changed []kindChange
+	var relinked []scan.Entry
 	firstName := map[string]string{}
 	done, todo := 0, 0
 	for _, e := range res.Entries {
 		_, wasAssigned := assigned[e.Rel]
 		if wasAssigned && e.Kind != scan.KindFile {
-			changed = append(changed, e)
+			changed = append(changed, kindChange{rel: e.Rel, was: scan.KindFile, now: e.Kind})
+			continue
+		}
+		if k, ok := was[e.Rel]; ok && k != e.Kind {
+			changed = append(changed, kindChange{rel: e.Rel, was: k, now: e.Kind})
+			if e.Kind == scan.KindFile {
+				// No disc holds this file, so it is still to write, and only a
+				// new disc could take it: counting it makes the refusal below
+				// fire even when it is the only thing left.
+				todo++
+			}
 			continue
 		}
 		if e.Kind == scan.KindFile {
@@ -224,7 +295,15 @@ func (r *runner) resumeFilter(res *scan.Result) ([]scan.Entry, error) {
 		out = append(out, e)
 	}
 	if len(changed) > 0 {
-		return nil, changedKindError(changed, r.st.DiscsDone)
+		if todo > 0 {
+			return nil, changedKindError(changed, r.st.DiscsDone)
+		}
+		r.p.Warn("%s", changedKindDetail(changed, r.st.DiscsDone))
+	}
+	// With nothing to write, this scan's skeleton goes onto no disc, so it is
+	// not recorded — nor would it be saved, since only a finished disc saves.
+	if todo > 0 {
+		r.st.recordSkeleton(was, res.Entries)
 	}
 	if len(relinked) > 0 {
 		r.p.Warn("%s", relinkedDetail(relinked, firstName))
@@ -249,7 +328,7 @@ type inodeKey struct {
 // already-written data between an interrupted run and its resume, largest
 // first. It names what each duplicates, because the repair is to remove the new
 // link and resume again, and the operator cannot do that without knowing which
-// name is new.
+// name is new. The names are %q, for the reason oversizedDetail gives.
 func relinkedDetail(relinked []scan.Entry, firstName map[string]string) string {
 	sort.Slice(relinked, func(i, j int) bool { return relinked[i].Size > relinked[j].Size })
 	var extra int64
@@ -266,37 +345,71 @@ func relinkedDetail(relinked []scan.Entry, firstName map[string]string) string {
 			fmt.Fprintf(&b, "\n  ... and %d more", len(relinked)-20)
 			break
 		}
-		fmt.Fprintf(&b, "\n  %14d  %s (already on a disc as %s)", e.Size, e.Rel, firstName[e.Rel])
+		fmt.Fprintf(&b, "\n  %14d  %q (already on a disc as %q)", e.Size, e.Rel, firstName[e.Rel])
 	}
 	b.WriteString("\n  remove the new link(s) and resume again to avoid the copies, or start the set over")
 	return b.String()
 }
 
-// changedKindError refuses a resume whose source tree has replaced an
-// already-written file with something that is not a file. Naming the paths is
-// the whole value of the message: putting them back is the one repair that does
-// not throw the finished discs away, and nothing else in the run points at them.
-func changedKindError(changed []scan.Entry, discsDone int) error {
+// kindChange is one path whose kind on a finished disc is not its kind in the
+// source tree now.
+type kindChange struct {
+	rel      string
+	was, now scan.Kind
+}
+
+// changedKindError refuses a resume whose source tree has changed the kind of
+// a path a finished disc holds, in either direction, in one message — a list
+// per direction would let fixing the first refusal uncover the second. Naming
+// each path with what it was and what it is now is the whole value of the
+// message: putting them back is the one repair that does not throw the
+// finished discs away, and nothing else in the run points at them.
+func changedKindError(changed []kindChange, discsDone int) error {
 	var b strings.Builder
-	fmt.Fprintf(&b, "backup: --resume: %d path(s) already written to the %d finished disc(s) as regular "+
-		"files are no longer regular files in the source tree:", len(changed), discsDone)
-	for i, e := range changed {
-		if i == 20 {
-			fmt.Fprintf(&b, "\n  ... and %d more", len(changed)-20)
-			break
-		}
-		fmt.Fprintf(&b, "\n  now a %-7s %s", e.Kind, e.Rel)
-	}
+	fmt.Fprintf(&b, "backup: --resume: %d path(s) the %d finished disc(s) hold have changed kind "+
+		"in the source tree since (was -> now):", len(changed), discsDone)
+	writeKindChanges(&b, changed)
 	b.WriteString("\n  a finished disc cannot be rewritten, and every later disc carries the whole " +
-		"directory skeleton, so continuing would put each of these on one disc as a file and on the " +
-		"rest as something else — a set that unsquashfs abandons part way through restoring; " +
-		"put them back as they were, or start the set over")
+		"directory skeleton, so continuing would hold each of these as one kind on the finished discs " +
+		"and as another on the rest. Where one of the two is a directory, no restore of the set can " +
+		"reliably lay one over the other; where one is a regular file, squashfs-tools 4.5 writes it " +
+		"through a symlink or into a device node the other disc left at that path, or blocks on a fifo " +
+		"there; and a path that changed between two other kinds is refused so that the rule stays simple. " +
+		"Put them back as they were, or start the set over")
 	return errors.New(b.String())
 }
 
+// changedKindDetail is the warning for the same changes when nothing is left
+// to write. It names them because the restored tree will not match the source
+// at those paths, and an operator who sees a restore bring back a directory
+// they had replaced with a symlink should already have been told why.
+func changedKindDetail(changed []kindChange, discsDone int) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "%d path(s) the %d finished disc(s) hold have changed kind in the source tree "+
+		"since (was -> now):", len(changed), discsDone)
+	writeKindChanges(&b, changed)
+	b.WriteString("\n  nothing is left to write, so no further disc carries them and the set is unaffected: " +
+		"a restore gives each back as the finished discs hold it, not as it is now")
+	return b.String()
+}
+
+// writeKindChanges lists changes one per line, the first twenty of them. The
+// paths are %q, for the reason oversizedDetail gives.
+func writeKindChanges(b *strings.Builder, changed []kindChange) {
+	for i, c := range changed {
+		if i == 20 {
+			fmt.Fprintf(b, "\n  ... and %d more", len(changed)-20)
+			break
+		}
+		fmt.Fprintf(b, "\n  %-7s -> %-7s  %q", c.was, c.now, c.rel)
+	}
+}
+
 // checkIndexCovers refuses a resume that would build discs the encrypted index
-// can never list. A run that got as far as buildIndex deleted the plaintext
-// index, and prepareState marks such a resume indexBuilt: the encrypted index
+// can never list. Only finish deletes the plaintext index, as the step before
+// it deletes the state file, so a resume that finds the encrypted index and no
+// plaintext one is one whose last run stopped between the two (or could not
+// remove the state), and prepareState marks it indexBuilt: the encrypted index
 // is kept as it is and copied onto every disc. That is only right if there is
 // nothing left to write. If the source tree grew since — files added under
 // SOURCE_DIR, or files that were unreadable then and are readable now — the
@@ -731,18 +844,26 @@ func (r *runner) discPayload(n int) ([]string, error) {
 // buildDiscDirs lays out one directory per disc, exactly as it will be burned.
 // Each artefact is hard-linked so staging does not hold a second copy of every
 // image; a copy is only made when the link cannot be created.
+//
+// Each disc directory is emptied and made again before it is laid out, so
+// everything in it afterwards was put there by this run; see freshDiscDir.
 func (r *runner) buildDiscDirs(ctx context.Context, total int) error {
 	r.p.Log("laying out discs")
 	for n := 1; n <= total; n++ {
 		if err := ctx.Err(); err != nil {
 			return fmt.Errorf("backup: aborted: %w", err)
 		}
-		data := filepath.Join(r.dirs.Discs, discDirName(n), "data")
-		if err := os.MkdirAll(data, 0o755); err != nil {
-			return fmt.Errorf("backup: creating %s: %w", data, err)
-		}
+		// Before the directory is cleared, not after: a resume that finds an
+		// artefact missing from enc/ must stop with the disc directory's copy
+		// of it still there. On a staging tree that spans filesystems that copy
+		// is a copy rather than a link, and it may be the only one left.
 		names, err := r.discPayload(n)
 		if err != nil {
+			return err
+		}
+		dd := filepath.Join(r.dirs.Discs, discDirName(n))
+		data := filepath.Join(dd, "data")
+		if err := freshDiscDir(dd, data); err != nil {
 			return err
 		}
 		for _, nm := range names {
@@ -771,6 +892,156 @@ func (r *runner) buildDiscDirs(ctx context.Context, total int) error {
 	}
 	r.p.OK("%d disc directory(ies)", total)
 	return nil
+}
+
+// freshDiscDir empties the disc directory dd and creates it again, with its
+// data/ subdirectory, under the rules [fsx.SecureStaging] applies to the rest
+// of the staging tree: real directories, mode 0700, owned by this process.
+//
+// WHY EMPTY IT. makeDirs secures discs/ itself and nothing below it, and a
+// staging tree is reused across a resume, so whatever an earlier run left
+// inside discs/ was taken as found. A tree that another account could once
+// write — one the operator made group- or world-writable by hand, or adopted
+// with chown -R — could hold a symlink at discs/disc01, a symlink or a hard
+// link at one of the document names, or a plain file at a name nothing in this
+// run overwrites. The first sent the whole layout of that disc, images,
+// documents and a copy of this program, wherever the link pointed. The second
+// had os.WriteFile truncate the target of a link at README.md with the
+// README's text. The third went onto the disc as though this run had put it
+// there: hashed into SHA512SUMS, and — for a planted brb.sh or
+// brb-linux-<arch> on a set with no dist payload, where copySelf kept
+// whatever it found — listed by the README as a copy of the tool for a
+// restorer to run. Securing the directory would
+// have answered only the first. Emptying it answers all three, and costs
+// nothing, because every entry a disc directory holds is regenerated on every
+// run anyway: the data/ links from enc/, sidecars.par2, identity.txt, the
+// manifest link, the payload, the self-copy, README.md and SHA512SUMS.
+// linkOrCopy already removed and relinked each artefact rather than trust
+// what it found.
+//
+// A symlink at dd is refused rather than removed. RemoveAll would only unlink
+// it, so nothing outside staging is at risk either way; but a link there was
+// either planted or made by an operator who pointed a disc at another volume
+// for room, and both are worth hearing about rather than finding the link
+// gone. discs/ is mode 0700 and this process's own by now, so nothing can be
+// planted between the check and the removal.
+//
+// A mount point at dd, or anywhere below it, is refused too, and for a worse
+// reason. It is the other way to point a disc at another volume for room, and
+// RemoveAll does not stop at it: it walks into the mounted filesystem, deletes
+// everything there, and only then fails on the mount point itself with EBUSY,
+// so the run stopped with that volume already emptied. A bind mount does the
+// same to the directory it shows, wherever that is. Before disc directories
+// were emptied, a run wrote into such a mount without trouble, as it is meant
+// to: linkOrCopy copies where it cannot link so that a staging tree spanning
+// filesystems works. Mounting the other volume at discs/ itself is still fine,
+// since nothing at or below dd is then a mount point. mountBelow says how a
+// mount point is recognised, and which one goes unseen off Linux or without
+// /proc: a bind mount from the filesystem discs/ is on, which gives a disc no
+// room it did not have. A mount cannot appear between the check and the
+// removal without privileges that make every other check here moot.
+//
+// The resume state (<STAGING>/state.json), the plaintext index in work/ and
+// the ciphertext in enc/ cannot be treated this way — they are the set — so
+// the README's security notes say what a shared staging tree costs there.
+func freshDiscDir(dd, data string) error {
+	if fi, err := os.Lstat(dd); err == nil && fi.Mode()&fs.ModeSymlink != 0 {
+		target, _ := os.Readlink(dd)
+		return fmt.Errorf("backup: %s is a symlink (-> %s); a disc directory is laid out by this run "+
+			"and must be a real directory inside staging — remove the link and run "+
+			"'brb backup --resume'", dd, target)
+	}
+	discs := filepath.Dir(dd)
+	mp, why, err := mountBelow(dd)
+	if err != nil {
+		return err
+	}
+	if mp != "" {
+		return fmt.Errorf("backup: %s %s; a disc directory is emptied and laid out again on every "+
+			"run, which would delete everything on it — unmount it, or mount the other volume at %s "+
+			"as a whole instead, and run 'brb backup --resume'", mp, why, discs)
+	}
+	if err := os.RemoveAll(dd); err != nil {
+		return fmt.Errorf("backup: clearing %s: %w", dd, err)
+	}
+	if err := fsx.SecureStaging(dd, data); err != nil {
+		return fmt.Errorf("backup: %w", err)
+	}
+	return nil
+}
+
+// deviceOf is [fsx.DeviceID] and mountPointsUnder is [fsx.MountPointsUnder],
+// held in variables so that a test can stand a mount in for one directory:
+// mounting a filesystem takes a privilege an ordinary test run does not have.
+var (
+	deviceOf         = func(_ string, fi fs.FileInfo) (uint64, bool) { return fsx.DeviceID(fi) }
+	mountPointsUnder = fsx.MountPointsUnder
+)
+
+// mountBelow returns the first directory at or below dd that is a mount point,
+// with the reason to give for it, or "" when there is none, which includes a
+// dd that does not exist yet.
+//
+// Two tests, because each misses something the other sees. The kernel's list
+// of mount points, [fsx.MountPointsUnder], is the only one that sees a
+// directory bind-mounted from the filesystem discs/ is on, which has the
+// device discs/ has; it needs Linux and /proc. A device other than the one
+// discs/ is on catches every other mount on every system, so where the list
+// cannot be read, only that same-filesystem bind goes unrecognised. The device
+// test also refuses a btrfs subvolume, which has a device of its own without
+// being a mount point; emptying one empties it just as surely.
+//
+// Directories only, for the device test. A filesystem mounted on a file cannot
+// lose its contents to an unlink, and the comparison would be wrong for files
+// on overlayfs, which reports its own device for a directory but may report
+// the one of the layer beneath for anything else. The list is not filtered
+// that way, and a mount on a file below dd is refused as well; that only
+// brings the failure forward, since RemoveAll cannot unlink a mount point
+// either and stops there with EBUSY.
+func mountBelow(dd string) (found, why string, err error) {
+	mps, _, err := mountPointsUnder(dd)
+	if err != nil {
+		return "", "", fmt.Errorf("backup: looking for mount points under %s: %w", dd, err)
+	}
+	if len(mps) > 0 {
+		return mps[0], "is a mount point", nil
+	}
+	parent := filepath.Dir(dd)
+	pfi, err := os.Lstat(parent)
+	if err != nil {
+		return "", "", fmt.Errorf("backup: %w", err)
+	}
+	want, ok := deviceOf(parent, pfi)
+	if !ok {
+		return "", "", nil
+	}
+	err = filepath.WalkDir(dd, func(p string, d fs.DirEntry, err error) error {
+		if err != nil {
+			if errors.Is(err, fs.ErrNotExist) {
+				return nil
+			}
+			return err
+		}
+		if !d.IsDir() {
+			return nil
+		}
+		fi, err := d.Info()
+		if err != nil {
+			if errors.Is(err, fs.ErrNotExist) {
+				return nil
+			}
+			return err
+		}
+		if dev, ok := deviceOf(p, fi); ok && dev != want {
+			found, why = p, "is on a different filesystem from "+parent+" (a mount point, or a subvolume)"
+			return filepath.SkipAll
+		}
+		return nil
+	})
+	if err != nil {
+		return "", "", fmt.Errorf("backup: looking for mount points under %s: %w", dd, err)
+	}
+	return found, why, nil
 }
 
 // oversizedDisc is the refusal for a disc directory that has outgrown the
@@ -835,25 +1106,12 @@ func (r *runner) writePublicIdentity(n int) error {
 	if err != nil {
 		return fmt.Errorf("backup: disc %d: reading the set's key: %w", n, err)
 	}
-	// A resumed run reaches discs an earlier run already laid out. Keep the
-	// file only if it is byte-for-byte the set's key: a run killed between the
-	// create and the write leaves a truncated one, and keeping that would put
-	// a disc on the shelf whose "key" is an empty file.
-	if existing, err := os.ReadFile(path); err == nil && bytes.Equal(existing, canonical) {
-		return nil
-	}
-	if err := os.Remove(path); err != nil && !errors.Is(err, fs.ErrNotExist) {
-		return fmt.Errorf("backup: disc %d: replacing %s: %w", n, path, err)
-	}
-	if err := os.WriteFile(path, canonical, 0o644); err != nil {
-		return fmt.Errorf("backup: disc %d: writing %s: %w", n, path, err)
-	}
-	// The mode passed to WriteFile is masked by the umask; the disc copy is
-	// meant to be world-readable, that being the point of a public archive.
-	if err := os.Chmod(path, 0o644); err != nil {
-		return fmt.Errorf("backup: disc %d: chmod %s: %w", n, path, err)
-	}
-	return nil
+	// World-readable, that being the point of a public archive; the staging
+	// copy it comes from is 0400. There is never an earlier copy to keep or
+	// replace — freshDiscDir has just emptied the directory — and the write
+	// goes through a .part and a rename, so a run killed part way leaves no
+	// truncated "key" behind at this name for a later one to burn.
+	return writeFileAtomic(path, canonical, 0o644)
 }
 
 // The recovery set over a disc's small files. The parameters are fixed rather
@@ -875,8 +1133,8 @@ const (
 //
 // The membership is part of the on-disc format, not an internal choice: the
 // README tells a restorer to run `par2 repair -- sidecars.par2`, and brb.sh
-// prints that same instruction (brb.sh:611, :1709), so a file left out of this
-// set is a file the printed repair cannot recover.
+// prints that same instruction (brb.sh's sidecar_repair_hint and usage), so a
+// file left out of this set is a file the printed repair cannot recover.
 func sidecarNames(data string) ([]string, error) {
 	names, err := filesMatching(data, func(nm string) bool {
 		return strings.HasSuffix(nm, ".sha512")
@@ -941,8 +1199,11 @@ func (r *runner) sidecarParity(ctx context.Context, n int, data string) error {
 	if len(names) == 0 {
 		return fmt.Errorf("there are no sidecar files in %s to protect", data)
 	}
-	// A resumed run finds the previous run's set here, and par2 will not
-	// overwrite one. Removing it first also means a set that is left behind is
+	// No earlier set should be here any more. A resumed run used to find the
+	// previous run's, but buildDiscDirs has just emptied data/ (freshDiscDir),
+	// and nothing it links in from enc/ is named like this. The sweep stays as
+	// the guarantee rather than the expectation: par2 refuses to write over an
+	// existing set, and removing one first means a set that is left behind is
 	// always one that matches the files beside it. Matched by name, not by a
 	// glob over the full path, so a STAGING holding '[' or '*' still sweeps.
 	stale, err := filesMatching(data, func(nm string) bool {
@@ -1000,7 +1261,7 @@ func (r *runner) writeManifest(ctx context.Context, total int) error {
 		Archive:        r.cfg.ArchiveName,
 		Created:        r.started.Format(time.RFC3339),
 		Host:           host,
-		Source:         r.cfg.SourceDir,
+		Source:         docPath(r.cfg.SourceDir),
 		Total:          total,
 		DiscType:       r.cfg.DiscType.String(),
 		Compression:    r.cfg.Compression,
@@ -1014,12 +1275,16 @@ func (r *runner) writeManifest(ctx context.Context, total int) error {
 		PublicIdentity: r.publicIdentityText(),
 		DiscFiles:      discFiles,
 		PruneDirs:      r.manifestPrunes(),
-		ExcludeMasks:   r.cfg.ExcludeMasks,
+		ExcludeMasks:   docPaths(r.cfg.ExcludeMasks),
 	})
 
+	// The staging root is never emptied the way a disc directory is, so this
+	// one is the write that has to replace whatever sits at the name rather
+	// than open through it; see writeFileAtomic. The disc copies are links to
+	// the file it installs.
 	mf := filepath.Join(r.cfg.Staging, "MANIFEST.txt")
-	if err := os.WriteFile(mf, []byte(text), 0o644); err != nil {
-		return fmt.Errorf("backup: writing %s: %w", mf, err)
+	if err := writeFileAtomic(mf, []byte(text), 0o644); err != nil {
+		return err
 	}
 	for n := 1; n <= total; n++ {
 		dst := filepath.Join(r.dirs.Discs, discDirName(n), "MANIFEST.txt")
@@ -1048,20 +1313,68 @@ const maxNamedUnreadable = 64
 //
 // The distinction matters to whoever reads it: a mount point was left out on
 // purpose and its contents are somewhere else, while an unreadable path was
-// meant to be here and is not. Both are named as what they are.
+// meant to be here and is not. Both are named as what they are, and both
+// relative to SOURCE_DIR, like the prunes above them: a path inside the
+// archive is the one a restorer can look for, and pass to --only.
+//
+// Every name goes through docPath. The mount points and unreadable paths come
+// from the source tree, where anyone who can create a file chooses its name.
 func (r *runner) manifestPrunes() []string {
-	if len(r.skippedMounts) == 0 && r.unreadableCount == 0 {
-		return r.cfg.PruneDirs
-	}
-	out := append([]string(nil), r.cfg.PruneDirs...)
+	out := docPaths(r.cfg.PruneDirs)
 	for _, m := range r.skippedMounts {
-		out = append(out, m+"  (mount point: not crossed, its contents are not on this set)")
+		out = append(out, docPath(m)+"  (mount point: not crossed, its contents are not on this set)")
 	}
 	for _, u := range r.unreadable {
-		out = append(out, u+"  (could not be read: NOT on any disc)")
+		out = append(out, docPath(u)+"  (could not be read: NOT on any disc)")
 	}
 	if extra := r.unreadableCount - len(r.unreadable); extra > 0 {
 		out = append(out, fmt.Sprintf("... and %d more path(s) that could not be read and are NOT on any disc", extra))
+	}
+	return out
+}
+
+// docPath renders a path, or a configured pattern, for MANIFEST.txt and the
+// on-disc README: documents a stranger reads off a disc years from now, most
+// likely by catting them to a terminal.
+//
+// A name holding a control character is quoted with strconv.Quote, which is
+// what reportPaths' %q shows the operator for the same name on the terminal.
+// Every other name is written exactly as it is. Raw, a newline in SOURCE_DIR
+// started a line of its own ahead of the manifest's real "discs" line, and
+// both readers' expected-disc check and iso.Total believe the first "discs"
+// line they see: a source path holding "\ndiscs : 1\n" made a two-disc set
+// with one disc staged read as complete. A newline in an unreadable file's
+// name or in a mount point forged "prune:" and "mask :" records in the
+// excluded section. And an ESC or a C1 control acted on the terminal of
+// whoever read the file. ARCHIVE_NAME is refused outright for holding a C0
+// control, for exactly that reason, while the path printed beside it went in
+// verbatim.
+//
+// The class is the Printer's (ui.needsEscaping): C0, DEL, and C1 in both
+// spellings — UTF-8 encoded, and as a raw 0x80..0x9F byte that is not part of
+// a valid sequence — plus the newline and tab the Printer keeps for brb's own
+// multi-line messages, which in a document can only forge.
+//
+// It is a rendering for people, not an encoding to parse back. It is not
+// one-to-one: a name that is literally a quoted, escaped string reads the same
+// as the quoted form of the name it spells. Nothing reads these lines back,
+// and the quotes tell a person which of the two to suspect.
+func docPath(s string) string {
+	for i, r := range s {
+		if r < 0x20 || r == 0x7f || (r >= 0x80 && r <= 0x9f) ||
+			(r == utf8.RuneError && s[i] >= 0x80 && s[i] <= 0x9f) {
+			return strconv.Quote(s)
+		}
+	}
+	return s
+}
+
+// docPaths is docPath over a list, into a new slice: the configuration's own
+// lists are not the manifest's to rewrite.
+func docPaths(in []string) []string {
+	out := make([]string, 0, len(in))
+	for _, s := range in {
+		out = append(out, docPath(s))
 	}
 	return out
 }
@@ -1095,7 +1408,7 @@ func (r *runner) writeReadmes(ctx context.Context, total int) error {
 			Disc:              n,
 			Total:             total,
 			Date:              date,
-			Source:            r.cfg.SourceDir,
+			Source:            docPath(r.cfg.SourceDir),
 			Redundancy:        r.cfg.Par2Redundancy,
 			SidecarRedundancy: SidecarRedundancy,
 			SidecarParity:     !r.sidecarFailed(n),
@@ -1103,8 +1416,8 @@ func (r *runner) writeReadmes(ctx context.Context, total int) error {
 			Tools:             discToolArtifacts(dd),
 			PublicIdentity:    r.publicIdentityText(),
 		})
-		if err := os.WriteFile(filepath.Join(dd, "README.md"), []byte(text), 0o644); err != nil {
-			return fmt.Errorf("backup: writing %s/README.md: %w", dd, err)
+		if err := writeFileAtomic(filepath.Join(dd, "README.md"), []byte(text), 0o644); err != nil {
+			return err
 		}
 	}
 
@@ -1144,6 +1457,14 @@ func (r *runner) copySelf(ctx context.Context, total int) (string, error) {
 		// The dist payload, when there is one, already carries a properly named
 		// binary for every architecture. Copying ourselves over it would replace
 		// a cross-built release artifact with whatever happens to be running.
+		//
+		// Anything at dst can only be that payload, placed by this run.
+		// freshDiscDir emptied every disc directory before writePayload ran, so
+		// the copy an earlier, interrupted run left here is gone. It used to be
+		// kept: a resume after an upgrade or a rebuild then burned the old
+		// binary, under a README and a manifest that both name the version
+		// running now — and an earlier run that died part way through this loop
+		// left one set carrying two different programs under one name.
 		if _, err := os.Stat(dst); err == nil {
 			continue
 		}
@@ -1182,9 +1503,20 @@ func selfPath() (string, error) {
 // writeSums writes a sha512sum-compatible SHA512SUMS covering every file on
 // each disc.
 func (r *runner) writeSums(ctx context.Context, total int) error {
+	// The index is the same file on every disc, so its digest is looked up
+	// once, here, rather than once per disc: a sidecar that cannot be read was
+	// read again, and warned about again, for each of twenty discs.
+	var index *agecrypt.KnownSum
+	if k, ok := r.knownSum(indexName, r.indexCipher); ok {
+		index = &k
+	}
 	for n := 1; n <= total; n++ {
 		dd := filepath.Join(r.dirs.Discs, discDirName(n))
-		if err := agecrypt.WriteSumsKnown(ctx, dd, filepath.Join(dd, agecrypt.SumsName), r.knownSums(n)); err != nil {
+		if err := agecrypt.WriteSumsKnown(ctx, dd, filepath.Join(dd, agecrypt.SumsName), r.knownSums(n, index)); err != nil {
+			var changed *agecrypt.DigestMismatchError
+			if errors.As(err, &changed) {
+				return r.changedSinceEncryption(n, changed)
+			}
 			return fmt.Errorf("backup: disc %d: %w", n, err)
 		}
 	}
@@ -1192,32 +1524,162 @@ func (r *runner) writeSums(ctx context.Context, total int) error {
 	return nil
 }
 
-// knownSums lists the digests this run already measured for disc n's two large
-// files, so SHA512SUMS does not read them again: the disc directory's copies
-// are hard links to the ones in enc/, whose SHA-512 was computed on the way
-// through the encryption.
+// knownSums tells agecrypt.WriteSumsKnown what disc n's two large files, its
+// image and the encrypted index, hashed to when they were encrypted. The one
+// record does two jobs.
 //
-// It returns nothing under --verify-roundtrip. That flag is the operator asking
-// for every byte to be proved twice, and this pass is the only one that reads
-// the ciphertext back off the filesystem after it was written — the one thing
-// that would catch a staging directory that corrupted it in between. See
-// agecrypt.WriteSumsKnown, which checks the inode before trusting any of this.
-func (r *runner) knownSums(n int) map[string]agecrypt.KnownSum {
-	if r.opts.VerifyRoundTrip {
-		return nil
-	}
+// In default mode it saves a read. The disc directory's copies are hard links
+// to the ones in enc/, whose SHA-512 this run computed on the way through the
+// encryption, and agecrypt trusts that digest only once it has checked the
+// inode (Same) — so SHA512SUMS does not re-read twenty gigabytes per disc to
+// learn a number brb already holds.
+//
+// And whenever a file IS read, the result is held to that digest (Verify),
+// and a file that no longer matches it refuses the run. It is read under
+// --verify-roundtrip, which is the operator asking for every byte to be proved
+// twice, so nothing is shortcut; when linkOrCopy had to copy rather than link,
+// so the inode check fails; and for a disc or an index an earlier, interrupted
+// invocation encrypted, which this one never measured. For those last the
+// digest comes from the sidecar written at encryption, enc/<name>.sha512.
+//
+// The comparison is what makes the read-back worth its time, and it used to
+// be missing. Under --verify-roundtrip this returned nothing at all, so
+// SHA512SUMS was filled with whatever the bytes hashed to by then: a
+// ciphertext that changed in staging after its round-trip — bad RAM, a
+// failing SSD — was attested as correct and verified clean, where default mode
+// would at least have recorded the original digest for `brb verify` to catch.
+// Every disc finished before a --resume was attested the same way in default
+// mode.
+//
+// index is the index's entry, which writeSums looks up once for every disc;
+// nil leaves the index to be hashed with nothing to compare against.
+func (r *runner) knownSums(n int, index *agecrypt.KnownSum) map[string]agecrypt.KnownSum {
 	out := make(map[string]agecrypt.KnownSum, 2)
 	base := imageName(n) + ".age"
-	if sum, ok := r.discCipher[n]; ok {
-		out["./data/"+base] = agecrypt.KnownSum{Digest: sum, Same: filepath.Join(r.dirs.Enc, base)}
+	if k, ok := r.knownSum(base, r.discCipher[n]); ok {
+		out["./data/"+base] = k
 	}
-	if r.indexCipher != "" {
-		out["./data/"+indexName] = agecrypt.KnownSum{
-			Digest: r.indexCipher,
-			Same:   filepath.Join(r.dirs.Enc, indexName),
-		}
+	if index != nil {
+		out["./data/"+indexName] = *index
 	}
 	return out
+}
+
+// knownSum is one entry of knownSums. measured is the ciphertext digest this
+// invocation took while encrypting name, or "" when an earlier one did.
+//
+// A sidecar that cannot be read, or that does not name the file, leaves the
+// file to be hashed with nothing to compare against — which is what happened
+// to every such file before the comparison existed — and says so. It is not a
+// refusal: discPayload has already required the sidecar to exist, so this is
+// a sidecar that rotted, and the readers' own checks will meet it on restore.
+func (r *runner) knownSum(name, measured string) (agecrypt.KnownSum, bool) {
+	enc := filepath.Join(r.dirs.Enc, name)
+	if measured != "" {
+		k := agecrypt.KnownSum{Digest: measured, Verify: true}
+		if !r.opts.VerifyRoundTrip {
+			k.Same = enc
+		}
+		return k, true
+	}
+	sidecar := enc + ".sha512"
+	recorded, err := agecrypt.ReadSumFile(sidecar)
+	if err != nil {
+		r.p.Warn("%s is hashed for %s without being compared with the digest taken when it was "+
+			"encrypted: %v", name, agecrypt.SumsName, err)
+		return agecrypt.KnownSum{}, false
+	}
+	digest, ok := recorded[name]
+	if !ok {
+		r.p.Warn("%s is hashed for %s without being compared with the digest taken when it was "+
+			"encrypted: %s has no line for it", name, agecrypt.SumsName, sidecar)
+		return agecrypt.KnownSum{}, false
+	}
+	return agecrypt.KnownSum{Digest: digest, Verify: true}, true
+}
+
+// changedSinceEncryption is writeSums' refusal for a file that no longer hashes
+// to the digest taken when it was encrypted. Either the file changed in
+// staging since, or the record of it did, and from here the two cannot be told
+// apart — so the message names both, and the way out, which is different for
+// an image and for the index.
+//
+// A refusal and not a warning, because what it stops is the one thing that
+// cannot be undone afterwards: a SHA512SUMS on the disc that attests the bytes
+// as correct, so that verify-disc passes a disc whose image or index is no
+// longer the one that was encrypted. Nothing is lost by stopping: every disc
+// is already recorded in state.json, so a --resume after the repair redoes
+// only the steps that follow the last image.
+//
+// Where the advice starts depends on what was read. When linkOrCopy had to
+// copy, the file hashed was the disc directory's own copy and enc/ may be
+// untouched, so the first thing to try is a resume, which lays the disc out
+// again from enc/. Sending the operator to par2 first was wrong there: par2
+// would find enc/ intact, and the advice for an intact image — suspect the
+// record, decrypt twenty gigabytes to check it — sent them after a record
+// that was fine, with "start the set over" as the only other way out. Only if
+// the refusal comes back is enc/ or its record the suspect, and then the
+// advice is the linked case's.
+//
+// That advice ends in a repair of the record rather than in "start the set
+// over", wherever the bytes can be proved sound without it. Decrypting is that
+// proof: age authenticates its header and every chunk of what it decrypts, so
+// a ciphertext that decrypts without error is the one that was written, and
+// for an image the plaintext digest says it is the right one. A record proved
+// wrong that way is written again with sha512sum, whose output is the format
+// the sidecar is in, and the resume then holds the file to the new record.
+func (r *runner) changedSinceEncryption(n int, c *agecrypt.DigestMismatchError) error {
+	name := strings.TrimPrefix(c.Name, "./data/")
+	enc := filepath.Join(r.dirs.Enc, name)
+	head := fmt.Sprintf("backup: disc %d: %s hashes to %s now but to %s when it was encrypted, so it, "+
+		"or its record %s, has changed in staging since; refusing to write a %s that would vouch for it",
+		n, c.Name, c.Got, c.Want, enc+".sha512", agecrypt.SumsName)
+	rewrite := fmt.Sprintf("in %s, 'sha512sum %s > %s.sha512' writes the record again, and "+
+		"'brb backup --resume' carries on", r.dirs.Enc, name, name)
+
+	var fix string
+	switch {
+	case name == indexName && !r.indexBuilt:
+		// The index has no parity in enc/ — sidecars.par2 is built per disc,
+		// over whatever the index was at the time — but until finish() it has
+		// its plaintext: a resume that finds work/index.tsv encrypts it again,
+		// and lays every disc out again after it, so this one answer covers the
+		// copy, the ciphertext and the record alike.
+		return fmt.Errorf("%s — run 'brb backup --resume', which encrypts the index again from %s",
+			head, filepath.Join(r.dirs.Work, indexFileName))
+	case name == indexName:
+		fix = fmt.Sprintf("the plaintext index it was encrypted from is already gone, so check whether %s "+
+			"is sound: if it still decrypts, and 'gunzip -t' accepts what comes out, the record is what "+
+			"changed — %s; if not, start the set over", enc, rewrite)
+	default:
+		fix = fmt.Sprintf("in %s, 'par2 repair -- %s.par2' restores the image if it is what changed, and "+
+			"'brb backup --resume' then lays the discs out again. If par2 finds it intact, the record is "+
+			"the suspect: decrypt the image and compare its sha512 with %s. If they match, the image is "+
+			"sound — %s; if they do not, start the set over", r.dirs.Enc, name,
+			strings.TrimSuffix(name, ".age")+".sha512", rewrite)
+	}
+	if r.separateCopy(n, name) {
+		return fmt.Errorf("%s — the disc's copy is a file of its own, not a link to %s, so it may be the "+
+			"copy alone that changed: run 'brb backup --resume', which copies it again from enc/. If the "+
+			"refusal comes back, %s", head, enc, fix)
+	}
+	return fmt.Errorf("%s — %s", head, fix)
+}
+
+// separateCopy reports whether disc n's copy of the enc/ file name is a file
+// of its own rather than a hard link to it: what linkOrCopy leaves when the
+// link cannot be made. It is false when either cannot be looked at, which
+// leaves changedSinceEncryption giving the advice that does not depend on it.
+func (r *runner) separateCopy(n int, name string) bool {
+	disc, err := os.Lstat(filepath.Join(r.dirs.Discs, discDirName(n), "data", name))
+	if err != nil {
+		return false
+	}
+	orig, err := os.Lstat(filepath.Join(r.dirs.Enc, name))
+	if err != nil {
+		return false
+	}
+	return !os.SameFile(disc, orig)
 }
 
 // checkDiscSizes confirms every finished disc directory still fits the media,
@@ -1301,7 +1763,9 @@ func (r *runner) finish(total int) {
 	r.p.Raw("    brb verify-disc 1")
 	r.p.Raw("    brb restore /tmp/testrestore    # do this once before trusting the set")
 	r.p.Raw("")
-	r.p.Raw("  Then wipe staging:  rm -rf %s", r.cfg.Staging)
+	// One shell word whatever STAGING holds: this is pasted, and a staging path
+	// with a space in it would otherwise reach rm as two operands.
+	r.p.Raw("  Then wipe staging:  rm -rf %s", ui.ShellWord(r.cfg.Staging))
 	r.p.Raw("")
 }
 

@@ -33,21 +33,28 @@ var errNoIndex = errors.New("restore: no encrypted index")
 // bytes would miss exactly the files whose names made escaping necessary, and
 // would also match a path against the disc-number field.
 //
-// It is deliberately stricter than brb.sh, which greps the index
-// case-insensitively for a substring: here a request matches an entry only when
-// it names it exactly or names a directory containing it, which is the same
-// question [Options.pathsPresent] asks the image itself. Anything looser would
-// have the index and the image disagree about what --only means, and would send
-// a restore off to decrypt a disc because some other file's name contained the
+// It asks the index the same question brb.sh's restore asks of it, and the same
+// one [Options.pathsPresent] asks the image itself: a request matches an entry
+// only when it names it exactly or names a directory containing it. It is
+// deliberately not the case-insensitive substring match that 'index', the
+// search command, performs on both readers: anything looser would have the
+// index and the image disagree about what --only means, and would send a
+// restore off to decrypt a disc because some other file's name contained the
 // requested one.
 func (o Options) indexDiscs(ctx context.Context, want []string) (map[string][]int, error) {
 	if len(want) == 0 {
 		return nil, nil
 	}
 	hits := make(map[string]map[int]bool, len(want))
+	// Each request trimmed once rather than inside covers once per record: the
+	// index of a $HOME-sized set holds a million of them.
+	trimmed := make([]string, len(want))
+	for i, w := range want {
+		trimmed[i] = strings.Trim(w, "/")
+	}
 	bad, err := o.scanIndex(ctx, func(disc int, p string) {
-		for _, w := range want {
-			if covers(w, p) {
+		for i, w := range want {
+			if coversTrimmed(trimmed[i], p) {
 				if hits[w] == nil {
 					hits[w] = map[int]bool{}
 				}
@@ -279,11 +286,14 @@ func containsDisc(ds []int, n int) bool {
 //   - It never fails because the index is absent or unreadable. An old set, or
 //     a single disc ingested on its own, still restores the way it did before;
 //     the fallback is announced, because a --only that quietly decrypts fifty
-//     discs is a surprise worth one warning.
+//     discs is a surprise worth one warning. brb.sh used to refuse in both
+//     cases, and to call an unreadable index "not in the index"; it now falls
+//     back with the same warnings.
 //   - It never adds a disc the operator did not ask for. With --disc N the
 //     selection stays disc N; the index only contributes what it knows about
 //     that choice, up to refusing early when it is certain the path is
-//     somewhere else.
+//     somewhere else. brb.sh asks the index the same question with --disc,
+//     where it used to skip it.
 func (o Options) narrowByIndex(ctx context.Context, imgs []discFile, ro RestoreOptions) (sel []discFile, narrowed bool, err error) {
 	encDir := o.dirs().Enc
 	hits, err := o.indexDiscs(ctx, ro.Only)
@@ -348,9 +358,12 @@ func (o Options) narrowByIndex(ctx context.Context, imgs []discFile, ro RestoreO
 		}
 	}
 	if len(absent) > 0 {
+		// The last sentence names what can still make a path miss. It used to
+		// say "with no leading '/'", but onlyPath strips a leading slash before
+		// the index is asked, so a slash can no longer be the reason.
 		return nil, false, fmt.Errorf("restore: %s is not in the index — check 'brb index %s', or pass "+
-			"--disc N explicitly. Paths are relative to the archive root, with no leading '/'",
-			quoteAll(absent), absent[0])
+			"--disc N explicitly. Paths are relative to the archive root, not the path the file had on "+
+			"the machine that was backed up", quoteAll(absent), absent[0])
 	}
 
 	have := make(map[int]discFile, len(imgs))

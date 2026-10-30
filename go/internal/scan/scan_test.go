@@ -1001,3 +1001,48 @@ func TestOneFileSystemDoesNotStopAtANonDirectory(t *testing.T) {
 			res.RawBytes)
 	}
 }
+
+// TestCleanPatternsDropsDuplicates. The walk tries every glob prune and every
+// mask against every entry it sees, so a pattern listed twice — or spelled two
+// ways that trim to the same thing — was a second round of matching across the
+// whole tree for an answer that cannot change. Validation still sees every
+// element first, so a malformed pattern is refused however often it appears.
+func TestCleanPatternsDropsDuplicates(t *testing.T) {
+	got, err := cleanPatterns([]string{"cache", "/cache/", " cache/ ", "*/x", "*/x/", "core.[0-9]*", "core.[0-9]*"}, "PruneDirs")
+	if err != nil {
+		t.Fatalf("cleanPatterns: %v", err)
+	}
+	if want := []string{"*/x", "cache", "core.[0-9]*"}; !reflect.DeepEqual(got, want) {
+		t.Errorf("cleanPatterns = %q, want %q", got, want)
+	}
+	if _, err := cleanPatterns([]string{"[", "["}, "ExcludeMasks"); !errors.Is(err, filepath.ErrBadPattern) {
+		t.Errorf("a malformed duplicate = %v, want filepath.ErrBadPattern", err)
+	}
+
+	// And the walk selects exactly what it selected with each pattern once.
+	root := t.TempDir()
+	for _, p := range []string{"keep/a", "cache/b", "src/x/c", "core.123", "core/main.go"} {
+		if err := os.MkdirAll(filepath.Dir(filepath.Join(root, p)), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(root, p), []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	walk := func(prunes, masks []string) []string {
+		res, err := Walk(context.Background(), Options{Root: root, PruneDirs: prunes, ExcludeMasks: masks})
+		if err != nil {
+			t.Fatal(err)
+		}
+		var rels []string
+		for _, e := range res.Entries {
+			rels = append(rels, e.Rel)
+		}
+		return rels
+	}
+	once := walk([]string{"cache", "*/x"}, []string{"core.[0-9]*"})
+	twice := walk([]string{"cache", "/cache/", "*/x", "*/x/"}, []string{"core.[0-9]*", "core.[0-9]*"})
+	if !reflect.DeepEqual(once, twice) {
+		t.Errorf("duplicated patterns changed the selection:\n once  %q\n twice %q", once, twice)
+	}
+}

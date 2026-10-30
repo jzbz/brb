@@ -7,6 +7,8 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+
+	"github.com/jzbz/brb/internal/ui"
 )
 
 // SecureStaging makes a staging root, and the subdirectories the caller is
@@ -182,8 +184,13 @@ func symlinkRefusal(dir string) error {
 // ownershipAdvice says what to do about a staging directory somebody else
 // owns. The advice differs by who "somebody else" is, because the three cases
 // have three different fixes and only one of them is suspicious.
+//
+// The chown is a command the operator pastes as root, so dir goes into it as
+// one shell word (ui.ShellWord): a STAGING with a space in it would otherwise
+// hand chown -R two trees, and the one before the space is somebody's existing
+// directory made root-owned to its last file.
 func ownershipAdvice(dir string, owner int) string {
-	if os.Geteuid() == 0 {
+	if adviceEuid() == 0 {
 		// Running the backup under sudo is normal and supported — the README
 		// recommends it — and the commonest way to arrive here is entirely
 		// innocent: the operator ran brb as themselves once, which created
@@ -200,16 +207,23 @@ func ownershipAdvice(dir string, owner int) string {
 			if uid, err := strconv.Atoi(sudo); err == nil && uid == owner {
 				return fmt.Sprintf("that is the account you ran sudo from, and a root run must not write "+
 					"plaintext where it can be replaced from below: chown -R root %s to hand the tree to "+
-					"this run, or point STAGING at a directory root owns", dir)
+					"this run, or point STAGING at a directory root owns", ui.ShellWord(dir))
 			}
 		}
-		return fmt.Sprintf("chown -R root %s if it is yours, or point STAGING at a directory root owns", dir)
+		return fmt.Sprintf("chown -R root %s if it is yours, or point STAGING at a directory root owns", ui.ShellWord(dir))
 	}
 	if owner == 0 {
 		return "run this command as root, or point STAGING at a directory you own"
 	}
 	return "remove it if it is not yours, or point STAGING at a directory you own"
 }
+
+// adviceEuid is os.Geteuid, as a variable only so a test can reach the root
+// branch of ownershipAdvice without being root: that branch is the one whose
+// advice is pasted as root, and a test that ran only as root would never run
+// in CI. Nothing else reads it, so the ownership check itself always asks the
+// kernel.
+var adviceEuid = os.Geteuid
 
 // CreateFresh creates path for writing, removing whatever was there first.
 //

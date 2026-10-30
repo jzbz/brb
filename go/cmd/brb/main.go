@@ -35,17 +35,18 @@ func main() {
 // arranged so that a second one kills brb outright.
 //
 // Every long operation in the program watches the context, so the first
-// signal is an orderly stop: the current step is abandoned, staging is left
-// resumable, and Main says so. The second is for when that is not prompt
-// enough — a child process ignoring SIGINT, a write that will not return —
-// and it only has its default effect once nothing is catching it. NotifyContext
-// keeps catching until its stop function is called, so on its own it swallows
-// every signal after the first, and a repeat Ctrl-C did nothing at all. The
-// goroutine here calls stop the moment the context is cancelled: the context
-// stays cancelled and cli.Main still winds down as before, but the signal's
-// default disposition is back for the next one, which ends the process the way
-// the operator expects. The stop returned to the caller is safe to call again
-// afterwards; it is idempotent.
+// signal is an orderly stop: the current step is abandoned, a backup's staging
+// is left resumable, and Main says so. The second is for when that is not
+// prompt enough — a prompt still waiting for its answer, a child process
+// ignoring SIGINT, a write that will not return — and it only has its default
+// effect once nothing is catching it. NotifyContext keeps catching until its
+// stop function is called, so on its own it swallows every signal after the
+// first, and a repeat Ctrl-C did nothing at all. The goroutine here calls stop
+// the moment the context is cancelled: the context stays cancelled and
+// cli.Main still winds down as before, but the signal's default disposition is
+// back for the next one, which ends the process the way the operator expects.
+// The stop returned to the caller is safe to call again afterwards; it is
+// idempotent.
 func signalContext() (context.Context, context.CancelFunc) {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	go func() {

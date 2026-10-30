@@ -11,6 +11,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/jzbz/brb/internal/config"
 )
 
 func TestSaveLoadStateRoundTrip(t *testing.T) {
@@ -147,6 +149,32 @@ func TestLoadStateErrors(t *testing.T) {
 				t.Errorf("error %q does not mention %q", err, tc.wantSub)
 			}
 		})
+	}
+}
+
+// TestCheckResumeHintPastesIntoAConfig: the hint is a line to paste into a
+// config file, and an archive name derived from a SOURCE_DIR such as
+// "My Documents" carries a space. Printed bare, brb.sh's source ran the second
+// word as a command and the Go parser refused the line.
+func TestCheckResumeHintPastesIntoAConfig(t *testing.T) {
+	t.Parallel()
+	const was = "My Documents-2026-10-29"
+	st := &State{Version: StateVersion, Archive: was, Source: "/home/u/My Documents"}
+	err := st.checkResume("My Documents-2026-10-30", "/home/u/My Documents")
+	if err == nil {
+		t.Fatal("checkResume succeeded, want a mismatch error")
+	}
+	_, line, ok := strings.Cut(err.Error(), "(set ")
+	line, _, ok2 := strings.Cut(line, " to continue that set)")
+	if !ok || !ok2 {
+		t.Fatalf("no ARCHIVE_NAME hint in %q", err)
+	}
+	vals, perr := config.Parse(line+"\n", "hint")
+	if perr != nil {
+		t.Fatalf("the hint %q does not parse as a config line: %v", line, perr)
+	}
+	if got := vals["ARCHIVE_NAME"].Scalar; got != was {
+		t.Errorf("the hint %q sets ARCHIVE_NAME to %q, want %q", line, got, was)
 	}
 }
 
@@ -381,17 +409,41 @@ func TestStateRoundTripsPathsThatAreNotUTF8(t *testing.T) {
 		"ünïcøde.txt",
 		"lone-continuation-\x80.bin",
 	}
+	skeleton := []string{"d dir-\xff", "l link-\x80", "o plain-fifo"}
 	path := filepath.Join(t.TempDir(), "state.json")
 	in := &State{
 		Version: StateVersion, Archive: "a", Source: "/s", DiscsDone: 1,
 		Assigned: append([]string(nil), paths...), PackRatio: 1,
+		Skeleton: append([]string(nil), skeleton...),
 	}
 	if err := SaveState(path, in); err != nil {
 		t.Fatalf("SaveState: %v", err)
 	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, k := range []string{`"assigned_raw"`, `"skeleton_raw"`} {
+		if !strings.Contains(string(data), k) {
+			t.Errorf("state.json carries no %s for lists that need one:\n%s", k, data)
+		}
+	}
+	// The raw forms are the file's business. Left on the caller's State they
+	// were a second copy of every path for the rest of the run.
+	if in.AssignedRaw != "" || in.SkeletonRaw != "" {
+		t.Errorf("SaveState left raw forms on the caller's State (%d and %d bytes)",
+			len(in.AssignedRaw), len(in.SkeletonRaw))
+	}
 	out, err := LoadState(path)
 	if err != nil {
 		t.Fatalf("LoadState: %v", err)
+	}
+	if out.AssignedRaw != "" || out.SkeletonRaw != "" {
+		t.Errorf("LoadState kept raw forms after restoring from them (%d and %d bytes)",
+			len(out.AssignedRaw), len(out.SkeletonRaw))
+	}
+	if !slices.Equal(out.Skeleton, skeleton) {
+		t.Errorf("Skeleton = %q, want %q", out.Skeleton, skeleton)
 	}
 	if !slices.Equal(out.Assigned, paths) {
 		for i := range paths {
@@ -410,12 +462,59 @@ func TestStateRoundTripsPathsThatAreNotUTF8(t *testing.T) {
 	}
 }
 
-// TestStateLeavesOrdinaryFilesAlone: the raw list is a fallback, not a format
+// TestStateRoundTripsASourceAndArchiveThatAreNotUTF8: the two names checkResume
+// compares byte for byte with the configuration have to come back byte for
+// byte too.
+//
+// They used to go through JSON as text, so a SOURCE_DIR named in Latin-1 came
+// back with U+FFFD in place of each accented letter, and every resume of the
+// set was refused as belonging to a different source — with the configuration
+// unchanged and no setting that could satisfy the check. The default
+// ARCHIVE_NAME is derived from the directory and inherited the same bytes.
+func TestStateRoundTripsASourceAndArchiveThatAreNotUTF8(t *testing.T) {
+	t.Parallel()
+	latin1 := "/data/Fotos_\xe9t\xe9"
+	started := time.Date(2026, 10, 30, 0, 0, 0, 0, time.UTC)
+	for _, tc := range []struct {
+		name            string
+		archive, source string
+	}{
+		{"source with the derived archive name", config.ArchiveNameFor(latin1, started), latin1},
+		{"archive name alone", "arch\xff", "/srv/photos"},
+		{"source alone", "photos", latin1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			path := filepath.Join(t.TempDir(), "state.json")
+			in := newState(tc.archive, tc.source, 1.0, started)
+			in.DiscsDone, in.Assigned = 1, []string{"a"}
+			if err := SaveState(path, in); err != nil {
+				t.Fatalf("SaveState: %v", err)
+			}
+			out, err := LoadState(path)
+			if err != nil {
+				t.Fatalf("LoadState: %v", err)
+			}
+			if out.Archive != tc.archive || out.Source != tc.source {
+				t.Errorf("round trip gave archive %q, source %q; want %q, %q",
+					out.Archive, out.Source, tc.archive, tc.source)
+			}
+			if err := out.checkResume(tc.archive, tc.source); err != nil {
+				t.Errorf("a resume under the unchanged configuration was refused: %v", err)
+			}
+			if out.ArchiveRaw != "" || out.SourceRaw != "" {
+				t.Error("LoadState kept the raw forms after restoring from them")
+			}
+		})
+	}
+}
+
+// TestStateLeavesOrdinaryFilesAlone: the raw lists are a fallback, not a format
 // change. A tree of ordinary names must produce the state file it always did.
 func TestStateLeavesOrdinaryFilesAlone(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "state.json")
-	s := &State{Version: StateVersion, Archive: "a", Source: "/s", DiscsDone: 1,
-		Assigned: []string{"a.txt", "sub/ünïcøde.txt"}, PackRatio: 1}
+	s := &State{Version: StateVersion, Archive: "ärchive", Source: "/s/ünïcøde", DiscsDone: 1,
+		Assigned: []string{"a.txt", "sub/ünïcøde.txt"}, Skeleton: []string{"d sub"}, PackRatio: 1}
 	if err := SaveState(path, s); err != nil {
 		t.Fatalf("SaveState: %v", err)
 	}
@@ -423,31 +522,56 @@ func TestStateLeavesOrdinaryFilesAlone(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if strings.Contains(string(data), "assigned_raw") {
-		t.Errorf("state.json carries assigned_raw for a tree that does not need it:\n%s", data)
+	for _, k := range []string{"assigned_raw", "skeleton_raw", "archive_raw", "source_raw"} {
+		if strings.Contains(string(data), k) {
+			t.Errorf("state.json carries %s for a tree that does not need it:\n%s", k, data)
+		}
 	}
 }
 
-// TestLoadStateRefusesADisagreeingRawList: the two lists are written together,
-// so a mismatch means the file was edited or truncated. Guessing which one is
-// right would silently leave files out of the archive.
+// TestLoadStateRefusesADisagreeingRawList: a raw form and the field it stands
+// for are written together, so a raw form that does not decode, or does not
+// hold as many entries as its list, means the file was edited or truncated.
+// Guessing which one is right would silently leave files out of the archive,
+// or skip the check that keeps the set restorable. So would a skeleton entry
+// that names no kind.
 func TestLoadStateRefusesADisagreeingRawList(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "state.json")
-	body := `{"version":1,"archive":"a","source":"/s","discs_done":1,` +
-		`"assigned":["a.txt","b.txt"],"assigned_raw":"` +
-		base64.StdEncoding.EncodeToString([]byte("a.txt")) + `","pack_ratio":1}`
-	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := LoadState(path); err == nil {
-		t.Fatal("LoadState accepted a state file whose two path lists disagree")
+	b64 := func(s string) string { return base64.StdEncoding.EncodeToString([]byte(s)) }
+	for _, tc := range []struct {
+		name, fields, want string
+	}{
+		{"assigned_raw short", `"assigned":["a.txt","b.txt"],"assigned_raw":"` + b64("a.txt") + `"`, "assigned_raw lists 1"},
+		{"skeleton_raw short", `"assigned":["a.txt"],"skeleton":["d x","d y"],"skeleton_raw":"` + b64("d x") + `"`, "skeleton_raw lists 1"},
+		{"assigned_raw not base64", `"assigned":["a.txt"],"assigned_raw":"!!"`, "assigned_raw is not valid base64"},
+		{"skeleton_raw not base64", `"assigned":["a.txt"],"skeleton":["d x"],"skeleton_raw":"!!"`, "skeleton_raw is not valid base64"},
+		{"archive_raw not base64", `"assigned":["a.txt"],"archive_raw":"!!"`, "archive_raw is not valid base64"},
+		{"source_raw not base64", `"assigned":["a.txt"],"source_raw":"!!"`, "source_raw is not valid base64"},
+		{"skeleton entry with no kind", `"assigned":["a.txt"],"skeleton":["x what"]`, "skeleton entry 1"},
+		{"skeleton entry with no path", `"assigned":["a.txt"],"skeleton":["d "]`, "skeleton entry 1"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "state.json")
+			body := `{"version":1,"archive":"a","source":"/s","discs_done":1,` + tc.fields + `,"pack_ratio":1}`
+			if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			_, err := LoadState(path)
+			if err == nil {
+				t.Fatalf("LoadState accepted %s", tc.name)
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Errorf("error %q does not say %q", err, tc.want)
+			}
+		})
 	}
 }
 
-// TestSaveStateBytesAreUnchanged pins the file format across the switch from
-// marshalling the whole state into memory to streaming it: state.json never
-// reaches a disc, but it decides which files a resumed run skips, so a version
-// of brb either side of the change must read what the other wrote.
+// TestSaveStateBytesAreUnchanged pins the file format to exactly what
+// json.MarshalIndent of the State produces, plus a newline. state.json never
+// reaches a disc, but it decides which files a resumed run skips, so a brb
+// that wrote it any other way — a hand-rolled streaming writer, say, the
+// obvious way to cut what a save costs in memory — must still be read by the
+// versions either side of it, and they by it.
 func TestSaveStateBytesAreUnchanged(t *testing.T) {
 	st := &State{
 		Version:        StateVersion,

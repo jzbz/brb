@@ -236,6 +236,9 @@ func TestCovers(t *testing.T) {
 		{"sub/", "sub/b.txt", true},
 		{"/sub", "sub/b.txt", true},
 		{"", "anything", true},
+		{"a/b", "a/bc", false}, // the boundary under() checks by index
+		{"a/b", "a/b/c", true},
+		{"a/b", "a", false},
 	}
 	for _, tc := range tests {
 		if got := covers(tc.want, tc.entry); got != tc.ok {

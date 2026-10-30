@@ -3,12 +3,16 @@ package cli
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
+	"io/fs"
 	"math"
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
+	"time"
 
 	"filippo.io/age"
 
@@ -146,6 +150,52 @@ func TestExplicitConfigPathMustExist(t *testing.T) {
 	}
 }
 
+// TestPublicArchiveFlagReachesTheHomeCheck covers `backup --public-archive`
+// with no HOME and no AGE_RECIPIENTS_FILE. A public archive mints its own key
+// and never reads a recipients file, and config.Load exempts it from the
+// no-HOME refusal for that reason — but the flag was applied in dispatch,
+// after Load had already refused, so the flag failed where PUBLIC_ARCHIVE=1
+// (which the README calls the same thing) went through.
+//
+// PACK_RATIO_WINDOW=0 stops each run at preflight's Validate, the first thing
+// backup.Run does after Load: reaching that refusal proves Load let the run
+// through, and nothing is built, locked or written either way.
+func TestPublicArchiveFlagReachesTheHomeCheck(t *testing.T) {
+	home := isolate(t)
+	src := filepath.Join(home, "src")
+	if err := os.Mkdir(src, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cfg := writeConfig(t, home, "SOURCE_DIR="+src+"\nSTAGING="+filepath.Join(home, "staging")+
+		"\nPACK_RATIO_WINDOW=0\n")
+	t.Setenv("HOME", "")
+
+	const recipientsRefusal = "AGE_RECIPIENTS_FILE has no value"
+	status, _, errOut := runMain(t, "--yes", "-c", cfg, "backup", "--public-archive")
+	if strings.Contains(errOut, recipientsRefusal) {
+		t.Fatalf("backup --public-archive with no HOME was refused for a recipients file it never reads:\n%s", errOut)
+	}
+	if status != exitError || !strings.Contains(errOut, "PACK_RATIO_WINDOW") {
+		t.Fatalf("backup --public-archive exit = %d, want %d from preflight's PACK_RATIO_WINDOW refusal:\n%s",
+			status, exitError, errOut)
+	}
+
+	// Without the flag the refusal stands: the exemption is the flag's, not
+	// a hole for every backup with no HOME.
+	status, _, errOut = runMain(t, "--yes", "-c", cfg, "backup")
+	if status != exitError || !strings.Contains(errOut, recipientsRefusal) {
+		t.Errorf("backup with no HOME and no recipients exit = %d, want %d and the AGE_RECIPIENTS_FILE refusal:\n%s",
+			status, exitError, errOut)
+	}
+
+	// And a bad flag is a usage error even when the configuration would also
+	// have been refused: it is read first now.
+	status, _, errOut = runMain(t, "--yes", "-c", cfg, "backup", "--public-archive", "--bogus")
+	if status != exitUsage || !strings.Contains(errOut, "unknown flag --bogus") {
+		t.Errorf("backup --bogus with no HOME exit = %d, want %d naming the flag:\n%s", status, exitUsage, errOut)
+	}
+}
+
 // TestSymlinkedSourceDirIsFollowed covers a SOURCE_DIR that is itself a
 // symbolic link to a directory. Validate stats through the link, so doctor
 // said ready; the scanner lstats its root and refused it as "not a directory"
@@ -164,7 +214,10 @@ func TestSymlinkedSourceDirIsFollowed(t *testing.T) {
 	if err := os.Symlink(real, link); err != nil {
 		t.Skipf("cannot create a symlink here: %v", err)
 	}
-	writeConfig(t, home, "SOURCE_DIR="+link+"\n")
+	// STAGING too: the commands below lock and populate the staging area, and
+	// left to its default they did that to the real /var/tmp/brb of whoever
+	// ran the tests.
+	writeConfig(t, home, "SOURCE_DIR="+link+"\nSTAGING="+filepath.Join(home, "staging")+"\n")
 
 	var errOut bytes.Buffer
 	cfg, _, err := loadConfig("", newTestPrinter(&errOut))
@@ -377,6 +430,40 @@ func TestDoctorUnderPublicArchive(t *testing.T) {
 	}
 }
 
+// TestDoctorCountsABudgetFailureOnce: Validate computes the budget again when
+// nothing else is wrong and returns the very error doctor has just printed and
+// counted under "configuration", so a budget that was the only configuration
+// problem was reported twice and counted as two. With another problem beside
+// it Validate skips the budget, which is why only this case doubled.
+func TestDoctorCountsABudgetFailureOnce(t *testing.T) {
+	home := isolate(t)
+	src := filepath.Join(home, "src")
+	if err := os.MkdirAll(src, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeConfig(t, home, "SOURCE_DIR="+src+"\nSTAGING="+filepath.Join(home, "staging")+
+		"\nDISC_CAPACITY_BYTES=1000\n")
+
+	status, _, errOut := runMain(t, "doctor")
+	if status != exitError {
+		t.Fatalf("doctor exit = %d with a disc too small for its reserve, want %d\n%s", status, exitError, errOut)
+	}
+	if n := strings.Count(errOut, "disc budget for "); n != 1 {
+		t.Errorf("the budget failure is reported %d time(s), want once:\n%s", n, errOut)
+	}
+	if strings.Contains(errOut, "configuration problems") {
+		t.Errorf("a configuration-problems section was opened with nothing but the budget to put in it:\n%s", errOut)
+	}
+
+	// Another problem beside it still gets its section, and is still counted.
+	writeConfig(t, home, "SOURCE_DIR="+filepath.Join(home, "nope")+"\nSTAGING="+filepath.Join(home, "staging")+
+		"\nDISC_CAPACITY_BYTES=1000\n")
+	_, _, errOut = runMain(t, "doctor")
+	if !strings.Contains(errOut, "configuration problems") || !strings.Contains(errOut, "fail SOURCE_DIR") {
+		t.Errorf("a bad SOURCE_DIR beside the budget is no longer reported:\n%s", errOut)
+	}
+}
+
 func TestDoctorWarnsAboutAnInapplicableCompressionLevel(t *testing.T) {
 	home := isolate(t)
 	src := filepath.Join(home, "src")
@@ -500,6 +587,142 @@ func TestDoctorAcceptsAPassphraseProtectedIdentity(t *testing.T) {
 	}
 }
 
+// TestDoctorRefusesAnIdentityThatIsNotARegularFile: doctor stat'ed the
+// identity and then opened it, so an AGE_IDENTITY naming a FIFO hung doctor in
+// the open, past the first Ctrl-C, and one naming /dev/zero ran the
+// passphrase-container sniff out of memory. Now anything that is not a regular
+// file is one problem, named as such, before anything opens it — and a
+// rescue-key name that is not a regular file is not reported as a rescue key,
+// since the restore side would never use it.
+func TestDoctorRefusesAnIdentityThatIsNotARegularFile(t *testing.T) {
+	home := isolate(t)
+	keys := filepath.Join(home, "keys")
+	recips := filepath.Join(keys, "recipients.txt")
+	id, err := agecrypt.GenerateIdentity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := agecrypt.AppendRecipient(recips, id.Recipient().String()); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(filepath.Join(keys, rescueIdentityName), 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, idPath := range irregularPaths(t, home) {
+		cfg := config.Default()
+		cfg.AgeRecipientsFile = recips
+		cfg.AgeIdentity = idPath
+		var errOut bytes.Buffer
+		done := make(chan int, 1)
+		go func() { done <- checkKeys(context.Background(), cfg, newTestPrinter(&errOut)) }()
+		select {
+		case problems := <-done:
+			out := errOut.String()
+			if problems != 1 {
+				t.Errorf("AGE_IDENTITY=%s: checkKeys counted %d problem(s), want 1\n%s", idPath, problems, out)
+			}
+			if !strings.Contains(out, "fail identity "+idPath+" is not a regular file") {
+				t.Errorf("AGE_IDENTITY=%s: doctor does not say it is not a regular file:\n%s", idPath, out)
+			}
+			if strings.Contains(out, "rescue key present") {
+				t.Errorf("a directory named %s was reported as a rescue key:\n%s", rescueIdentityName, out)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatalf("AGE_IDENTITY=%s: checkKeys has not returned after 5s", idPath)
+		}
+	}
+}
+
+// irregularPaths makes a directory and a FIFO under dir and returns them, with
+// /dev/null after them where it is a character device: one of each kind of
+// path that exists and is not a regular file. A reader still blocked opening
+// the FIFO when the test ends is released then, so a regression that opens it
+// hangs one goroutine for the length of the test and no longer.
+func irregularPaths(t *testing.T, dir string) []string {
+	t.Helper()
+	d := filepath.Join(dir, "a-directory")
+	if err := os.Mkdir(d, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	fifo := filepath.Join(dir, "a-fifo")
+	if err := syscall.Mkfifo(fifo, 0o600); err != nil {
+		t.Skipf("cannot make a FIFO here: %v", err)
+	}
+	t.Cleanup(func() {
+		// A writer's open completes a blocked reader's; with no reader
+		// waiting, O_NONBLOCK makes it fail at once instead of hanging.
+		if f, err := os.OpenFile(fifo, os.O_WRONLY|syscall.O_NONBLOCK, 0); err == nil {
+			f.Close()
+		}
+	})
+	paths := []string{d, fifo}
+	if fi, err := os.Stat(os.DevNull); err == nil && fi.Mode()&os.ModeCharDevice != 0 {
+		paths = append(paths, os.DevNull)
+	}
+	return paths
+}
+
+// TestDoctorRefusesARecipientsFileThatIsNotARegularFile: the identity's guard
+// above sat a few lines below an unguarded open of AGE_RECIPIENTS_FILE, so a
+// FIFO there hung doctor exactly as one at AGE_IDENTITY did. agecrypt's
+// parsers now refuse anything but a regular file before opening it, and doctor
+// reports that as the one problem it is.
+func TestDoctorRefusesARecipientsFileThatIsNotARegularFile(t *testing.T) {
+	home := isolate(t)
+	for _, recips := range irregularPaths(t, home) {
+		cfg := config.Default()
+		cfg.AgeRecipientsFile = recips
+		cfg.AgeIdentity = filepath.Join(home, "identity.txt")
+		var errOut bytes.Buffer
+		done := make(chan int, 1)
+		go func() { done <- checkKeys(context.Background(), cfg, newTestPrinter(&errOut)) }()
+		select {
+		case problems := <-done:
+			out := errOut.String()
+			if problems != 1 {
+				t.Errorf("AGE_RECIPIENTS_FILE=%s: checkKeys counted %d problem(s), want 1\n%s", recips, problems, out)
+			}
+			if !strings.Contains(out, "fail recipients file "+recips+": agecrypt: recipients file "+recips+" is not a regular file") {
+				t.Errorf("AGE_RECIPIENTS_FILE=%s: doctor does not say it is not a regular file:\n%s", recips, out)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatalf("AGE_RECIPIENTS_FILE=%s: checkKeys has not returned after 5s", recips)
+		}
+	}
+}
+
+// TestInitKeyRefusesARecipientsFileThatIsNotARegularFile: init-key minted the
+// identity first and found out afterwards that the recipients path could not
+// take its public key — a directory failed the append's open, a FIFO or
+// /dev/null its fsync — leaving an identity that nothing was encrypted to and
+// that a second init-key refuses to overwrite. A FIFO hung it outright, in the
+// pre-mint check's open. Now such a path is refused before anything is minted.
+func TestInitKeyRefusesARecipientsFileThatIsNotARegularFile(t *testing.T) {
+	home := isolate(t)
+	for _, recips := range irregularPaths(t, home) {
+		keyFile := filepath.Join(home, "keys", "identity.txt")
+		cfg := config.Default()
+		cfg.AgeRecipientsFile = recips
+		cfg.AgeIdentity = keyFile
+		var errOut bytes.Buffer
+		done := make(chan error, 1)
+		go func() { done <- initKey(cfg, newTestPrinter(&errOut), false) }()
+		select {
+		case err := <-done:
+			if err == nil || !strings.Contains(err.Error(), "recipients file "+recips+" is not a regular file") {
+				t.Errorf("AGE_RECIPIENTS_FILE=%s: init-key = %v, want it refused as not a regular file\n%s", recips, err, errOut.String())
+			}
+			if _, err := os.Lstat(keyFile); !errors.Is(err, fs.ErrNotExist) {
+				t.Errorf("AGE_RECIPIENTS_FILE=%s: init-key wrote %s before refusing (%v)", recips, keyFile, err)
+				_ = os.Remove(keyFile)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatalf("AGE_RECIPIENTS_FILE=%s: init-key has not returned after 5s", recips)
+		}
+	}
+}
+
 func TestInitKey(t *testing.T) {
 	home := isolate(t)
 	keys := filepath.Join(home, "keys")
@@ -582,7 +805,7 @@ func TestInitKeyLeavesOtherPeoplesDirectoriesAlone(t *testing.T) {
 		if !strings.Contains(errOut, "warn "+home+" is accessible to others (mode 0755)") {
 			t.Errorf("no warning that the identity's directory is open to others:\n%s", errOut)
 		}
-		if !strings.Contains(errOut, "chmod 700 "+home) {
+		if !strings.Contains(errOut, "chmod 700 "+ui.ShellWord(home)) {
 			t.Errorf("the warning does not say how to tighten it:\n%s", errOut)
 		}
 		if got := dirMode(t, filepath.Join(home, ".config", "brb")); got != 0o700 {
@@ -717,6 +940,28 @@ func TestInitKeyLeavesOtherPeoplesDirectoriesAlone(t *testing.T) {
 			t.Errorf("no warning about the group-accessible directory:\n%s", errOut)
 		}
 	})
+
+	// The advice is a command to paste, so the directory goes into it as one
+	// shell word. Bare, "chmod 700 <home>/shared keys" chmods <home>/shared and
+	// a ./keys wherever it is pasted, and leaves the key directory open.
+	t.Run("the chmod names a spaced directory as one word", func(t *testing.T) {
+		home := isolate(t)
+		shared := filepath.Join(home, "shared keys")
+		if err := os.Mkdir(shared, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if got := dirMode(t, shared); got != 0o755 {
+			t.Skipf("umask left the fixture at %04o", got)
+		}
+		writeConfig(t, home, "AGE_RECIPIENTS_FILE="+ui.ShellWord(filepath.Join(shared, "recipients.txt"))+"\n")
+		status, _, errOut := runMain(t, "init-key")
+		if status != exitOK {
+			t.Fatalf("init-key exit = %d\n%s", status, errOut)
+		}
+		if want := "chmod 700 '" + shared + "'"; !strings.Contains(errOut, want) {
+			t.Errorf("the advice does not quote the directory, want %q:\n%s", want, errOut)
+		}
+	})
 }
 
 // TestInitKeyRefusesToBuildARecipientSetAgeWontEncryptTo: age refuses to
@@ -765,24 +1010,43 @@ func TestInitKeyRefusesToBuildARecipientSetAgeWontEncryptTo(t *testing.T) {
 	}
 }
 
+// TestMainReportsCancellation pins the line Main adds when a command fails
+// because it was interrupted, and that only a backup gets the advice to resume
+// it. That advice used to follow every interrupted command, sending an
+// operator whose restore or ingest was cut short to a backup --resume that
+// recovers neither.
 func TestMainReportsCancellation(t *testing.T) {
 	home := isolate(t)
 	src := filepath.Join(home, "src")
 	if err := os.MkdirAll(src, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	writeConfig(t, home, "SOURCE_DIR="+src+"\n")
+	writeConfig(t, home, "SOURCE_DIR="+src+"\nSTAGING="+filepath.Join(home, "staging")+
+		"\nAGE_RECIPIENTS_FILE="+filepath.Join(home, "keys", "recipients.txt")+"\n")
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	var out, errOut bytes.Buffer
-	status := Main(ctx, []string{"plan"}, &out, &errOut)
-	if status != exitError {
-		t.Fatalf("plan on a cancelled context exit = %d, want %d", status, exitError)
-	}
-	if !strings.Contains(errOut.String(), "interrupted") {
-		t.Errorf("cancellation was not reported:\n%s", errOut.String())
+	const resume = "'brb backup --resume' continues where this stopped"
+	for _, tc := range []struct {
+		args       []string
+		wantResume bool
+	}{
+		{[]string{"plan"}, false},
+		{[]string{"index", "x"}, false},
+		{[]string{"backup"}, true},
+	} {
+		var out, errOut bytes.Buffer
+		status := Main(ctx, tc.args, &out, &errOut)
+		if status != exitError {
+			t.Fatalf("%v on a cancelled context exit = %d, want %d\n%s", tc.args, status, exitError, errOut.String())
+		}
+		if !strings.Contains(errOut.String(), "warn interrupted") {
+			t.Errorf("%v: cancellation was not reported:\n%s", tc.args, errOut.String())
+		}
+		if got := strings.Contains(errOut.String(), resume); got != tc.wantResume {
+			t.Errorf("%v: resume advice given = %v, want %v:\n%s", tc.args, got, tc.wantResume, errOut.String())
+		}
 	}
 }
 

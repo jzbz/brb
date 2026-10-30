@@ -40,8 +40,19 @@ HERE="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 BRB="${1:-${BRB_GO_BIN:-$HERE/brb}}"
 [[ -x "$BRB" ]] || { echo "no executable Go brb at: $BRB" >&2; exit 2; }
 
-W="$(mktemp -d)"
-trap 'rm -rf "$W"' EXIT
+# Checked, because nothing else here would notice: this file runs without
+# errexit (ck needs a failing condition to carry on), so an empty W made every
+# fixture path a name at the filesystem root — /src, /cfg, /stage — and the
+# first visible symptom was "could not interrupt the run", word for word what a
+# genuinely broken backup prints. The trap is armed only once W is known.
+W="$(mktemp -d)" || { echo "mktemp -d failed; set TMPDIR to a writable directory" >&2; exit 2; }
+# RUN_PID is the backup kill_after_first_disc has running in the background,
+# while it has one. set -m gives that backup its own process group, so a ^C at
+# the terminal never reaches it: without this the trap would delete $W out from
+# under a backup still writing into it, and leave that backup running. Set
+# before the trap so that set -u cannot abort the trap ahead of its rm.
+RUN_PID=""
+trap '[[ -n $RUN_PID ]] && { kill -9 -- "-$RUN_PID" 2>/dev/null; wait "$RUN_PID" 2>/dev/null; }; rm -rf "$W"' EXIT
 
 pass=0 fail=0 xfail=0
 ck() { if (( $2 == 0 )); then printf '  PASS  %s\n' "$1"; pass=$((pass+1));
@@ -96,7 +107,8 @@ STATE="$W/stage/state.json"
 
 # kill_after_first_disc CFG STATE LOG — run a backup until state.json records a
 # completed disc, kill the whole run, and report in KILLED_AT the disc count it
-# reached (empty if the kill never landed).
+# reached (empty if the kill never landed). Either way the run's process group
+# is gone when it returns.
 #
 # One harness, two callers. The public-archive section further down needs the
 # same interruption and used to carry its own character-for-character copy of
@@ -106,7 +118,8 @@ STATE="$W/stage/state.json"
 # to one copy would silently not apply to the other. What the callers keep is
 # their own not-killed branch, which is the one place they deliberately differ:
 # the resume section cannot prove anything without the kill and gives up, while
-# the public section records a failure and carries on.
+# the public section lets its failed check stand and carries on. Both have
+# already counted that failure through ck, so neither adds another.
 #
 # The count comes back in a global rather than on stdout: a command substitution
 # would put the backgrounded backup in a subshell whose pipe the caller then
@@ -122,6 +135,7 @@ kill_after_first_disc() {
   "$BRB" --yes -c "$cfg" backup </dev/null > "$log" 2>&1 &
   pid=$!
   set +m
+  RUN_PID=$pid                  # for the EXIT trap, until the wait below
   for _ in $(seq 1 4000); do
     # discs_done out of state.json, without needing jq. A state file that does
     # not exist yet reads as empty, which is the same as "no disc finished".
@@ -134,7 +148,26 @@ kill_after_first_disc() {
     kill -0 "$pid" 2>/dev/null || break
     sleep 0.05
   done
+  # Not killed above: the run ended before a disc finished, or the poll ran out
+  # with it still going, which is a hang. Take its group down either way. A
+  # bare wait on a hung backup used to block here for as long as the backup
+  # lived, which for a deadlock is forever, and the group kill also catches a
+  # child (mksquashfs, par2) left writing into staging by a leader that has
+  # already exited — the guard is KILLED_AT, not whether the leader is alive.
+  # The log goes with $W when the suite exits, so its tail is shown here: a
+  # hang and a backup that failed outright print the same caller message.
+  if [[ -z $KILLED_AT ]]; then
+    if kill -0 "$pid" 2>/dev/null; then
+      echo "backup still running after the poll with no disc finished; killing it" >&2
+    fi
+    kill -9 -- "-$pid" 2>/dev/null
+  fi
   wait "$pid" 2>/dev/null
+  RUN_PID=""
+  if [[ -z $KILLED_AT ]]; then
+    echo "the last lines of that backup's log:" >&2
+    tail -n 5 -- "$log" | sed 's/^/  /' >&2
+  fi
 }
 
 sect "kill a multi-disc backup mid-set"
@@ -145,7 +178,9 @@ ck "backup was killed after disc ${killed_at:-?} completed" $?
 
 if [[ -z "$killed_at" ]]; then
   printf '\ncould not interrupt the run; nothing further can be proven\n'
-  printf '%d passed, %d failed\n' "$pass" "$((fail+1))"
+  # $fail as it stands: the ck just above has already counted this failure,
+  # and adding one here reported a FAIL line more than the run had printed.
+  printf '%d passed, %d failed\n' "$pass" "$fail"
   exit 1
 fi
 
@@ -464,8 +499,8 @@ pub_killed_at=$KILLED_AT
 [[ -n "$pub_killed_at" ]] && (( pub_killed_at >= 1 ))
 ck "public backup was killed after disc ${pub_killed_at:-?} completed" $?
 if [[ -z "$pub_killed_at" ]]; then
+  # No fail+1 here: the ck above has already counted it.
   printf '\ncould not interrupt the public run; the rest of this section would prove nothing\n'
-  fail=$((fail+1))
 else
   key_before=$(grep -o 'AGE-SECRET-KEY-1[A-Z0-9]*' "$PUBW/enc/identity.txt" 2>/dev/null | head -1)
   [[ -n "$key_before" ]]

@@ -58,8 +58,15 @@ type globals struct {
 // args is the argument list without the program name, normally os.Args[1:].
 // stdout carries command output that a caller might pipe or redirect — the
 // decrypted index, an image listing, the help text; stderr carries progress and
-// diagnostics, exactly as brb.sh splits them. Main never panics and never calls
-// os.Exit; it aborts promptly when ctx is cancelled.
+// diagnostics, exactly as brb.sh splits them.
+//
+// Main never calls os.Exit: the exit status is its return value, which is what
+// lets the whole program be tested through it. It is meant never to panic on
+// any input, but nothing here recovers one: a panic is a bug and ends the
+// process. A cancelled ctx stops the work at the next point that watches it. A
+// prompt waiting on the terminal is not such a point: it returns only when the
+// operator answers or input ends, and until then only a second signal (see
+// cmd/brb) gets out.
 func Main(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	if ctx == nil {
 		ctx = context.Background()
@@ -86,8 +93,16 @@ func Main(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 
 	// A cancelled context is how SIGINT reaches us; say so rather than leaving
 	// the operator wondering which of the messages above was the real failure.
+	// Only a backup gets the resume advice. It used to follow every command,
+	// so an interrupted restore, ingest or verify-disc sent the operator to a
+	// backup --resume that recovers none of them — and that on a rescue
+	// machine whose config may not describe a backup at all.
 	if status != exitOK && ctx.Err() != nil {
-		p.Warn("interrupted — staging may hold partial output; 'brb backup --resume' continues where this stopped")
+		msg := "interrupted"
+		if g.cmd == "backup" {
+			msg += " — staging may hold partial output; 'brb backup --resume' continues where this stopped"
+		}
+		p.Warn("%s", msg)
 	}
 	return status
 }
@@ -116,7 +131,25 @@ func run(ctx context.Context, g globals, p *ui.Printer, stdout io.Writer) int {
 		return exitOK
 	}
 
-	cfg, cfgPath, err := loadConfig(g.configPath, p)
+	// backup's flags are read here, before the configuration, as well as in
+	// dispatch, because one of them is a setting: --public-archive is
+	// PUBLIC_ARCHIVE=1 for one run, and Load has to see it to grant the
+	// public-archive exemption from the no-HOME recipients check. Applied only
+	// in dispatch, it arrived after Load had already refused. Parsing has no
+	// side effects, so doing it twice costs nothing, and a bad flag now reports
+	// the usage error it is instead of whatever the configuration said first.
+	var adjust []func(*config.Config)
+	if g.cmd == "backup" {
+		var bo backupOptions
+		if err := backupFlags(&bo).parse(g.args); err != nil {
+			return fail(p, err)
+		}
+		if bo.public {
+			adjust = append(adjust, func(c *config.Config) { c.PublicArchive = true })
+		}
+	}
+
+	cfg, cfgPath, err := loadConfig(g.configPath, p, adjust...)
 	if err != nil {
 		return fail(p, err)
 	}
@@ -155,7 +188,9 @@ func fail(p *ui.Printer, err error) int {
 // carrying on with the defaults would silently point a restore at
 // /var/tmp/brb — an empty staging directory and a report of no discs at all —
 // or a backup at $HOME. brb.sh dies on the same condition with the same words.
-func loadConfig(path string, p *ui.Printer) (*config.Config, string, error) {
+//
+// adjust is handed to config.Load; see there for what it is for.
+func loadConfig(path string, p *ui.Printer, adjust ...func(*config.Config)) (*config.Config, string, error) {
 	explicit := path != ""
 	if !explicit {
 		path = config.DefaultConfigPath()
@@ -173,7 +208,7 @@ func loadConfig(path string, p *ui.Printer) (*config.Config, string, error) {
 				"check the path, or %s)", path, fallback)
 		}
 	}
-	cfg, err := config.Load(path)
+	cfg, err := config.Load(path, adjust...)
 	if err != nil {
 		return nil, path, err
 	}
@@ -297,6 +332,9 @@ func dispatch(ctx context.Context, g globals, cfg *config.Config, cfgPath string
 		}
 		// The flag turns it on; the config file can too. Neither can turn the
 		// other off, so a set is public only if something said so explicitly.
+		// run() has already handed the flag to Load, for checkHomeDerived's
+		// sake, so on that path this changes nothing; it stays so that this
+		// case does not depend on how it was reached.
 		if bo.public {
 			cfg.PublicArchive = true
 		}

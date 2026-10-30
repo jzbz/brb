@@ -36,6 +36,9 @@
 # happened to move. Every job below starts from a bare checkout with nothing
 # exported, which is the only arrangement that can catch the next one: the suites
 # and build-dist.sh are invoked here with no arguments and no environment at all.
+# (The payload build is that invocation of build-dist.sh. The step that checks
+# its refusal of non-source files under go/ runs it twice more with a throwaway
+# output directory, because those runs are meant to fail, not to publish.)
 #
 # Copyright (c) 2026 Jonathan Zeppettini. MIT licensed — see the LICENSE file.
 
@@ -177,13 +180,27 @@ jobs:
             echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
           fi
 
+      # xcompat's mount checks run both readers as uid 0 of a user namespace
+      # (`unshare -r`), which is how they get past the root check without being
+      # root. Ubuntu 24.04 — ubuntu-latest — ships with
+      # kernel.apparmor_restrict_unprivileged_userns=1, which denies an
+      # unprivileged process what a user namespace would give it, and
+      # `unshare -r` then fails: HAVE_USERNS would be 0 and those checks would
+      # skip on every run while the suite exits 0. The runner is a throwaway VM,
+      # so the policy is switched off for it here. An image without that sysctl
+      # has nothing to switch off, which is the `|| true`; either way the next
+      # step is what decides, by trying it.
+      - name: Let xcompat make a user namespace
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+
       # THIS STEP IS LOAD-BEARING, NOT CEREMONY, and two different failures hide
       # behind it. The QUIET ones are what it is really for: a tool-dependent Go
       # test calls t.Skipf when detection fails, so a runner missing par2 reports
       # a green `go test ./...` in which the integration tests never ran at all;
-      # and xcompat treats script(1), flock(1) and en_US.UTF-8 as OPTIONAL (its
-      # HAVE_SCRIPT / HAVE_FLOCK / HAVE_UTF8_LOCALE gates), so without them the
-      # pty sections, the staging-lock checks and the locale round-trip skip
+      # and xcompat treats script(1), flock(1), en_US.UTF-8 and a working
+      # `unshare -r` as OPTIONAL (its HAVE_SCRIPT / HAVE_FLOCK / HAVE_UTF8_LOCALE
+      # / HAVE_USERNS gates), so without them the pty sections, the staging-lock
+      # checks, the locale round-trip and the run of both readers' mount skip
       # themselves and the suite still exits 0. Those are why this list is
       # longer than the suites' own required list, and why script and flock are
       # on it at all.
@@ -204,6 +221,10 @@ jobs:
           fi
           locale -a | grep -qiE '^en_US\.utf-?8$' || {
             echo "::error::no en_US.UTF-8; xcompat's locale checks would skip"
+            exit 1
+          }
+          unshare -r true >/dev/null 2>&1 || {
+            echo "::error::unshare -r cannot make a user namespace; xcompat's mount checks would skip"
             exit 1
           }
           # squashfs-tools below 4.5 has no -cpiostyle0, which the backup path
@@ -306,10 +327,25 @@ jobs:
           test ! -e SHA512SUMS || { echo "release dir still writes SHA512SUMS" >&2; exit 1; }
           v="$(sed -n 's/^VERSION="\([^"]*\)".*/\1/p' "$GITHUB_WORKSPACE/brb.sh" | head -1)"
           test -n "$v" || { echo "could not read VERSION out of brb.sh" >&2; exit 1; }
-          for f in "brb-v$v-linux-amd64" "brb-v$v-linux-aarch64" \
-                   "brb-v$v.sh" "brb-v$v-src.tar.gz"; do
+          # Named once, for the three checks below: two copies of a list are
+          # how one of them comes to be wrong.
+          assets=( "brb-v$v-linux-amd64" "brb-v$v-linux-aarch64" "brb-v$v.sh" "brb-v$v-src.tar.gz" )
+          for f in "${assets[@]}"; do
             test -f "$f" || { echo "missing release asset: $f" >&2; exit 1; }
           done
+          # sha256sum -c checks only the lines that are there. A list missing one
+          # of the four verifies the other three and passes, and so does the
+          # README's `sha256sum -c --ignore-missing` for every downloader, which
+          # then never checks the fourth file at all. The file that gets signed
+          # has to name exactly the release, so its names are compared with the
+          # list. The sed leaves any line it cannot parse in place, and that
+          # line then fails the comparison rather than being dropped from it.
+          diff <(printf '%s\n' "${assets[@]}" | sort) <(sed 's/^[0-9a-f]\{64\}  //' SHA256SUMS | sort) \
+            || { echo "SHA256SUMS does not list exactly the four release assets" >&2; exit 1; }
+          # build-dist.sh ends by telling the releaser to upload release/*, so
+          # anything else in this directory would go up beside them, unsigned.
+          diff <(printf '%s\n' "${assets[@]}" SHA256SUMS | sort) <(find . -mindepth 1 -maxdepth 1 -printf '%P\n' | sort) \
+            || { echo "the release directory holds more than the four assets and SHA256SUMS" >&2; exit 1; }
           # An asset that is not the payload byte for byte would put something
           # on a release page that no disc has ever carried.
           cmp "brb-v$v-linux-amd64"   ../brb-linux-amd64
@@ -323,6 +359,57 @@ jobs:
       # no longer describe the module that actually gets shipped on the discs.
       - name: go.mod and go.sum must already be tidy
         run: git diff --exit-code -- go/go.mod go/go.sum
+
+      # build-dist.sh copies go/ whole into the source tarball, so it refuses to
+      # run while go/ holds a file that is not source: cp -a would otherwise put
+      # that file in plaintext on every disc and on the release page. A refusal
+      # nothing ever trips is not known to work, so trip both of its branches.
+      # In this checkout git decides, and an untracked file must stop it. In an
+      # unpacked source tarball nothing tracks the tree and an allowlist
+      # decides, and the binary the on-disc README's rebuild recipe leaves there
+      # must stop it. Each run has to fail AND name the file, in the listing
+      # build-dist.sh prints, so a build that broke for some other reason
+      # cannot pass for the refusal. And it has to name that file ALONE: the
+      # listing is every line indented under the header that starts with go/
+      # (the remedy line under it starts with a verb). In the tarball that is
+      # what keeps the allowlist honest. A new kind of tracked file under go/ —
+      # a testdata fixture, a go:embed asset — sails through the git-decided
+      # payload build above and both plain `go build` rebuilds, and would then
+      # have build-dist.sh refuse every clean unpacked tarball with CI green.
+      # The tarball is unpacked afresh rather than reusing the one above, which
+      # the floor rebuild below needs untouched. HOME is the payload build's,
+      # so its module and build caches are warm, and the output directory is a
+      # throwaway: these runs exist to be refused.
+      - name: build-dist.sh must refuse to pack a file under go/ that is not source
+        env:
+          HOME: ${{ runner.temp }}/home
+        run: |
+          touch go/stray-sentinel
+          if ./build-dist.sh "$RUNNER_TEMP/stray-out" 2>"$RUNNER_TEMP/stray-git.log"; then
+            echo "::error::build-dist.sh packed an untracked go/stray-sentinel"; exit 1
+          fi
+          cat "$RUNNER_TEMP/stray-git.log"
+          if [[ "$(grep '^  go/' "$RUNNER_TEMP/stray-git.log")" != '  go/stray-sentinel' ]] ||
+             ! grep -qF 'git add them' "$RUNNER_TEMP/stray-git.log"; then
+            echo "::error::build-dist.sh failed, but not by refusing go/stray-sentinel, and only that, as untracked"; exit 1
+          fi
+          rm go/stray-sentinel
+
+          mkdir "$RUNNER_TEMP/stray-src"
+          tar xzf "$HOME/brb-dist/brb-src.tar.gz" -C "$RUNNER_TEMP/stray-src"
+          tree="$(cd "$RUNNER_TEMP"/stray-src/brb-*/ && pwd)"
+          ( cd "$tree/go" && go build -mod=vendor ./cmd/brb )
+          if "$tree/build-dist.sh" "$RUNNER_TEMP/stray-out" 2>"$RUNNER_TEMP/stray-tar.log"; then
+            echo "::error::build-dist.sh packed the go/brb that the rebuild recipe leaves behind"; exit 1
+          fi
+          cat "$RUNNER_TEMP/stray-tar.log"
+          if ! grep -qxF '  go/brb' "$RUNNER_TEMP/stray-tar.log" ||
+             ! grep -qF 'no git tracks this tree' "$RUNNER_TEMP/stray-tar.log"; then
+            echo "::error::build-dist.sh failed, but not by refusing go/brb by the allowlist"; exit 1
+          fi
+          if [[ "$(grep '^  go/' "$RUNNER_TEMP/stray-tar.log")" != '  go/brb' ]]; then
+            echo "::error::build-dist.sh's allowlist refuses files the source tarball itself ships; add their kind to it"; exit 1
+          fi
 
       # The offline rebuild above runs on GO_VERSION, under the GOTOOLCHAIN=local
       # that setup-go exports, and that is the one arrangement that cannot see

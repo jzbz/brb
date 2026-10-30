@@ -67,11 +67,14 @@ func DirBytes(ctx context.Context, dir string) (int64, error) {
 	return total, nil
 }
 
-// SyncDir flushes a directory entry so a completed rename survives a crash.
+// SyncDir flushes a directory's entries so that a completed rename into it,
+// or a file just created in it, survives a crash. A directory that was itself
+// just created has its entry in its parent, which takes a SyncDir of its own;
+// agecrypt's key writers walk up for that reason.
 //
 // Failures are deliberately ignored: not every filesystem supports fsync on a
 // directory, and at every call site the data itself is already durable — the
-// rename is what is being made visible, not the bytes. Callers that cared about
+// name is what is being made visible, not the bytes. Callers that cared about
 // the error could not do anything useful with it.
 //
 // It lives here rather than in each caller because it was written twice,

@@ -49,6 +49,18 @@ func initKey(cfg *config.Config, p *ui.Printer, rescue bool) error {
 	}
 	keyDir := filepath.Dir(keyFile)
 
+	// Before anything is made or minted. A recipients path that is there and
+	// is not a regular file cannot take the public key: a directory fails the
+	// append's open, a FIFO or a device its fsync. Found only then, the
+	// identity or the rescue container is already on disk with nothing
+	// encrypted to it, and this command will not mint over either, so the
+	// operator is left to mend the setup by hand. CheckRecipientAddition lets
+	// such a path through on purpose: it refuses only a set age rejects.
+	if fi, err := os.Stat(cfg.AgeRecipientsFile); err == nil && !fi.Mode().IsRegular() {
+		return fmt.Errorf("init-key: recipients file %s is not a regular file (%s) — point AGE_RECIPIENTS_FILE "+
+			"at the recipients file itself, or at a path where one can be created", cfg.AgeRecipientsFile, fi.Mode().Type())
+	}
+
 	if err := prepareKeyDir(keyDir, p); err != nil {
 		return err
 	}
@@ -134,7 +146,7 @@ func prepareKeyDir(keyDir string, p *ui.Printer) error {
 	if perm := fi.Mode().Perm(); perm&0o077 != 0 {
 		p.Warn("%s is accessible to others (mode %04o); the identity written into it is 0400, but the directory is not brb's to lock down",
 			keyDir, perm)
-		p.Step("tighten it yourself if nothing else needs it: chmod 700 %s", keyDir)
+		p.Step("tighten it yourself if nothing else needs it: chmod 700 %s", ui.ShellWord(keyDir))
 	}
 	return nil
 }

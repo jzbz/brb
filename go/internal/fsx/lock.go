@@ -16,7 +16,8 @@ import (
 // file another process may be about to lock is how advisory locking is
 // commonly got wrong: the second process locks an inode that is no longer at
 // the path, a third creates a fresh one, and both then believe they hold it.
-// The file is zero bytes and goes when staging is wiped.
+// So it outlives every run, with at most one pid line in it — a stale one once
+// that run has ended — and goes when staging is wiped.
 const LockName = ".brb.lock"
 
 // StagingLock is a held exclusive lock on a staging directory.

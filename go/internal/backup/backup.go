@@ -32,6 +32,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"math"
 	"path/filepath"
 	"sort"
@@ -211,8 +212,10 @@ type runner struct {
 	est     *ratioEstimator
 	started time.Time
 
-	// indexBuilt records that a resumed run found the encrypted index already
-	// written, so the plaintext index it was built from is legitimately gone.
+	// indexBuilt records that a resumed run found the encrypted index written
+	// and the plaintext one it was built from already removed — which only an
+	// earlier run's finish does, just before it removes the state file — so
+	// the plaintext index is legitimately gone and the encrypted one is kept.
 	indexBuilt bool
 
 	// skippedMounts holds the mount points the scan stopped at, relative to
@@ -228,6 +231,12 @@ type runner struct {
 	// not be read is not on any disc, the terminal that said so is long gone by
 	// the time anyone reads the discs, and a restore that quietly lacks a file
 	// looks exactly like a backup that never had it.
+	//
+	// The scan reports them as the paths it passed to the OS, SOURCE_DIR and
+	// all (scan.Problem.Path), and runner.scan takes SOURCE_DIR off. They used
+	// to be kept whole, and reached the manifest as absolute paths on the
+	// machine that made the set, beside prunes and mount points that are
+	// relative.
 	unreadable      []string
 	unreadableCount int
 
@@ -240,7 +249,8 @@ type runner struct {
 	// discCipher and indexCipher hold the ciphertext digests this run measured
 	// while encrypting, so SHA512SUMS does not re-read twenty gigabytes per
 	// disc to arrive at the same numbers. A disc finished by an earlier run is
-	// simply absent here and is hashed the long way. See writeSums.
+	// absent here; it is hashed the long way and held to the digest its
+	// sidecar in enc/ recorded at encryption. See knownSums.
 	discCipher  map[int]string
 	indexCipher string
 
@@ -402,7 +412,7 @@ func (r *runner) scan(ctx context.Context) (*scan.Result, error) {
 				r.p.Step("... and %d more", n-10)
 				break
 			}
-			r.p.Step("%s", e.Error())
+			r.p.Step("%s", problemLine(e))
 		}
 		// Carried into the manifest as well. A tree can hold more unreadable
 		// paths than a document should list, so the manifest names the first
@@ -413,7 +423,7 @@ func (r *runner) scan(ctx context.Context) (*scan.Result, error) {
 			if i == maxNamedUnreadable {
 				break
 			}
-			r.unreadable = append(r.unreadable, e.Path)
+			r.unreadable = append(r.unreadable, relToRoot(res.Root, e.Path))
 		}
 	}
 	// A mount point under SOURCE_DIR is kept as an empty directory and its whole
@@ -459,6 +469,39 @@ func (r *runner) scan(ctx context.Context) (*scan.Result, error) {
 	return res, nil
 }
 
+// problemLine renders one path the scan could not read, for the warning that
+// lists them: the path %q, then what failed and why.
+//
+// Not Problem.Error(). That is the path, then the underlying error — and every
+// error the walker records is an *fs.PathError carrying the same path, so each
+// one was printed twice, at twice the width, in a list capped at ten lines. And
+// it was printed raw: the Printer keeps a newline, because brb's own messages
+// span lines, so a file named "x\n  ok all files readable" put a line of its own
+// under the warning that read exactly like one of brb's. The operation stays,
+// because "open" (a file), "readdirent" (a directory, part way through) and
+// "lstat" are different things to go and look at. Anything that is not a
+// PathError is quoted whole rather than trusted to hold no path.
+func problemLine(p scan.Problem) string {
+	var pe *fs.PathError
+	if errors.As(p.Err, &pe) {
+		return fmt.Sprintf("%q: %s: %v", p.Path, pe.Op, pe.Err)
+	}
+	return fmt.Sprintf("%q", p.Error())
+}
+
+// relToRoot is a path the scan reported, relative to the root it walked: the
+// form the manifest's excluded section uses for every entry, and the one a
+// restorer can look for in the archive. A path that is not below root, which
+// the walker never produces, is kept as it was rather than dressed up with
+// "../".
+func relToRoot(root, p string) string {
+	rel, err := filepath.Rel(root, p)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, "../") {
+		return p
+	}
+	return rel
+}
+
 // reportPaths lists odd paths under a warning, %q so a control byte is shown as
 // an escape rather than acted on by the terminal, and truncated so a tree full
 // of them cannot bury the rest of the run's output.
@@ -480,6 +523,13 @@ func oversizedError(over []pack.Unit, budget int64) error {
 // oversizedDetail is oversizedError's message without the package prefix, so
 // that buildImage can say what the measured ratio did to the budget first and
 // still give the operator the same list and the same three ways out.
+//
+// The paths are %q, as reportPaths prints them. They come from the source
+// tree, where whoever creates a file names it, and the Printer passes a
+// newline through because messages like this one are meant to span lines — so
+// a file named "big\n  ok no files were skipped" printed, under the refusal, a
+// line indistinguishable from one of brb's own. The size, count and remedy
+// lines are brb's and stay as they are.
 func oversizedDetail(over []pack.Unit, budget int64) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "%d file(s) are larger than one disc can hold (%s raw budget):",
@@ -489,7 +539,7 @@ func oversizedDetail(over []pack.Unit, budget int64) string {
 			fmt.Fprintf(&b, "\n  ... and %d more", len(over)-20)
 			break
 		}
-		fmt.Fprintf(&b, "\n  %14d  %s", u.Size, u.Paths[0])
+		fmt.Fprintf(&b, "\n  %14d  %q", u.Size, u.Paths[0])
 	}
 	b.WriteString("\n  exclude them via EXCLUDE_MASKS, use larger media (DISC_TYPE=bdxl100), " +
 		"or split them yourself before backing up")

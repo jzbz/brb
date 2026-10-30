@@ -38,9 +38,9 @@
 # a caller that reads exit codes ("both suites are green") must never be told
 # success by a run in which no assertion executed at all.
 #
-# The two optional tools, script(1) and an en_US.UTF-8 locale, are the only ones
-# that gate individual checks rather than the whole file; each such check prints
-# its own SKIP naming what is missing.
+# The optional tools — script(1), flock(1), a working unshare -r and an
+# en_US.UTF-8 locale — are the only ones that gate individual checks rather than
+# the whole file; each such check prints its own SKIP naming what is missing.
 
 set -uo pipefail
 
@@ -75,18 +75,24 @@ head_s() { printf '\n== %s\n' "$1"; }
 _tail() { printf '%s' "$1" | tr '\n' '|' | sed -e 's/|\+/ | /g' -e 's/^ *| *//' | tail -c 300; }
 
 # assert0 DESC CMD...   -- the check passes when CMD exits 0
+#
+# Both return 1 when the check fails, so that `if assert0 "fixture: ..."` can
+# skip the cases that lean on a fixture which was never built. They used to
+# return fail's status, which is _why's, which is always 0: the guard let every
+# case through, and a "refuses" case then passed for refusing a disc that did
+# not exist. Nothing else reads their status, and the file does not set -e.
 assert0() {
   local d=$1; shift
   local out rc
   out=$("$@" 2>&1); rc=$?
-  if ((rc == 0)); then pass "$d"; else fail "$d" "exit $rc: $(_tail "$out")"; fi
+  if ((rc == 0)); then pass "$d"; else fail "$d" "exit $rc: $(_tail "$out")"; return 1; fi
 }
 # assertN DESC CMD...   -- the check passes when CMD exits non-zero
 assertN() {
   local d=$1; shift
   local out rc
   out=$("$@" 2>&1); rc=$?
-  if ((rc != 0)); then pass "$d"; else fail "$d" "expected a non-zero exit, got 0: $(_tail "$out")"; fi
+  if ((rc != 0)); then pass "$d"; else fail "$d" "expected a non-zero exit, got 0: $(_tail "$out")"; return 1; fi
 }
 # xassert0 DESC WHY CMD... -- SHOULD exit 0; today it does not. Non-zero = XFAIL.
 xassert0() {
@@ -339,23 +345,374 @@ assert0 "brb.sh verify-disc works with a reader-side config (no writer keys)" re
 # A line inside SHA512SUMS that has itself rotted is only a WARNING to
 # sha512sum -c, which then never hashes the file that line named at all.
 # verify-disc must fail rather than report the disc clean off a checksum file
-# that cannot vouch for it. The fixture is asserted separately so a mangling
-# that silently missed cannot let the refusal checks pass vacuously.
+# that cannot vouch for it. The fixture is asserted first and the refusal
+# checks run only when it was built, so a mangling that silently missed, or a
+# disc that was never there to copy, cannot let them pass vacuously: both
+# readers refuse a directory that does not exist.
 mangle_sums_fixture() {
   rm -rf "$T/rotsums"; cp -a "$GOD" "$T/rotsums"
   printf 'X' | dd of="$T/rotsums/data/disc01.squashfs.age" bs=1 seek=99 count=1 conv=notrunc 2>/dev/null
   sed -i 's|^[0-9a-f]\{128\}\(  \./data/disc01\.squashfs\.age\)$|deadbeef\1|' "$T/rotsums/SHA512SUMS"
   grep -q '^deadbeef  ' "$T/rotsums/SHA512SUMS"
 }
-assert0 "fixture: a disc whose SHA512SUMS line for a corrupt file is itself mangled" mangle_sums_fixture
 verify_rotsums() { # verify_rotsums sh|go
   case $1 in
     sh) bash "$BRB_SH" --yes -c "$T/cfg/go" verify-disc 1 "$T/rotsums" > "$LOG/rotsums-sh.log" 2>&1 ;;
     go) "$BRB_GO" --yes --no-color -c "$T/cfg/go" verify-disc 1 "$T/rotsums" > "$LOG/rotsums-go.log" 2>&1 ;;
   esac
 }
-assertN "brb.sh verify-disc rejects a disc whose SHA512SUMS has a corrupt line" verify_rotsums sh
-assertN "go brb verify-disc rejects a disc whose SHA512SUMS has a corrupt line" verify_rotsums go
+if assert0 "fixture: a disc whose SHA512SUMS line for a corrupt file is itself mangled" mangle_sums_fixture; then
+  assertN "brb.sh verify-disc rejects a disc whose SHA512SUMS has a corrupt line" verify_rotsums sh
+  assertN "go brb verify-disc rejects a disc whose SHA512SUMS has a corrupt line" verify_rotsums go
+fi
+
+# ---------------------------------------------------------------------------
+head_s "2a. SHA512SUMS parsing and verify-disc, in both readers"
+# ---------------------------------------------------------------------------
+# verify-disc is the one command whose whole job is the integrity claim, and
+# section 2 only shows it accepting a good disc and refusing one rotted line.
+# brb.sh used to hand SHA512SUMS to `sha512sum -c`, which hashes whatever each
+# line names: a textual check in front of it stopped "<empty digest>  /dev/null"
+# and nothing else, so a BSD-style line, a leading space, or a symlink on the
+# disc still had a disc "verified" off /dev/null or off a host file. The Go
+# reader, for its part, followed a symlinked data/, hung in open(2) on a FIFO,
+# and called an empty SHA512SUMS clean. Both now parse the file with one grammar
+# (ReadSumFile; brb.sh's SUM_AWK) under one byte cap, require the disc's image
+# to be listed, and hold every listed name to one rule — no link anywhere on the
+# way, nothing climbing out, a regular file at the end (agecrypt.hashInRoot;
+# brb.sh's verify_disc_sums). This section is that rule, case by case, on both.
+#
+# Every fixture is a copy of the reference disc with one thing done to it, used
+# as a directory where a mount point goes, and removed — with anything its
+# builder put beside it — once both readers have seen it. Each run is under a
+# timeout, and a run the timeout ended counts as a FAILURE, never as a refusal:
+# several of these discs used to hang one reader or the other, and a hang must
+# not read as "refused". Each fixture builder checks that its own sabotage
+# landed, so a builder that silently missed cannot let a refusal pass
+# vacuously — and where a case appends one bad line to an intact SHA512SUMS
+# rather than replacing it, nothing but that line can be what is refused.
+#
+# Some discs here would be refused by more than one guard: the rule that the
+# image be listed refuses nearly anything, and where a reader refuses a disc
+# outright or calls it unrecognised, the walk over the listed names would
+# still have refused it a step later, as a mismatch. A refusal alone then goes
+# on passing with the guard a case is about deleted, so such a case also names
+# an ERE its refusal has to print — one for both readers, or one for each where
+# they word it differently.
+SV=$T/sv
+SV_EMPTY=$(sha512sum < /dev/null | cut -c1-128)   # the digest of the empty file
+sv_disc() { # sv_disc NAME -- a fresh copy of the reference disc to sabotage
+  rm -rf -- "${SV:?}/${1:?}"; mkdir -p "$SV"; cp -a "$GOD" "$SV/$1" && test -f "$SV/$1/SHA512SUMS"
+}
+sv_corrupt() { # sv_corrupt NAME -- one flipped byte in the image, proven to have landed
+  printf 'X' | dd of="$SV/$1/data/disc01.squashfs.age" bs=1 seek=99 count=1 conv=notrunc 2>/dev/null
+  ! cmp -s "$GOD/data/disc01.squashfs.age" "$SV/$1/data/disc01.squashfs.age"
+}
+sv_keep() { # sv_keep NAME ERE -- keep only the SHA512SUMS lines matching ERE
+  grep -E "$2" "$SV/$1/SHA512SUMS" > "$SV/$1/SHA512SUMS.new"
+  mv -f -- "$SV/$1/SHA512SUMS.new" "$SV/$1/SHA512SUMS"
+}
+sv_drop() { # sv_drop NAME ERE -- drop the SHA512SUMS lines matching ERE
+  grep -vE "$2" "$SV/$1/SHA512SUMS" > "$SV/$1/SHA512SUMS.new"
+  mv -f -- "$SV/$1/SHA512SUMS.new" "$SV/$1/SHA512SUMS"
+}
+sv_sum_of() { sha512sum < "$1" | cut -c1-128; }
+sv_run() { # sv_run sh|go NAME -- verify-disc 1 over the fixture, under SV_LOCALE if set; prints the exit status
+  local r=0
+  # Always run inside $( ), so the export goes no further than this one run.
+  [[ -z "${SV_LOCALE:-}" ]] || export LC_ALL="$SV_LOCALE"
+  case $1 in
+    sh) timeout -k 5 60 bash "$BRB_SH" --yes -c "$T/cfg/go" verify-disc 1 "$SV/$2" > "$LOG/sv-$2-sh.log" 2>&1 || r=$? ;;
+    go) timeout -k 5 60 "$BRB_GO" --yes --no-color -c "$T/cfg/go" verify-disc 1 "$SV/$2" > "$LOG/sv-$2-go.log" 2>&1 || r=$? ;;
+  esac
+  printf '%s' "$r"
+}
+sv_refuses() { # sv_refuses sh|go NAME [ERE] -- refused, and saying ERE if one is given
+  local r; r=$(sv_run "$1" "$2")
+  case $r in
+    0)       echo "called it verified (see $LOG/sv-$2-$1.log)" >&2; return 1 ;;
+    124|137) echo "hung until the timeout killed it (see $LOG/sv-$2-$1.log)" >&2; return 1 ;;
+  esac
+  [[ -z "${3:-}" ]] || grep -Eq -- "$3" "$LOG/sv-$2-$1.log" || {
+    echo "refused, but not saying /$3/ — some other guard refused it (see $LOG/sv-$2-$1.log)" >&2
+    tail -3 "$LOG/sv-$2-$1.log" >&2; return 1; }
+}
+sv_accepts() { # sv_accepts sh|go NAME
+  local r; r=$(sv_run "$1" "$2")
+  (( r == 0 )) || { echo "exit $r (see $LOG/sv-$2-$1.log)" >&2; tail -3 "$LOG/sv-$2-$1.log" >&2; return 1; }
+}
+sv_case() { # sv_case refuses|accepts NAME BUILDER DESCRIPTION [ERE [GO_ERE]]
+  local how=$1 nm=$2 build=$3 desc=$4 sh_re=${5:-} go_re=${6:-${5:-}}
+  if assert0 "fixture: $desc" "$build" "$nm"; then
+    assert0 "  ... brb.sh verify-disc $how it" "sv_$how" sh "$nm" ${sh_re:+"$sh_re"}
+    assert0 "  ... go brb verify-disc $how it" "sv_$how" go "$nm" ${go_re:+"$go_re"}
+  fi
+  rm -rf -- "${SV:?}/${nm:?}" "${SV:?}/host-$nm" "${SV:?}/out-$nm"
+}
+
+# The control every refusal below leans on: an untouched copy verifies.
+sv_plain() { sv_disc "$1"; }
+sv_case accepts plain sv_plain "an untouched copy of the reference disc"
+
+# The shape refuse_escaping_sums existed for, and the two spellings it missed.
+# GNU sha512sum -c --strict takes all three, so the old brb.sh hashed /dev/null
+# and called the disc verified; the Go parser refuses the last two outright.
+# The first is refused by brb.sh as a checksum file brb did not write and
+# counted by Go as a mismatch (README's table of reader differences), and the
+# ERE pins that: the walk from the disc root would also make it a mismatch in
+# brb.sh, which would hide the loss of the refusal.
+sv_gnu_null()  { sv_disc "$1" && printf '%s  /dev/null\n' "$SV_EMPTY" >> "$SV/$1/SHA512SUMS"; }
+sv_bsd_null()  { sv_disc "$1" && printf 'SHA512 (/dev/null) = %s\n' "$SV_EMPTY" >> "$SV/$1/SHA512SUMS"; }
+sv_lead_null() { sv_disc "$1" && printf '  %s  /dev/null\n' "$SV_EMPTY" >> "$SV/$1/SHA512SUMS"; }
+sv_case refuses gnunull  sv_gnu_null  "an intact SHA512SUMS plus a line for /dev/null" \
+  'which is not a file on the disc' 'mismatch: /dev/null'
+sv_case refuses bsdnull  sv_bsd_null  "an intact SHA512SUMS plus a BSD-style line for /dev/null"
+sv_case refuses leadnull sv_lead_null "an intact SHA512SUMS plus a /dev/null line with leading whitespace"
+
+# Links. A disc brb wrote carries none at the names it lists, and following one
+# reads a file that is not on the disc: the image linked to /dev/null beside the
+# empty file's digest, or a listed link to a host file carrying that file's real
+# digest, verified under the old brb.sh. A link that stays inside the disc is
+# refused too — the rule is "no link", not "no link out", in both readers.
+sv_null_image() {
+  sv_disc "$1" || return 1
+  mv -f -- "$SV/$1/data/disc01.squashfs.age" "$SV/$1/data/disc01.squashfs.age.was"
+  ln -s /dev/null "$SV/$1/data/disc01.squashfs.age"
+  printf '%s  ./data/disc01.squashfs.age\n' "$SV_EMPTY" > "$SV/$1/SHA512SUMS"
+  test -L "$SV/$1/data/disc01.squashfs.age"
+}
+sv_host_link() {
+  sv_disc "$1" || return 1
+  printf 'a file on the host, not on the disc\n' > "$SV/host-$1"
+  ln -s "$SV/host-$1" "$SV/$1/hostlink"
+  printf '%s  ./hostlink\n' "$(sv_sum_of "$SV/host-$1")" >> "$SV/$1/SHA512SUMS"
+  test -L "$SV/$1/hostlink"
+}
+sv_inner_link() {
+  sv_disc "$1" || return 1
+  ln -s README.md "$SV/$1/innerlink"
+  printf '%s  ./innerlink\n' "$(sv_sum_of "$SV/$1/README.md")" >> "$SV/$1/SHA512SUMS"
+  test -L "$SV/$1/innerlink"
+}
+# A link at the image's own name is no image at all to either reader's identity
+# check (brb.sh's find -type f, Go's dataFiles), so that disc is unrecognised
+# before a hash is read; the ERE keeps it from passing as a mere mismatch.
+sv_case refuses nullimage sv_null_image "the image a symlink to /dev/null, listed with the empty file's digest" \
+  'unrecognised disc'
+sv_case refuses hostlink  sv_host_link  "a listed symlink to a host file, carrying that file's real digest"
+sv_case refuses innerlink sv_inner_link "a listed symlink to a file inside the disc, carrying its real digest"
+
+# data/ as a link off the disc, with a SHA512SUMS that does not mention the
+# image at all: the Go reader's os.ReadDir followed the link, found an image
+# there, and verified the disc on the strength of MANIFEST.txt alone. Now that
+# the image has to be listed, that alone refuses this disc too, so the case
+# needs the refusal to name the link.
+sv_data_link() {
+  sv_disc "$1" || return 1
+  mkdir -p "$SV/out-$1"
+  mv -- "$SV/$1/data" "$SV/out-$1/data"
+  ln -s "$SV/out-$1/data" "$SV/$1/data"
+  sv_keep "$1" '  \./MANIFEST\.txt$'
+  test -L "$SV/$1/data" && [[ "$(wc -l < "$SV/$1/SHA512SUMS")" == 1 ]]
+}
+sv_case refuses datalink sv_data_link "data/ a symlink to a directory off the disc, SHA512SUMS listing only MANIFEST.txt" \
+  'symbolic link'
+
+# What a SHA512SUMS has to say before it can vouch for anything. An empty one
+# beside a corrupt image was clean to the Go reader; one that simply leaves the
+# image out was clean to both, since each checked only what the file listed.
+# The empty one fails the image rule as well, hence its ERE. The .. name is
+# refused by brb.sh outright and counted by Go as a mismatch, as /dev/null is
+# above, and its EREs pin that for the same reason.
+sv_empty_sums() { sv_disc "$1" && sv_corrupt "$1" && : > "$SV/$1/SHA512SUMS"; }
+sv_no_image() {
+  sv_disc "$1" && sv_corrupt "$1" || return 1
+  sv_drop "$1" 'data/disc01\.squashfs\.age$'
+  ! grep -q 'disc01\.squashfs\.age$' "$SV/$1/SHA512SUMS" && test -s "$SV/$1/SHA512SUMS"
+}
+sv_dotdot() {
+  sv_disc "$1" && printf '%s  ./data/../README.md\n' "$(sv_sum_of "$SV/$1/README.md")" >> "$SV/$1/SHA512SUMS"
+}
+sv_case refuses emptysums sv_empty_sums "a corrupt image beside an empty SHA512SUMS" \
+  'lists no files'
+sv_case refuses noimage   sv_no_image   "a corrupt image beside a SHA512SUMS that lists every file but it"
+sv_case refuses dotdot    sv_dotdot     "a listed name that climbs out with .. and back in, carrying the real digest" \
+  'which is not a file on the disc' 'mismatch: \./data/\.\./README\.md'
+
+# A NUL in a listed name. bash's read drops it, so without SUM_ZS brb.sh's
+# parser would look up README.md for "./READ<NUL>ME.md" and verify the disc,
+# where Go's open refuses the name; and the image's own line spelled with a NUL
+# in it would satisfy brb.sh's rule that the image be listed and not Go's. Both
+# carry the real digest of the file the name reads as without its NUL. The
+# second needs its ERE: brb.sh would also count that line a mismatch, which
+# still refuses the disc, so only the message shows whether the line was taken
+# for the image's.
+sv_nul_name() {
+  sv_disc "$1" || return 1
+  printf '%s  ./READ\0ME.md\n' "$(sv_sum_of "$SV/$1/README.md")" >> "$SV/$1/SHA512SUMS"
+  grep -qa 'READ.ME\.md$' "$SV/$1/SHA512SUMS"
+}
+sv_nul_image() {
+  sv_disc "$1" || return 1
+  sv_drop "$1" 'data/disc01\.squashfs\.age$'
+  printf '%s  ./data/disc01.squash\0fs.age\n' "$(sv_sum_of "$SV/$1/data/disc01.squashfs.age")" >> "$SV/$1/SHA512SUMS"
+  grep -qa 'squash.fs\.age$' "$SV/$1/SHA512SUMS" && ! grep -qa 'disc01\.squashfs\.age$' "$SV/$1/SHA512SUMS"
+}
+sv_case refuses nulname  sv_nul_name  "a listed name with a NUL in it, carrying the digest of the name without it"
+sv_case refuses nulimage sv_nul_image "the image's own line with a NUL in its name, carrying the image's digest" \
+  'records no hash for data/disc01\.squashfs\.age'
+
+# A megabyte of name is allowed on a line, and an escaped one can be nothing
+# but newlines. brb.sh prints a name it cannot match, and printing one of these
+# through ${1//$'\n'/\\n} is quadratic in bash: most of a minute per name in a
+# UTF-8 locale, where the Go reader takes milliseconds, so four of them would
+# take brb.sh past the timeout. esc_str's awk join takes two or three seconds
+# over all four, and this case is what keeps the substitution from coming back.
+# It runs under the suite's UTF-8 locale, as CI does, and is skipped without
+# one: under C the quadratic cost is about twenty times smaller, small enough
+# for four names to fit in the timeout, and the case would pin nothing.
+sv_nl_names() {
+  sv_disc "$1" || return 1
+  awk -v d="$SV_EMPTY" 'BEGIN {
+    s = "\\n"; while (length(s) < 1040000) s = s s; s = substr(s, 1, 1040000)
+    for (i = 1; i <= 4; i++) printf "\\%s  ./%d%s\n", d, i, s
+  }' >> "$SV/$1/SHA512SUMS"
+  [[ "$(grep -c '^[\]' "$SV/$1/SHA512SUMS")" == 4 ]]
+}
+if (( HAVE_UTF8_LOCALE )); then
+  SV_LOCALE=$UTF8_LOCALE
+  sv_case refuses nlnames sv_nl_names "four escaped names of about a megabyte each, nothing but newlines after ./N"
+  unset SV_LOCALE
+else
+  skip "four escaped names of about a megabyte each, nothing but newlines after ./N (both readers)" \
+       "no en_US.UTF-8 locale on this machine, and under C the case would pin nothing"
+fi
+
+# FIFOs. open(2) on one blocks until a writer appears; the Go reader hung there
+# on SHA512SUMS and on MANIFEST.txt (through the first Ctrl-C), and both readers
+# hung on a listed one. A FIFO MANIFEST.txt is not refused, only stepped past,
+# as brb.sh's [[ -f ]] always did — it carries advice, not a hash.
+sv_fifo_entry() { sv_disc "$1" && mkfifo "$SV/$1/fifo" && printf '%s  ./fifo\n' "$SV_EMPTY" >> "$SV/$1/SHA512SUMS"; }
+sv_fifo_sums() {
+  sv_disc "$1" || return 1
+  mv -f -- "$SV/$1/SHA512SUMS" "$SV/$1/SHA512SUMS.was"
+  mkfifo "$SV/$1/SHA512SUMS"
+}
+sv_fifo_manifest() {
+  sv_disc "$1" || return 1
+  mv -f -- "$SV/$1/MANIFEST.txt" "$SV/$1/MANIFEST.was"
+  mkfifo "$SV/$1/MANIFEST.txt"
+  sv_drop "$1" '  \./MANIFEST\.(txt|was)$'
+  test -p "$SV/$1/MANIFEST.txt"
+}
+sv_case refuses fifoentry sv_fifo_entry    "a listed FIFO inside the disc"
+sv_case refuses fifosums  sv_fifo_sums     "SHA512SUMS itself a FIFO"
+sv_case accepts fifoman   sv_fifo_manifest "MANIFEST.txt a FIFO, unlisted, with an archive name configured"
+
+# The byte cap, at its edge, in both readers: agecrypt.maxSumBytes and brb.sh's
+# MAX_SUM_BYTES are the same number counted the same way. The padding is comment
+# lines, which store nothing and are skipped by GNU sha512sum too, so before the
+# cap both readers verified the file one byte over, and the case exactly at the
+# cap shows the cap is not refusing everything near it. A SHA512SUMS linked to
+# /proc/self/pagemap is the case a stat-based cap misses: a "regular file" of
+# size 0 that reads far past the cap.
+SV_CAP=16777216
+sv_pad_to() { # sv_pad_to NAME SIZE
+  local f=$SV/$1/SHA512SUMS have
+  have=$(stat -c %s "$f")
+  { yes "#$(printf '%0998d' 0)" | head -c "$(( $2 - have ))"; } >> "$f"
+  [[ "$(stat -c %s "$f")" == "$2" ]]
+}
+sv_at_cap()   { sv_disc "$1" && sv_pad_to "$1" "$SV_CAP"; }
+sv_over_cap() { sv_disc "$1" && sv_pad_to "$1" "$(( SV_CAP + 1 ))"; }
+sv_pagemap() {
+  sv_disc "$1" || return 1
+  mv -f -- "$SV/$1/SHA512SUMS" "$SV/$1/SHA512SUMS.was"
+  ln -s /proc/self/pagemap "$SV/$1/SHA512SUMS"
+}
+sv_case accepts atcap   sv_at_cap   "a SHA512SUMS padded with comments to exactly $SV_CAP bytes"
+sv_case refuses overcap sv_over_cap "a SHA512SUMS padded with comments to one byte more"
+if [[ -r /proc/self/pagemap ]]; then
+  sv_case refuses pagemap sv_pagemap "SHA512SUMS a symlink to /proc/self/pagemap"
+else
+  skip "a SHA512SUMS linked to /proc/self/pagemap" "no readable /proc/self/pagemap here"
+fi
+
+# The per-line cap, where bufio.Scanner puts it: a line of 1048576 bytes or more
+# (a trailing CR counted, the newline not) refuses the file, even as a comment.
+# brb.sh's SUM_AWK reproduces that edge by hand, so both sides of it are pinned.
+sv_comment_of() { # sv_comment_of NAME LENGTH
+  sv_disc "$1" || return 1
+  { printf '#'; head -c "$(( $2 - 1 ))" /dev/zero | tr '\0' c; printf '\n'; } >> "$SV/$1/SHA512SUMS"
+}
+sv_long_ok()  { sv_comment_of "$1" 1048575; }
+sv_long_bad() { sv_comment_of "$1" 1048576; }
+sv_case accepts longok  sv_long_ok  "a comment line of 1048575 bytes"
+sv_case refuses longbad sv_long_bad "a comment line of 1048576 bytes"
+
+# The parser's own control. Names holding a newline or a backslash are written
+# escaped (a leading backslash on the line), and brb.sh now unescapes them
+# itself, as unescapeName does, instead of leaving that to sha512sum: a disc
+# carrying such files, with a SHA512SUMS GNU sha512sum wrote over all of it,
+# must still verify in both readers.
+sv_escaped() {
+  sv_disc "$1" || return 1
+  printf 'x\n' > "$SV/$1/$(printf 'new\nline')"
+  printf 'y\n' > "$SV/$1/back\\slash"
+  ( cd "$SV/$1" && find . -type f ! -name SHA512SUMS -print0 | LC_ALL=C sort -z | xargs -0 sha512sum > ../escaped.sums ) || return 1
+  mv -f -- "$SV/escaped.sums" "$SV/$1/SHA512SUMS"
+  # A leading backslash is GNU's mark of an escaped name; without one the case
+  # would prove nothing about unescaping.
+  grep -q '^[\]' "$SV/$1/SHA512SUMS" && grep -q 'data/disc01\.squashfs\.age$' "$SV/$1/SHA512SUMS"
+}
+sv_case accepts escaped sv_escaped "files whose names hold a newline and a backslash, summed by GNU sha512sum"
+
+# Ingest reads the same file and is held to the same cap: one over it is not
+# read at all, in either reader, and the copies go across unchecked with a
+# warning naming the cap — where before, both read it, and brb.sh went on
+# checking against it. The image must still be staged, byte for byte.
+#
+# And it reads it with the same grammar. brb.sh's ingest used to split each
+# line with `read -r`, so a SHA512SUMS with CRLF line endings kept the CR on
+# every name: not one copy was checked against it, and nothing said so, where
+# the Go reader trims the CR and checks them all. The image's own sidecar is
+# the copy to watch: the image is checked against that sidecar whatever
+# SHA512SUMS says, but the sidecar has nothing else to vouch for it.
+sv_ingest() { # sv_ingest sh|go NAME -- ingest the fixture into a STAGING of its own
+  local st=$T/sv-ing-$2-$1
+  rm -rf -- "$st"; mkdir -p "$st/enc"
+  mkcfg "$T/cfg/sv-ing-$2-$1" "$st" "$SRC"
+  case $1 in
+    sh) run_pty "$LOG/sv-ing-$2-sh.log" $'\nq\n' "bash '$BRB_SH' -c '$T/cfg/sv-ing-$2-sh' ingest '$SV/$2'" || true ;;
+    go) run_pty "$LOG/sv-ing-$2-go.log" $'\n\n'  "'$BRB_GO' --no-color -c '$T/cfg/sv-ing-$2-go' ingest '$SV/$2'" || true ;;
+  esac
+}
+sv_crlf() { sv_disc "$1" && sed -i 's/$/\r/' "$SV/$1/SHA512SUMS" && grep -q $'data/disc01\\.squashfs\\.age\r$' "$SV/$1/SHA512SUMS"; }
+if (( HAVE_SCRIPT )); then
+  if assert0 "fixture: a disc whose SHA512SUMS is padded with comments to one byte over the cap" sv_over_cap ingcap; then
+    for who in sh go; do
+      case $who in sh) name="brb.sh" ;; go) name="go brb" ;; esac
+      sv_ingest "$who" ingcap
+      assert0 "$name ingest does not read a SHA512SUMS one byte over the cap, and says why" \
+        grep -q "larger than $SV_CAP bytes" "$LOG/sv-ing-ingcap-$who.log"
+      assert0 "  ... and still stages the image, byte for byte" \
+        cmp -s "$GOD/data/disc01.squashfs.age" "$T/sv-ing-ingcap-$who/enc/disc01.squashfs.age"
+    done
+  fi
+  if assert0 "fixture: a disc whose SHA512SUMS has CRLF line endings" sv_crlf ingcrlf; then
+    for who in sh go; do
+      case $who in sh) name="brb.sh" ;; go) name="go brb" ;; esac
+      sv_ingest "$who" ingcrlf
+      assert0 "$name ingest checks the image's sidecar against a CRLF SHA512SUMS" \
+        grep -q 'disc01\.squashfs\.age\.sha512 copied and verified' "$LOG/sv-ing-ingcrlf-$who.log"
+    done
+  fi
+  unset name
+  rm -rf -- "${SV:?}/ingcap" "${SV:?}/ingcrlf" "${T:?}"/sv-ing-*
+else
+  skip "ingest of a disc whose SHA512SUMS is over the cap, or has CRLF line endings (both readers)" \
+       "script(1) is not installed; ingest reads its disc prompts from /dev/tty"
+fi
 
 # ---------------------------------------------------------------------------
 head_s "3. the encrypted index"
@@ -413,8 +770,27 @@ idx_escaped_rows() {
     | awk -F'\t' 'NF!=2 { b=1 } END { exit b+0 }'
 }
 assert0 "a tab or newline in a filename still yields one row of two fields" idx_escaped_rows
-sh_reads_escaped() { bash "$BRB_SH" -c "$T/cfg/idx" index 2>/dev/null | awk -F'\t' 'NF!=2 { b=1 } END { exit b+0 }'; }
-assert0 "brb.sh reads the escaped index without splitting a row" sh_reads_escaped
+# Captured to files and compared with the decrypted index itself, for the
+# reasons readers_agree_on_index gives and one more. Piped through awk, an
+# empty index passed (awk exits 0 on no input), and so did one that dropped
+# every escaped row, or one read without `read -r` that stripped every
+# backslash while keeping two fields a row. Against each other, two readers
+# sharing that last bug would still agree; against what was written, neither
+# does. Both readers print the index unchanged into a pipe, which is the
+# contract this holds them to. The field check runs before the count, so a row
+# split by an unescaped newline is reported as that rather than as a count.
+readers_print_escaped_index() {
+  local a=$T/index-idx-sh b=$T/index-idx-go p=$T/index-idx-plain n
+  idx_plain "$T/stage-idx" >"$p" || { echo "could not decrypt the escaped index" >&2; return 1; }
+  bash "$BRB_SH" -c "$T/cfg/idx" index >"$a" 2>/dev/null || { echo "brb.sh index exited non-zero" >&2; return 1; }
+  "$BRB_GO" --no-color -c "$T/cfg/idx" index >"$b" 2>/dev/null || { echo "go brb index exited non-zero" >&2; return 1; }
+  awk -F'\t' 'NF!=2 { b=1 } END { exit b+0 }' "$a" || { echo "brb.sh split a row" >&2; return 1; }
+  n=$(wc -l < "$a")
+  (( n == IDXSRC_FILES )) || { echo "brb.sh printed $n row(s) for $IDXSRC_FILES file(s)" >&2; return 1; }
+  cmp -s "$a" "$p" || { echo "brb.sh does not print the escaped index as written" >&2; return 1; }
+  cmp -s "$b" "$p" || { echo "go brb does not print the escaped index as written" >&2; return 1; }
+}
+assert0 "both readers print the escaped index as written, one row per file" readers_print_escaped_index
 
 # ---------------------------------------------------------------------------
 head_s "4. par2 parity: verify, damage, repair"
@@ -543,15 +919,27 @@ assert0 "the on-disc README does not claim a UDF filesystem" readme_no_udf
 # ---------------------------------------------------------------------------
 head_s "7. reader behaviours: --only, KEEP_IMAGES, list, mount, doctor"
 # ---------------------------------------------------------------------------
+# The --only checks that expect an extraction compare the destination's whole
+# inventory, not just the presence of the requested path, because presence is
+# also what restoring the ENTIRE image gives. Every --only refusal (the index
+# lookup, the listing pre-check, the prefix rule) runs before extraction, so a
+# reader that lost the extraction operand would pass every one of them, then
+# write the whole disc over a destination the operator had confirmed for one
+# path, and a presence check would call that a pass. The inventory lists every
+# non-directory, so an extra symlink or fifo fails it as surely as a file.
+dest_inventory() { ( cd "$1" && find . ! -type d -printf '%P\n' ) | LC_ALL=C sort; }
 only_extracts() { # only_extracts sh|go
   local who=$1
-  local dest=$T/only-$who
+  local dest=$T/only-$who got
   rm -rf "$dest"; mkdir -p "$dest"
   case $who in
     sh) run_sh "$LOG/only-$who.log" "$T/cfg/go" restore "$dest" --only 'project/core/src/main.c' ;;
     go) run_go "$LOG/only-$who.log" "$T/cfg/go" restore "$dest" --only 'project/core/src/main.c' ;;
   esac || return 1
-  test -s "$dest/project/core/src/main.c"
+  test -s "$dest/project/core/src/main.c" || { echo "the requested path did not come back" >&2; return 1; }
+  got=$(dest_inventory "$dest")
+  [[ "$got" == 'project/core/src/main.c' ]] \
+    || { echo "--only extracted more than that path: $(_tail "$got")" >&2; return 1; }
 }
 assert0 "brb.sh --only extracts just that path" only_extracts sh
 assert0 "go brb --only extracts just that path" only_extracts go
@@ -588,27 +976,34 @@ assert0 "brb.sh --only <prefix-of-a-real-path> refuses and writes nothing" only_
 assert0 "go brb --only <prefix-of-a-real-path> refuses and writes nothing" only_prefix_refused go
 # ...and a whole-component directory match must still work, with or without a
 # trailing slash — the refusal above must not have overtightened into exact-file-only.
+# The expected inventory is the whole of project/core as build_src makes it:
+# a file added under project/core there has to be added here too.
 only_dir_extracts() { # only_dir_extracts sh|go SPELLING
   local who=$1 spelling=$2
-  local dest=$T/onlydir-$who
+  local dest=$T/onlydir-$who got
   rm -rf "$dest"; mkdir -p "$dest"
   case $who in
     sh) run_sh "$LOG/onlydir-$who.log" "$T/cfg/go" restore "$dest" --only "$spelling" ;;
     go) run_go "$LOG/onlydir-$who.log" "$T/cfg/go" restore "$dest" --only "$spelling" ;;
   esac || return 1
-  test -s "$dest/project/core/src/main.c"
+  test -s "$dest/project/core/src/main.c" || { echo "the requested directory did not come back" >&2; return 1; }
+  got=$(dest_inventory "$dest")
+  [[ "$got" == $'project/core/important.c\nproject/core/src/main.c' ]] \
+    || { echo "--only extracted other than exactly that directory: $(_tail "$got")" >&2; return 1; }
 }
 assert0 "brb.sh --only project/core extracts the directory"      only_dir_extracts sh 'project/core'
 assert0 "go brb --only project/core extracts the directory"      only_dir_extracts go 'project/core'
 # Both readers, both spellings: three quarters of that grid was asserted, and
 # the missing cell was the Go one — in the file whose whole premise is that the
 # two agree. A trailing slash has produced a Go-only divergence in this suite
-# before (the destination-symlink case in section 12), and the two implementations
-# reach unsquashfs by different routes: brb.sh strips the slash at parse time,
-# while the Go build's covers() strips it only for the index pre-check and hands
-# the operand on unchanged. If that ever stopped matching, the result would be a
-# run that selects the disc, extracts nothing and reports success — the exact
-# silent-empty-restore this section exists for.
+# before (the destination-symlink case in section 12). Both readers now fold the
+# spelling once, before the index is consulted — onlyPath in Restore on the Go
+# build, the --only arm in brb.sh — and hand unsquashfs the folded operand;
+# until they did, the Go build stripped slashes only for its pre-checks and
+# passed the operand on unchanged. Section 8a pins the other spellings. If the
+# two ever stopped matching, the result would be a run that selects the disc,
+# extracts nothing and reports success — the exact silent-empty-restore this
+# section exists for.
 assert0 "brb.sh --only project/core/ (trailing slash) works too" only_dir_extracts sh 'project/core/'
 assert0 "go brb --only project/core/ (trailing slash) works too" only_dir_extracts go 'project/core/'
 
@@ -617,10 +1012,11 @@ keep_images() { # keep_images sh|go WANT   (WANT=1 keep, 0 remove)
   local st=$T/keep-$who-$want dest=$T/outkeep-$who-$want cfg=$T/cfg/keep-$who-$want
   rm -rf "$st" "$dest"; mkdir -p "$dest"
   cp -a "$T/stage-go" "$st"; rm -rf "$st/restore"
-  # Each implementation is driven the way it actually exposes the option: the
-  # behaviour is what has to match, not the spelling. The Go build has no
-  # KEEP_IMAGES config key and REJECTS the file outright if it sees one, so its
-  # config must not carry it — that divergence is recorded on its own below.
+  # The behaviour is what has to match, not the spelling, so the two are driven
+  # by different ones: brb.sh by the config key, the Go build by its
+  # --keep-images flag. Both readers take the key from the file too, and
+  # go_reads_keep_images_from_config further down covers the Go build's half of
+  # that; this check keeps the flag covered as well.
   local -a extra=()
   case $who in
     sh) mkcfg "$cfg" "$st" "$SRC" "KEEP_IMAGES=$want"
@@ -650,11 +1046,12 @@ list_agrees() {
   [[ -s $b.raw ]] || { echo "go brb listed nothing" >&2; return 1; }
   grep -q 'big\.bin' "$a.raw" || { echo "brb.sh's listing does not mention big.bin" >&2; return 1; }
   grep -q 'big\.bin' "$b.raw" || { echo "go brb's listing does not mention big.bin" >&2; return 1; }
-  # The two tools' column padding differs and carries no information; the names
-  # and the order do, so only whitespace runs are normalised.
-  sed 's/  */ /g' "$a.raw" | sort > "$a"
-  sed 's/  */ /g' "$b.raw" | sort > "$b"
-  diff "$a" "$b" >&2
+  # Both readers hand `unsquashfs -ll` straight to a pipe (cmd_list in brb.sh,
+  # restore.List in Go), so the two listings must match byte for byte: order,
+  # and the whitespace inside names, included. This used to collapse runs of
+  # spaces and then sort both sides, citing padding that differed; it never
+  # did, and the sort discarded the very order it said carried information.
+  diff "$a.raw" "$b.raw" >&2
 }
 assert0 "brb.sh and go brb list a disc's contents identically" list_agrees
 
@@ -739,6 +1136,9 @@ if (( HAVE_FLOCK )); then
   # The assertion that matters is that the TARGET SURVIVES, not that the run
   # failed. A reader that truncated the file and then failed for some later
   # reason would satisfy an exit code with the operator's file already gone.
+  # Its CONTENT is compared, not its size: brb.sh opens the lock without
+  # truncating now and writes its pid once it holds it, so a link it followed
+  # would leave the target holding a pid — not empty, and still destroyed.
   symlinked_lock_refused() { # symlinked_lock_refused sh|go
     local who=$1 rc=0
     local st=$T/lock-link-$who victim=$T/lock-victim-$who lf=$LOG/locklink-$who.log
@@ -754,7 +1154,8 @@ if (( HAVE_FLOCK )); then
     (( rc != 0 )) || { echo "accepted a symlinked staging lock" >&2; return 1; }
     grep -qi 'symlink' "$lf" \
       || { echo "refused, but not for the link: $(_tail "$(cat "$lf")")" >&2; return 1; }
-    [[ -s "$victim" ]] || { echo "the link target was truncated to nothing" >&2; return 1; }
+    grep -Fqx "the operator file, which is none of this run's business" "$victim" \
+      || { echo "the link target was rewritten: '$(_tail "$(cat "$victim")")'" >&2; return 1; }
   }
   assert0 "brb.sh refuses a symlinked staging lock, and leaves its target whole" symlinked_lock_refused sh
   assert0 "go brb refuses a symlinked staging lock, and leaves its target whole" symlinked_lock_refused go
@@ -763,6 +1164,388 @@ else
   # flock(1) is util-linux, and a machine without it still has to be able to
   # restore. Both readers then run unguarded, so there is nothing to assert.
   skip "the staging lock (both readers)" "no flock(1) to stand in for a run in progress"
+fi
+
+# ---------------------------------------------------------------------------
+head_s "7a. brb mount (both readers): the mount point, and what mount(8) is handed"
+# ---------------------------------------------------------------------------
+# mount was the one reader command with no check in this file at all, because
+# a real mount needs root. Two things about it can be held to account without
+# one, and both are reader parity in the ordinary sense: given the same
+# arguments, the two must refuse the same paths, for the same reason, and hand
+# mount(8) the same list.
+#
+# First, a mount point that is itself a symlink. mount(8) run as root resolves
+# the path and mounts on the link's target, so a link left where root is about
+# to mount puts the image over whatever it names. Both readers refuse it, and
+# do so BEFORE their root check, which is what lets this run unprivileged. Every
+# spelling below is one the kernel resolves THROUGH the link unless the reader
+# strips it first; "link/." and "link/./" are the two that a strip of trailing
+# slashes alone lets past, so brb.sh would have mounted over the target where
+# Go refused. The staging tree is empty on purpose: a reader that lost the
+# guard and was run as root would stop at "no image for disc 1" rather than
+# mount anything, and the check would still fail on the missing refusal.
+mkdir -p "$T/mntlink/victim"
+ln -s victim "$T/mntlink/browse"
+mkdir -p "$T/mntlink-st"; chmod 700 "$T/mntlink-st"
+mkcfg "$T/cfg/mntlink" "$T/mntlink-st" "$SRC"
+symlinked_mount_point_refused() { # symlinked_mount_point_refused sh|go SPELLING
+  local who=$1 mp=$T/mntlink/browse$2 rc=0 n
+  local lf=$LOG/mntlink-$who.log
+  case $who in
+    sh) bash "$BRB_SH" --yes -c "$T/cfg/mntlink" mount 1 "$mp" > "$lf" 2>&1 || rc=$? ;;
+    go) "$BRB_GO" --yes --no-color -c "$T/cfg/mntlink" mount 1 "$mp" > "$lf" 2>&1 || rc=$? ;;
+  esac
+  (( rc != 0 )) || { echo "accepted a symlinked mount point" >&2; return 1; }
+  grep -qi 'is a symlink' "$lf" \
+    || { echo "refused, but not for the link: $(_tail "$(cat "$lf")")" >&2; return 1; }
+  n=$(find "$T/mntlink/victim" -mindepth 1 | wc -l)
+  (( n == 0 )) || { echo "wrote $n entr(ies) into the link's target" >&2; return 1; }
+}
+for sp in '' '/' '//' '/.' '/./'; do
+  assert0 "brb.sh refuses a symlinked mount point spelled 'browse$sp'" symlinked_mount_point_refused sh "$sp"
+  assert0 "go brb refuses a symlinked mount point spelled 'browse$sp'" symlinked_mount_point_refused go "$sp"
+done
+
+# The order of the refusals is parity too. cmd_mount checks the mount point,
+# then root, and only then touches staging; Go's Mount used to take the
+# staging lock first, which creates and secures STAGING. So under a STAGING
+# that was itself a link Go named the staging link and brb.sh the mount point,
+# and a STAGING that did not exist yet was created by Go for a run it went on
+# to refuse. Both must name the mount point under either, and leave no
+# staging tree behind.
+mkdir -p "$T/mntorder-real"; chmod 700 "$T/mntorder-real"
+ln -s mntorder-real "$T/mntorder-link"
+mkcfg "$T/cfg/mntorder-link" "$T/mntorder-link" "$SRC"
+mkcfg "$T/cfg/mntorder-fresh" "$T/mntorder-fresh" "$SRC"
+mount_point_refused_first() { # mount_point_refused_first sh|go
+  local who=$1 rc st n
+  local lf=$LOG/mntorder-$who.log
+  rm -rf -- "$T/mntorder-fresh"
+  for st in link fresh; do
+    rc=0
+    case $who in
+      sh) bash "$BRB_SH" --yes -c "$T/cfg/mntorder-$st" mount 1 "$T/mntlink/browse" > "$lf" 2>&1 || rc=$? ;;
+      go) "$BRB_GO" --yes --no-color -c "$T/cfg/mntorder-$st" mount 1 "$T/mntlink/browse" > "$lf" 2>&1 || rc=$? ;;
+    esac
+    (( rc != 0 )) || { echo "accepted a symlinked mount point (STAGING: $st)" >&2; return 1; }
+    grep -qiE 'mount point .* is a symlink' "$lf" \
+      || { echo "STAGING $st: refused, but not for the mount point: $(_tail "$(cat "$lf")")" >&2; return 1; }
+  done
+  [[ ! -e "$T/mntorder-fresh" ]] || { echo "created STAGING for a run it refused" >&2; return 1; }
+  n=$(find "$T/mntorder-real" -mindepth 1 | wc -l)
+  (( n == 0 )) || { echo "wrote $n entr(ies) through the staging link" >&2; return 1; }
+}
+assert0 "brb.sh refuses a symlinked mount point before it touches STAGING" mount_point_refused_first sh
+assert0 "go brb refuses a symlinked mount point before it touches STAGING" mount_point_refused_first go
+
+# A trailing newline is part of a mount point's name, and both readers keep
+# it. brb.sh's mp="$(dir_path ...)" dropped it, as $(...) drops every trailing
+# newline: "browse<newline>", which does not exist, was tested as "browse", the
+# link beside it, and refused where Go went on; and "browse/<newline>" came
+# back as "browse/", which [[ -L ]] answers through the link, so as root it was
+# mounted over the link's target. The first is the one that shows without
+# root, and both readers have to get past the symlink check with it and stop
+# at root — or, run as root, at the empty staging tree.
+newline_mount_point_kept() { # newline_mount_point_kept sh|go
+  local who=$1 mp=$T/mntlink/browse$'\n' rc=0 n
+  local lf=$LOG/mntnl-$who.log
+  case $who in
+    sh) bash "$BRB_SH" --yes -c "$T/cfg/mntlink" mount 1 "$mp" > "$lf" 2>&1 || rc=$? ;;
+    go) "$BRB_GO" --yes --no-color -c "$T/cfg/mntlink" mount 1 "$mp" > "$lf" 2>&1 || rc=$? ;;
+  esac
+  (( rc != 0 )) || { echo "exited 0 with no image to mount" >&2; return 1; }
+  if grep -qi 'is a symlink' "$lf"; then
+    echo "took 'browse<newline>' for the link 'browse': $(_tail "$(cat "$lf")")" >&2; return 1
+  fi
+  grep -qiE 'requires root|no image for disc 1' "$lf" \
+    || { echo "refused, but not at root or the missing image: $(_tail "$(cat "$lf")")" >&2; return 1; }
+  n=$(find "$T/mntlink/victim" -mindepth 1 | wc -l)
+  (( n == 0 )) || { echo "wrote $n entr(ies) into the link's target" >&2; return 1; }
+}
+assert0 "brb.sh keeps a mount point's trailing newline" newline_mount_point_kept sh
+assert0 "go brb keeps a mount point's trailing newline" newline_mount_point_kept go
+
+# Second, the mount itself, run for real as far as mount(8) and no further: a
+# stand-in mount first on PATH records its arguments and exits 0, and both
+# readers are run as uid 0 of a user namespace, which gets them past their root
+# checks without being root anywhere that matters (and a real mount(8) could
+# not mount on the host from in there anyway). The list must be exactly
+#
+#   -o loop,ro,nosuid,nodev -- <decrypted image> <mount point>
+#
+# nosuid,nodev because ro implies neither, and the format keeps setuid bits and
+# device nodes: a setuid-root binary from a backup of / acted on the host for
+# any account that could reach a mount made with loop,ro alone. "--" because
+# brb.sh used to leave it out and read a mount point with a leading dash as
+# options. The mount point is the one given with its trailing slashes gone,
+# byte for byte the same from both — Go's dirPath is brb.sh's dir_path, not
+# filepath.Clean.
+#
+# And the directories made on the way must be 0700 from both. brb.sh's mkdir -p
+# runs under the umask 077 its secure_staging sets; the Go build used to make
+# them 0755, which on a shared machine decides whether another account can
+# reach the decrypted tree at all. Run under umask 022, where the two modes
+# differ, or the check proves nothing.
+#
+# The decrypted image is compared by realpath: Go joins the staging path with
+# filepath.Join and brb.sh with a plain "/", so a TMPDIR with a trailing slash
+# spells the same file two ways, and that is not what is under test here.
+#
+# HAVE_USERNS is an optional gate like HAVE_SCRIPT and the rest: without root
+# or a user namespace this check skips and the suite still exits 0. So CI
+# checks for a working unshare -r by name before it runs this file, and turns
+# off the AppArmor policy that refuses it on Ubuntu's runners.
+HAVE_USERNS=0
+if (( EUID == 0 )) || unshare -r true >/dev/null 2>&1; then HAVE_USERNS=1; fi
+if (( HAVE_USERNS )); then
+  mkdir -p "$T/mntstub"
+  # Each argument on its own line, and nothing else: none of the arguments in
+  # this check holds a newline.
+  # shellcheck disable=SC2016  # the $-expressions are for the stand-in to expand
+  printf '%s\n' '#!/bin/sh' 'printf "%s\n" "$@" > "$BRB_MOUNT_ARGV"' > "$T/mntstub/mount"
+  chmod 755 "$T/mntstub/mount"
+  as_uid0() { # as_uid0 CMD...   -- uid 0, in a user namespace unless already root
+    if (( EUID == 0 )); then "$@"; else unshare -r "$@"; fi
+  }
+  mount_args_match() { # mount_args_match sh|go
+    local who=$1 rc=0 line d m
+    local st=$T/mntrun-st-$who base=$T/mntrun-$who lf=$LOG/mntrun-$who.log
+    local argv=$T/mntrun-argv-$who cfg=$T/cfg/mntrun-$who
+    local -a got=()
+    rm -rf "$st" "$base" "$argv"; mkdir -p "$st" "$base"; chmod 700 "$st"
+    cp -a "$T/stage-go/enc" "$st/enc"
+    mkcfg "$cfg" "$st" "$SRC"
+    case $who in
+      sh) ( umask 022; as_uid0 env PATH="$T/mntstub:$PATH" BRB_MOUNT_ARGV="$argv" \
+              bash "$BRB_SH" --yes -c "$cfg" mount 1 "$base/new/leaf//" ) > "$lf" 2>&1 || rc=$? ;;
+      go) ( umask 022; as_uid0 env PATH="$T/mntstub:$PATH" BRB_MOUNT_ARGV="$argv" \
+              "$BRB_GO" --yes --no-color -c "$cfg" mount 1 "$base/new/leaf//" ) > "$lf" 2>&1 || rc=$? ;;
+    esac
+    (( rc == 0 )) || { echo "mount exited $rc: $(_tail "$(cat "$lf")")" >&2; return 1; }
+    [[ -f "$argv" ]] || { echo "mount(8) was never run" >&2; return 1; }
+    while IFS= read -r line; do got+=("$line"); done < "$argv"
+    (( ${#got[@]} == 5 )) \
+      || { echo "mount(8) got ${#got[@]} argument(s): $(tr '\n' ' ' < "$argv")" >&2; return 1; }
+    [[ "${got[0]}" == -o && "${got[1]}" == loop,ro,nosuid,nodev && "${got[2]}" == -- ]] \
+      || { echo "mount(8) was given ${got[0]} ${got[1]} ${got[2]}, want -o loop,ro,nosuid,nodev --" >&2; return 1; }
+    [[ "$(realpath -- "${got[3]}")" == "$(realpath -- "$st/restore/disc01.squashfs")" ]] \
+      || { echo "mount(8) was handed ${got[3]} as the image" >&2; return 1; }
+    [[ "${got[4]}" == "$base/new/leaf" ]] \
+      || { echo "mount(8) was handed ${got[4]} as the mount point, want $base/new/leaf" >&2; return 1; }
+    for d in "$base/new" "$base/new/leaf"; do
+      m=$(stat -c %a -- "$d") || return 1
+      [[ "$m" == 700 ]] || { echo "$d was created $m, want 700" >&2; return 1; }
+    done
+  }
+  assert0 "brb.sh hands mount(8) -o loop,ro,nosuid,nodev -- IMAGE MOUNTPOINT, and makes it 0700" mount_args_match sh
+  assert0 "go brb hands mount(8) -o loop,ro,nosuid,nodev -- IMAGE MOUNTPOINT, and makes it 0700" mount_args_match go
+else
+  skip "what mount(8) is handed (both readers)" "not root, and unshare -r cannot make a user namespace here"
+  # Some hosts refuse unprivileged user namespaces (an AppArmor policy is the
+  # usual reason; CI turns it off, and fails rather than arrive here), and the
+  # options are the half of this that matters most, so they are at least read
+  # out of the script rather than left unchecked. This is weaker than running
+  # it — it pins the spelling of one line — and the Go half is pinned by
+  # TestMountHandsMountTheHardenedArguments either way.
+  mount_line_static() {
+    # shellcheck disable=SC2016  # $img and $mp are the script's text, matched literally
+    sed -n '/^cmd_mount() {/,/^}/p' "$BRB_SH" \
+      | grep -Eq '^[[:space:]]*mount -o loop,ro,nosuid,nodev -- "\$img" "\$mp"'
+  }
+  assert0 "brb.sh's cmd_mount passes -o loop,ro,nosuid,nodev -- (read from the script, not run)" mount_line_static
+fi
+
+# ---------------------------------------------------------------------------
+head_s "7b. configuration loading, the same on both readers"
+# ---------------------------------------------------------------------------
+# Section 7 asserts what the two readers do once they are running; this
+# asserts what they start FROM. They read one config file and one environment,
+# and every check here is a case where they used to come away with different
+# settings — the quiet kind of difference, because each reader on its own
+# looks perfectly sane. Each was found by running both on the same input.
+#
+# The refusal checks export STAGING into an empty scratch directory, so a
+# reader that regressed into running on its defaults fails there rather than
+# going on to touch the machine's own /var/tmp/brb. The list checks cannot:
+# finding the reference set's staging tree through the config or the
+# environment under test is their point, so they take STAGING from there, and
+# a reader that fell back onto its defaults in one of them runs `list 1`
+# against /var/tmp/brb — creating enc/, restore/ and the lock there if they
+# are missing — before it fails for want of an image. The defaults check runs
+# only doctor, which writes nothing to staging. Runs start in an empty working
+# directory, so nothing relative can be found by accident, and under a
+# timeout, because one of these used to be a hang.
+CL=$T/cfgload
+mkdir -p "$CL/cwd" "$CL/home/.config/brb" "$CL/stage" "$CL/cfgdir"
+cp "$ID" "$CL/home/.config/brb/identity.txt"
+mkfifo "$CL/fifo"
+ln -s "$T/cfg/go" "$CL/link-to-cfg"
+cfgload_n=0
+# The readers are run from $CL/cwd, so a relative path given on the command
+# line has to be made absolute first.
+cfgload_abs() { case $1 in /*) printf '%s' "$1" ;; *) printf '%s/%s' "$PWD" "$1" ;; esac; }
+CL_SH=$(cfgload_abs "$BRB_SH")
+CL_GO=$(cfgload_abs "$BRB_GO")
+
+# cfgload_run sh|go LOGFILE [VAR=value ...] -- ARGS...
+cfgload_run() {
+  local who=$1 lf=$2 rc=0; shift 2
+  local -a envs=()
+  while (( $# )) && [[ $1 != -- ]]; do envs+=("$1"); shift; done
+  shift
+  case $who in
+    sh) ( cd "$CL/cwd" && env ${envs[@]+"${envs[@]}"} timeout -k 5 60 bash "$CL_SH" --yes "$@" ) > "$lf" 2>&1 || rc=$? ;;
+    go) ( cd "$CL/cwd" && env ${envs[@]+"${envs[@]}"} timeout -k 5 60 "$CL_GO" --yes --no-color "$@" ) > "$lf" 2>&1 || rc=$? ;;
+  esac
+  return $rc
+}
+cfgload_name() { case $1 in sh) printf 'brb.sh' ;; go) printf 'go brb' ;; esac; }
+
+# cfgload_refused sh|go WANT [VAR=value ...] -- ARGS...  — the reader refuses,
+# and says WANT. The words are checked, not just the exit: a reader that ran
+# on its defaults and then failed for some other reason exits non-zero too.
+cfgload_refused() {
+  local who=$1 want=$2 lf; shift 2
+  cfgload_n=$((cfgload_n+1)); lf=$LOG/cfgload-$cfgload_n-$who.log
+  if cfgload_run "$who" "$lf" STAGING="$CL/stage" "$@"; then
+    echo "exited 0: $(_tail "$(cat "$lf")")" >&2; return 1
+  fi
+  grep -qF -- "$want" "$lf" \
+    || { echo "refused, but not with '$want': $(_tail "$(cat "$lf")")" >&2; return 1; }
+}
+
+# cfgload_lists sh|go [VAR=value ...] -- ARGS...  — the reader lists disc 1 of
+# the reference set, which only works if it found that set's staging tree
+# and its identity.
+cfgload_lists() {
+  local who=$1 lf; shift
+  cfgload_n=$((cfgload_n+1)); lf=$LOG/cfgload-$cfgload_n-$who.log
+  cfgload_run "$who" "$lf" "$@" \
+    || { echo "exit non-zero: $(_tail "$(cat "$lf")")" >&2; return 1; }
+  grep -q 'big\.bin' "$lf" \
+    || { echo "the listing does not mention big.bin: $(_tail "$(cat "$lf")")" >&2; return 1; }
+}
+
+# cfgload_defaults_shown sh|go — doctor, on a config whose STAGING= and BURNER=
+# lines are empty, reports the built-in defaults for both. Exit status is not
+# asserted: doctor's verdict depends on what else this machine has.
+cfgload_defaults_shown() {
+  local who=$1 lf
+  cfgload_n=$((cfgload_n+1)); lf=$LOG/cfgload-$cfgload_n-$who.log
+  cfgload_run "$who" "$lf" HOME="$CL/home" -- -c "$CL/empty.cfg" doctor || true
+  grep -qE 'staging +/var/tmp/brb$' "$lf" \
+    || { echo "staging is not the default: $(grep -m1 'staging  ' "$lf")" >&2; return 1; }
+  grep -qE 'burner +/dev/sr0( |$)' "$lf" \
+    || { echo "burner is not the default: $(grep -m1 'burner  ' "$lf")" >&2; return 1; }
+}
+printf 'STAGING=\nBURNER=\nAGE_RECIPIENTS_FILE=\nAGE_IDENTITY=\n' > "$CL/empty.cfg"
+printf 'STAGING="%s"\nAGE_RECIPIENTS_FILE=\nAGE_IDENTITY=\n' "$T/stage-go" > "$CL/empty-id.cfg"
+
+for who in sh go; do
+  name=$(cfgload_name "$who")
+  # A config that is not a regular file. brb.sh's load_config tested -f, so it
+  # said "not found" under -c and "no config file" under BRB_CONFIG — and ran
+  # on its defaults — while the Go build read /dev/null, a device or a pipe as
+  # a config, and blocked in read(2) on a FIFO, past the first Ctrl-C. Both
+  # now refuse, in the same words.
+  assert0 "$name refuses -c /dev/null as not a regular file" \
+    cfgload_refused "$who" "is not a regular file" -- -c /dev/null doctor
+  assert0 "$name refuses a FIFO named by -c at once, without reading it" \
+    cfgload_refused "$who" "is not a regular file" -- -c "$CL/fifo" doctor
+  assert0 "$name refuses BRB_CONFIG=/dev/null rather than using its defaults" \
+    cfgload_refused "$who" "is not a regular file" BRB_CONFIG=/dev/null -- doctor
+  assert0 "$name refuses a directory named by BRB_CONFIG" \
+    cfgload_refused "$who" "is a directory" BRB_CONFIG="$CL/cfgdir" -- doctor
+  # The companion that keeps the refusals honest: a symlink to a real config
+  # is a config to both, since -f and os.Stat both follow it.
+  assert0 "$name reads a config through a symlink to it" \
+    cfgload_lists "$who" -- -c "$CL/link-to-cfg" list 1
+
+  # KEY= with nothing after it means "not set" to the Go build, which keeps the
+  # default; brb.sh applied its defaults before sourcing the file, so the same
+  # line overwrote them with nothing — an empty staging directory, no burner,
+  # and an identity looked for in the working directory instead of beside
+  # ~/.config/brb/recipients.txt. load_config applies them again afterwards.
+  assert0 "$name keeps the default STAGING and BURNER for empty STAGING= and BURNER= lines" \
+    cfgload_defaults_shown "$who"
+  assert0 "$name finds the identity beside the default recipients file when the config empties both keys" \
+    cfgload_lists "$who" HOME="$CL/home" -- -c "$CL/empty-id.cfg" list 1
+
+  # A literal ~ or $HOME in an exported value — a systemd Environment= line,
+  # an env file — was expanded by the Go build and taken as written by brb.sh,
+  # so STAGING='~/stage-go' was two different directories. HOME is pointed at
+  # $T so that the expansion lands on the reference set's staging tree, and
+  # the working directory is empty, so the literal reading finds nothing.
+  # shellcheck disable=SC2016,SC2088  # the markers are meant literally: that is the case under test
+  for spelling in '$HOME/stage-go' '${HOME}/stage-go' '~/stage-go'; do
+    assert0 "$name expands an exported STAGING=$spelling written literally" \
+      cfgload_lists "$who" HOME="$T" STAGING="$spelling" -- -c "$T/cfg/go" list 1
+  done
+done
+
+if (( HAVE_FLOCK )); then
+  # The staging lock's pid. LockStaging writes its pid into .brb.lock and a
+  # refused Go run reads it back to name the holder. brb.sh opened the file
+  # with `>`, which truncates BEFORE flock says whether the lock is free, so a
+  # brb.sh that was about to be refused had already erased a running Go
+  # backup's pid. It opens with `<>` now and writes its own pid only once the
+  # lock is its own. The holder here is flock(1) over a file that already
+  # names pid 424242, opened without truncating it.
+  cfgload_pid_kept() {
+    local st=$CL/lock cfg=$CL/lock.cfg lsh=$LOG/cfgload-lock-sh.log lgo=$LOG/cfgload-lock-go.log
+    local holder held ran=0
+    mkdir -p "$st"; chmod 700 "$st"
+    mkcfg "$cfg" "$st" "$SRC"
+    printf '424242\n' > "$st/.brb.lock"
+    printf 'held\n' > "$CL/lock-held"
+    # stdout closed for the reason section 7's stand-in gives.
+    ( flock -x 9 || exit 1
+      while [[ -e "$CL/lock-held" ]]; do sleep 0.05; done ) 9<>"$st/.brb.lock" >/dev/null 2>&1 &
+    holder=$!
+    for _ in $(seq 1 200); do
+      flock -n -x "$st/.brb.lock" -c true 2>/dev/null || break
+      sleep 0.05
+    done
+    if flock -n -x "$st/.brb.lock" -c true 2>/dev/null; then
+      rm -f "$CL/lock-held"; wait "$holder" 2>/dev/null
+      echo "the stand-in never took the lock; the check would prove nothing" >&2; return 1
+    fi
+    bash "$BRB_SH" --yes -c "$cfg" index > "$lsh" 2>&1 && ran=1
+    held=$(cat "$st/.brb.lock")
+    "$BRB_GO" --yes --no-color -c "$cfg" index > "$lgo" 2>&1 && ran=1
+    rm -f "$CL/lock-held"; wait "$holder" 2>/dev/null
+    (( ran == 0 )) || { echo "a reader ran in a staging directory another brb holds" >&2; return 1; }
+    grep -qi 'another brb is using' "$lsh" \
+      || { echo "brb.sh refused, but not for the lock: $(_tail "$(cat "$lsh")")" >&2; return 1; }
+    [[ $held == 424242 ]] \
+      || { echo "brb.sh's refused attempt left the lock holding '$held', not the holder's pid" >&2; return 1; }
+    if ! grep -qF 'another brb is using' "$lgo" || ! grep -qF '(pid 424242)' "$lgo"; then
+      echo "go brb's refusal does not name the holder: $(_tail "$(cat "$lgo")")" >&2; return 1
+    fi
+  }
+  assert0 "a refused brb.sh leaves the holder's pid in the lock, and go brb names it" cfgload_pid_kept
+
+  # And once brb.sh does hold the lock, a pid left by a run that has ended is
+  # replaced with its own, as LockStaging does, so a Go contender names the
+  # run that is really there. index fails afterwards — there is no index in
+  # this staging tree — but the lock is taken before that.
+  cfgload_pid_replaced() {
+    local st=$CL/lock2 cfg=$CL/lock2.cfg lf=$LOG/cfgload-lock2-sh.log v
+    mkdir -p "$st"; chmod 700 "$st"
+    mkcfg "$cfg" "$st" "$SRC"
+    printf '424242\n' > "$st/.brb.lock"
+    bash "$BRB_SH" --yes -c "$cfg" index > "$lf" 2>&1
+    if grep -qi 'another brb is using' "$lf"; then
+      echo "refused a lock nobody holds: $(_tail "$(cat "$lf")")" >&2; return 1
+    fi
+    v=$(cat "$st/.brb.lock")
+    [[ $v =~ ^[1-9][0-9]*$ && $v != 424242 ]] \
+      || { echo "the lock holds '$v' after brb.sh held it; want that run's pid" >&2; return 1; }
+  }
+  assert0 "brb.sh replaces a stale pid in the lock with its own once it holds it" cfgload_pid_replaced
+else
+  skip "the staging lock's pid (both readers)" "no flock(1) to stand in for a run in progress"
 fi
 
 # ---------------------------------------------------------------------------
@@ -813,6 +1596,634 @@ if (( n_m >= 2 )); then
   assert0 "brb.sh announces that it is restoring an incomplete set" partial_announced sh
   assert0 "go brb announces that it is restoring an incomplete set" partial_announced go
 fi
+
+# ---------------------------------------------------------------------------
+head_s "8a. brb.sh restore, index and --only: the paths the rescue reader takes alone"
+# ---------------------------------------------------------------------------
+# Every case here is one where brb.sh did something the Go reader does not —
+# bar the --only spellings, where each reader was wrong about a different one —
+# on a path the sections above walk past: which staged images a whole-set
+# restore picks and counts, and what it reads as a disc number, what the last
+# line of a partial restore says, how --only is spelled, what happens when the
+# index is absent, rotted, contradicted by its own hash or holding rows that do
+# not parse, what a listing that is long or that fails does to --only, what a
+# long non-fatal unsquashfs log does to the run, what --disc does alongside
+# --only, which image --only narrows to, and what 'index' takes its pattern to
+# mean. Each is asserted on both readers wherever the Go reader has the same
+# command, because the claim being tested is that they agree. The fixtures live
+# under $T/rsc, and every name this section defines starts rsc_ or RSC_, so
+# nothing here can collide with the sections around it.
+#
+# Three cases put a wrapper in front of a real tool on PATH, because the
+# conditions they test — a listing that fails, an extraction that finishes with
+# a long non-fatal log, and a hash that cannot be taken — are not ones a
+# well-formed set produces on demand. The wrappers change nothing else: every
+# call they do not target is handed straight to the real tool.
+RSC=$T/rsc
+mkdir -p "$RSC"
+RSC_REAL_UNSQ=$(command -v unsquashfs)
+
+# rsc_run sh|go LOGFILE CFG args... — one reader, everything it prints in
+# LOGFILE, its exit status left for the caller to judge. A caller that puts a
+# wrapper in front of unsquashfs says so with a local RSC_PATH, which this hands
+# to the reader alone, so the suite's own PATH is never touched.
+rsc_run() {
+  local who=$1 lf=$2 cfg=$3; shift 3
+  case $who in
+    sh) env PATH="${RSC_PATH:-$PATH}" bash "$BRB_SH" --yes -c "$cfg" "$@" > "$lf" 2>&1 ;;
+    go) env PATH="${RSC_PATH:-$PATH}" "$BRB_GO" --yes --no-color -c "$cfg" "$@" > "$lf" 2>&1 ;;
+  esac
+}
+rsc_name() { case $1 in sh) echo "brb.sh" ;; go) echo "go brb" ;; esac; }
+# rsc_copy FROM NAME SOURCE [extra config...] — a private staging tree holding
+# FROM's encrypted images and manifest, which is all a restore reads, and a
+# config for it at $RSC/NAME.cfg. Nothing else is copied: the disc directories
+# a backup leaves beside them would double the cost of every copy here.
+rsc_copy() {
+  local from=$1 name=$2 src=$3; shift 3
+  local st=$RSC/$name
+  rm -rf "$st"; mkdir -p "$st" || return 1
+  cp -a "$from/enc" "$st/enc" || return 1
+  if [[ -f "$from/MANIFEST.txt" ]]; then cp -a "$from/MANIFEST.txt" "$st/" || return 1; fi
+  mkcfg "$RSC/$name.cfg" "$st" "$src" "$@"
+}
+# rsc_rot FILE — zero the last 16 bytes, which are the authentication tag of the
+# last age chunk, so the file still looks like age and no longer decrypts. The
+# chance that the tag was all zeros already is not worth a thought.
+rsc_rot() {
+  local f=$1 sz
+  sz=$(wc -c < "$f")
+  { head -c $(( sz - 16 )) "$f"; head -c 16 /dev/zero; } > "$f.rot" && mv -f "$f.rot" "$f"
+}
+
+# ---- which images a whole-set restore picks, and how many it counts --------
+# A whole-set restore used to take every name matching disc*.squashfs.age. A
+# forged image named discx.squashfs.age — no disc number in it at all — was
+# therefore picked, its index cross-check "degraded" because the name did not
+# say which disc it was, and its tree extracted into the destination with
+# nothing asked: a forger holding one disc needed only that name, the set's
+# public key and the genuine index copied across. The Go reader picks only
+# names with a disc number in them, and so now does brb.sh. The foreign image
+# here is the reference set's disc 1, which decrypts with the same identity, so
+# nothing but its name can keep it out.
+rsc_unnumbered_fixture() {
+  rsc_copy "$T/m-go" unnumbered "$T/m-src" 'DISC_CAPACITY_BYTES=40000000' 'RESERVE_BYTES=12000000' || return 1
+  cp -a "$T/stage-go/enc/disc01.squashfs.age" "$RSC/unnumbered/enc/discx.squashfs.age"
+}
+rsc_unnumbered_ignored() { # rsc_unnumbered_ignored sh|go
+  local who=$1 dest=$RSC/out-unnumbered-$1 rc=0
+  rm -rf "$dest" "$RSC/unnumbered/restore"; mkdir -p "$dest"
+  rsc_run "$who" "$LOG/rsc-unnumbered-$who.log" "$RSC/unnumbered.cfg" restore "$dest" || rc=$?
+  (( rc == 0 )) || { echo "exited $rc: $(_tail "$(cat "$LOG/rsc-unnumbered-$who.log")")" >&2; return 1; }
+  if [[ -e "$dest/big.bin" || -e "$dest/project" ]]; then
+    echo "the image staged as discx.squashfs.age was extracted into the destination" >&2; return 1
+  fi
+  diff -r --no-dereference "$T/m-src" "$dest" >&2
+}
+
+# The completeness count had the same hole from the other side: it counted
+# names, so disc001 beside disc01, a disc03 in a two-disc set, a discx, or even
+# a directory with an image's name made a set missing its disc 2 read "all 2
+# disc image(s) present" — and the warning, and the prompt before a partial
+# restore, never came. The Go reader counts distinct disc numbers in range.
+# Asserted through brb.sh's doctor, as section 18 asserts the manifest's own
+# number: the Go build's doctor is a writer's, and its count is pinned by
+# TestCheckComplete. A trailing slash on a name here stages a directory.
+#
+# Every case also requires that doctor printed none of bash's own arithmetic
+# errors, which all carry "error token": that is what a name or a manifest
+# field that slipped past a digit test used to produce, while the count came
+# out right only because the arithmetic failing happened to mean "skip it".
+rsc_doctor_says() { # rsc_doctor_says CLAIMED EXPECTED-RX NAME...
+  local claimed=$1 rx=$2 st=$RSC/doc out f; shift 2
+  rm -rf "$st"; mkdir -p "$st/enc"
+  for f in "$@"; do
+    case $f in
+      */) mkdir -p "$st/enc/${f%/}" ;;
+      *)  : > "$st/enc/$f" ;;
+    esac
+  done
+  printf 'discs           : %s\n' "$claimed" > "$st/MANIFEST.txt"
+  mkcfg "$T/cfg/rsc-doc" "$st" "$SRC"
+  out=$(LC_ALL=${RSC_DOC_LC:-${LC_ALL:-}} bash "$BRB_SH" --yes -c "$T/cfg/rsc-doc" doctor 2>&1) || true
+  grep -qE "$rx" <<<"$out" || { grep -E 'MANIFEST|present' <<<"$out" >&2; return 1; }
+  ! grep -q 'error token' <<<"$out" || { grep 'error token' <<<"$out" >&2; return 1; }
+}
+# rsc_doctor_says_in LOCALE CLAIMED EXPECTED-RX NAME... — the same, with doctor
+# run under LOCALE.
+rsc_doctor_says_in() { local RSC_DOC_LC=$1; shift; rsc_doctor_says "$@"; }
+
+if (( n_m >= 2 )); then
+  assert0 "fixture: the multi-disc set with another set's image staged beside it as discx.squashfs.age" \
+    rsc_unnumbered_fixture
+  for who in sh go; do
+    assert0 "$(rsc_name "$who") restores the set and never picks the image whose name carries no disc number" \
+      rsc_unnumbered_ignored "$who"
+  done
+fi
+assert0 "brb.sh counts disc001 beside disc01 as one disc, and names disc 2 missing" \
+  rsc_doctor_says 2 '2 present\. MISSING: 2$' disc01.squashfs.age disc001.squashfs.age
+assert0 "  ... does not count a disc03 towards a two-disc set" \
+  rsc_doctor_says 2 '2 present\. MISSING: 2$' disc01.squashfs.age disc03.squashfs.age
+assert0 "  ... does not count a name with no disc number at all" \
+  rsc_doctor_says 2 '1 present\. MISSING: 2$' disc01.squashfs.age discx.squashfs.age
+assert0 "  ... does not count a directory that has an image's name" \
+  rsc_doctor_says 2 '1 present\. MISSING: 2$' disc01.squashfs.age disc02.squashfs.age/
+assert0 "  ... and counts nothing at all when nothing staged is numbered" \
+  rsc_doctor_says 2 '0 present\. MISSING: 1 2$' discx.squashfs.age
+assert0 "  ... while a disc staged as disc002 still counts as disc 2" \
+  rsc_doctor_says 2 'all 2 disc image\(s\) present' disc01.squashfs.age disc002.squashfs.age
+# A disc number is read the way strconv.Atoi reads it, never through bash
+# arithmetic, which wraps at 2^64: disc18446744073709551618 used to be disc 2.
+assert0 "  ... and does not take disc18446744073709551618 for disc 2, as arithmetic wrapping at 2^64 did" \
+  rsc_doctor_says 2 '1 present\. MISSING: 2$' disc01.squashfs.age disc18446744073709551618.squashfs.age
+# And as ASCII digits only. Under a UTF-8 locale bash's [0-9] also takes other
+# scripts' digits (see disc_number_of in brb.sh), so a fullwidth 2 in a name
+# reached arithmetic as a "number", and an Arabic-Indic 3 as the manifest's
+# disc count ended doctor — and a restore — on a bash syntax error, where Atoi
+# refuses both and the Go reader carries on.
+if (( HAVE_UTF8_LOCALE )); then
+  assert0 "  ... and under LC_ALL=$UTF8_LOCALE does not read a fullwidth 2 in a name as a disc number" \
+    rsc_doctor_says_in "$UTF8_LOCALE" 2 '1 present\. MISSING: 2$' \
+      disc01.squashfs.age "$(printf 'disc\357\274\222.squashfs.age')"
+  assert0 "  ... nor a manifest's disc count written in Arabic-Indic digits, which it cannot tell" \
+    rsc_doctor_says_in "$UTF8_LOCALE" "$(printf '\331\243')" 'cannot tell how many discs' disc01.squashfs.age
+else
+  skip "brb.sh's disc numbers under a UTF-8 locale" "no en_US.UTF-8 locale on this machine"
+fi
+
+# ---- the last line of a partial restore -------------------------------------
+# Every disc carries the whole directory skeleton, so a partial restore leaves a
+# tree with the right shape and files silently absent, and the MISSING warning
+# it opened with has scrolled away by the end of a multi-disc run. brb.sh ended
+# a partial restore on the same "ok restore complete" a complete one ends on;
+# the Go reader closes it with three PARTIAL warnings and "partial restore
+# complete". Section 8 already ran both readers over a set missing its last
+# disc, so its logs are read here, beside the complete restore's.
+rsc_partial_closing() { # rsc_partial_closing LOGFILE
+  grep -q 'this restore was PARTIAL' "$1" || { echo "no PARTIAL warning at the end" >&2; return 1; }
+  grep -q 'partial restore complete: ' "$1" || { echo "no 'partial restore complete' line" >&2; return 1; }
+  ! grep -q 'ok restore complete: ' "$1" || { echo "ended on the line a complete restore ends on" >&2; return 1; }
+}
+rsc_complete_closing() { # rsc_complete_closing LOGFILE
+  grep -q 'ok restore complete: ' "$1" || { echo "no 'restore complete' line" >&2; return 1; }
+  ! grep -q 'PARTIAL' "$1" || { echo "a complete restore was called PARTIAL" >&2; return 1; }
+}
+# And the two holes together: a set missing its last disc, with disc 1 staged a
+# second time as disc001. The name count saw a complete set; the number count
+# sees disc $n_m missing, and the last line has to say so.
+rsc_dup_fixture() {
+  rsc_copy "$T/m-go" dup "$T/m-src" 'DISC_CAPACITY_BYTES=40000000' 'RESERVE_BYTES=12000000' || return 1
+  local last; last=$(printf 'disc%02d' "$n_m")
+  [[ -e "$RSC/dup/enc/$last.squashfs.age" ]] || { echo "fixture: $last is not in staging to remove" >&2; return 1; }
+  rm -f "$RSC/dup/enc/$last".*
+  cp -a "$RSC/dup/enc/disc01.squashfs.age" "$RSC/dup/enc/disc001.squashfs.age"
+}
+rsc_dup_announced() { # rsc_dup_announced sh|go
+  local who=$1 dest=$RSC/out-dup-$1 lf=$LOG/rsc-dup-$1.log rc=0
+  rm -rf "$dest" "$RSC/dup/restore"; mkdir -p "$dest"
+  rsc_run "$who" "$lf" "$RSC/dup.cfg" restore "$dest" || rc=$?
+  (( rc == 0 )) || { echo "exited $rc: $(_tail "$(cat "$lf")")" >&2; return 1; }
+  grep -q "MISSING: $n_m\$" "$lf" || { echo "disc $n_m was not named missing: $(grep -E 'MANIFEST|present' "$lf")" >&2; return 1; }
+  rsc_partial_closing "$lf"
+}
+if (( n_m >= 2 )); then
+  for who in sh go; do
+    assert0 "$(rsc_name "$who") ends a partial restore on 'partial restore complete', not the clean line" \
+      rsc_partial_closing "$LOG/part-$who.log"
+  done
+  assert0 "brb.sh still ends a complete restore on the clean line" rsc_complete_closing "$LOG/restore-m-sh.log"
+  assert0 "fixture: the multi-disc set missing disc $n_m, with disc 1 staged twice" rsc_dup_fixture
+  for who in sh go; do
+    assert0 "$(rsc_name "$who") counts disc 1 staged twice as one disc, names disc $n_m missing, and ends PARTIAL" \
+      rsc_dup_announced "$who"
+  done
+fi
+
+# ---- how --only is spelled --------------------------------------------------
+# Both readers drop every leading '/' and './' and every trailing '/'. They did
+# not agree before: brb.sh stripped one trailing slash and one leading './' and
+# never a leading slash, the Go reader trimmed every slash and never './' — so
+# './x' restored on one and failed on the other, and '/x' and 'x//' did the
+# reverse. A spelling with nothing left names the whole tree and is refused by
+# both, where brb.sh used to send it to the index to be "not found".
+rsc_spelling_restores() { # rsc_spelling_restores sh|go SPELLING
+  local who=$1 sp=$2 dest=$RSC/out-spell-$1 lf=$LOG/rsc-spell-$1.log rc=0
+  rm -rf "$dest" "$T/stage-go/restore"; mkdir -p "$dest"
+  rsc_run "$who" "$lf" "$T/cfg/go" restore "$dest" --only "$sp" || rc=$?
+  (( rc == 0 )) || { echo "exited $rc: $(_tail "$(cat "$lf")")" >&2; return 1; }
+  test -s "$dest/project/core/src/main.c" || { echo "project/core/src/main.c was not restored" >&2; return 1; }
+  [[ ! -e "$dest/big.bin" ]] || { echo "big.bin was restored too" >&2; return 1; }
+}
+rsc_root_refused() { # rsc_root_refused sh|go SPELLING
+  local who=$1 sp=$2 dest=$RSC/out-root-$1 lf=$LOG/rsc-root-$1.log rc=0 n
+  rm -rf "$dest"; mkdir -p "$dest"
+  rsc_run "$who" "$lf" "$T/cfg/go" restore "$dest" --only "$sp" || rc=$?
+  (( rc != 0 )) || { echo "exited 0" >&2; return 1; }
+  grep -q 'whole tree' "$lf" || { echo "refused, but not as the whole tree: $(_tail "$(cat "$lf")")" >&2; return 1; }
+  n=$(find "$dest" -type f | wc -l)
+  (( n == 0 )) || { echo "wrote $n file(s)" >&2; return 1; }
+}
+for who in sh go; do
+  for sp in './project/core/src/main.c' '/project/core/src/main.c' 'project/core//' './project/core/'; do
+    assert0 "$(rsc_name "$who") --only '$sp' restores project/core/src/main.c" rsc_spelling_restores "$who" "$sp"
+  done
+  for sp in '.' './' '/'; do
+    assert0 "$(rsc_name "$who") --only '$sp' is refused as the whole tree" rsc_root_refused "$who" "$sp"
+  done
+done
+unset sp
+
+# ---- the index: absent, rotted, or contradicted by its own hash -------------
+# The Go reader checks index.tsv.gz.age against index.tsv.gz.age.sha512 before
+# reading it; brb.sh never looked at that sidecar. And where the Go reader
+# warns and searches every image when the index is absent or will not read,
+# brb.sh refused: "--only needs the encrypted index", or — when one was there
+# and would not decrypt — "is not in the index", for a path the index had never
+# been able to answer for. 'index' turned the same unreadable index into "no
+# match". Three private copies of the reference set: one whose sidecar records
+# the wrong hash, one with no index at all, and one whose index has rotted and
+# whose sidecar is gone, so that age is the one to notice.
+rsc_index_fixtures() {
+  local f
+  rsc_copy "$T/stage-go" badsum "$SRC" || return 1
+  printf '%s  index.tsv.gz.age\n' "$(sha512sum < /dev/null | cut -d' ' -f1)" > "$RSC/badsum/enc/index.tsv.gz.age.sha512"
+  rsc_copy "$T/stage-go" noidx "$SRC" || return 1
+  rm -f "$RSC/noidx/enc/index.tsv.gz.age" "$RSC/noidx/enc/index.tsv.gz.age.sha512"
+  rsc_copy "$T/stage-go" rotidx "$SRC" || return 1
+  f=$RSC/rotidx/enc/index.tsv.gz.age
+  rm -f "$f.sha512"
+  rsc_rot "$f" || return 1
+  ! age -d -i "$ID" "$f" > /dev/null 2>&1 || { echo "fixture: the rotted index still decrypts" >&2; return 1; }
+}
+rsc_index_refused() { # rsc_index_refused sh|go NAME EXPECTED-RX
+  local who=$1 name=$2 rx=$3 lf=$LOG/rsc-index-$2-$1.log rc=0
+  rsc_run "$who" "$lf" "$RSC/$name.cfg" index lib || rc=$?
+  (( rc != 0 )) || { echo "printed the index as though nothing were wrong" >&2; return 1; }
+  ! grep -q 'no match' "$lf" || { echo "called an index it could not trust a search with no match" >&2; return 1; }
+  grep -qE "$rx" "$lf" || { echo "refused, but not for the index: $(_tail "$(cat "$lf")")" >&2; return 1; }
+}
+rsc_only_falls_back() { # rsc_only_falls_back sh|go NAME EXPECTED-RX
+  local who=$1 name=$2 rx=$3 dest=$RSC/out-$2-$1 lf=$LOG/rsc-only-$2-$1.log rc=0
+  rm -rf "$dest" "$RSC/$name/restore"; mkdir -p "$dest"
+  rsc_run "$who" "$lf" "$RSC/$name.cfg" restore "$dest" --only lib/a.c || rc=$?
+  (( rc == 0 )) || { echo "exited $rc: $(_tail "$(cat "$lf")")" >&2; return 1; }
+  cmp -s "$SRC/lib/a.c" "$dest/lib/a.c" || { echo "lib/a.c was not restored" >&2; return 1; }
+  grep -qE "$rx" "$lf" || { echo "searched every image without saying why" >&2; return 1; }
+}
+assert0 "fixture: the reference set with a wrong index hash, with no index, and with a rotted one" rsc_index_fixtures
+for who in sh go; do
+  name=$(rsc_name "$who")
+  assert0 "$name index refuses an index that does not match its recorded hash" \
+    rsc_index_refused "$who" badsum 'index\.tsv\.gz\.age does not match the hash in index\.tsv\.gz\.age\.sha512'
+  assert0 "$name restore --only searches every image when the index fails its hash, and restores" \
+    rsc_only_falls_back "$who" badsum 'could not be read'
+  assert0 "$name restore --only searches every image when there is no index, and restores" \
+    rsc_only_falls_back "$who" noidx 'no index\.tsv\.gz\.age in '
+  assert0 "$name restore --only searches every image when the index will not decrypt, and restores" \
+    rsc_only_falls_back "$who" rotidx 'could not be read'
+  assert0 "$name index says a rotted index could not be read, never 'no match'" \
+    rsc_index_refused "$who" rotidx 'repair it from parity'
+done
+unset name
+
+# A whole-set restore takes an index that fails its hash the same way, as an
+# index that will not read: each image is extracted with the cross-check
+# DEGRADED, and says so, rather than compared against rows nothing vouches for.
+# That is the Go reader's crossCheckRows, and its price is in README's
+# Limitations — ingest does not pin index.tsv.gz.age.sha512, so a later disc can
+# put a junk one in its place and switch the check off for the whole set. The
+# case holds the two readers to one answer, so that closing that gap, or opening
+# another, cannot happen on one side alone.
+rsc_badsum_degrades() { # rsc_badsum_degrades sh|go
+  local who=$1 dest=$RSC/out-badsum-all-$1 lf=$LOG/rsc-badsum-all-$1.log rc=0
+  rm -rf "$dest" "$RSC/badsum/restore"; mkdir -p "$dest"
+  rsc_run "$who" "$lf" "$RSC/badsum.cfg" restore "$dest" || rc=$?
+  (( rc == 0 )) || { echo "exited $rc: $(_tail "$(cat "$lf")")" >&2; return 1; }
+  grep -qE 'DEGRADED|NOT checked against the index' "$lf" \
+    || { echo "compared the image against an index that failed its own hash" >&2; return 1; }
+  cmp -s "$SRC/lib/a.c" "$dest/lib/a.c" || { echo "lib/a.c was not restored" >&2; return 1; }
+}
+
+# Index rows that do not parse are counted and reported by both readers, and a
+# disc number written with leading zeros is still that disc. brb.sh said
+# nothing of the first and lost the second outright: it put the raw field
+# through `sort -un`, which keeps the first of two numerically equal lines, so
+# a row reading 00000000001 came out in place of the row reading 1, was then
+# dropped as too long to be a disc number, and the path was "not in the index".
+# The index here is the reference set's, encrypted again to the same key with
+# three rows put in front of it: one that Atoi reads as disc 1, and two that
+# name no disc at all.
+rsc_oddrows_fixture() {
+  local f=$RSC/oddrows/enc/index.tsv.gz.age n
+  rsc_copy "$T/stage-go" oddrows "$SRC" || return 1
+  { printf '00000000001\tlib/a.c\nx\tlib/a.c\n0\tlib/a.c\n'; idx_plain "$T/stage-go"; } \
+    | gzip -c | age -R "$RCP" > "$f.new" || return 1
+  mv -f "$f.new" "$f"
+  printf '%s  index.tsv.gz.age\n' "$(sha512sum < "$f" | cut -d' ' -f1)" > "$f.sha512"
+  n=$(idx_plain "$RSC/oddrows" | grep -c 'lib/a\.c$')
+  (( n == 4 )) || { echo "fixture: the new index has $n row(s) for lib/a.c, want the three added and the set's own" >&2; return 1; }
+}
+rsc_oddrows_only() { # rsc_oddrows_only sh|go
+  local who=$1 dest=$RSC/out-oddrows-$1 lf=$LOG/rsc-oddrows-$1.log rc=0
+  rm -rf "$dest" "$RSC/oddrows/restore"; mkdir -p "$dest"
+  rsc_run "$who" "$lf" "$RSC/oddrows.cfg" restore "$dest" --only lib/a.c || rc=$?
+  (( rc == 0 )) || { echo "exited $rc: $(_tail "$(cat "$lf")")" >&2; return 1; }
+  cmp -s "$SRC/lib/a.c" "$dest/lib/a.c" || { echo "lib/a.c was not restored" >&2; return 1; }
+  grep -q '2 record(s) in index\.tsv\.gz\.age do not parse and were ignored' "$lf" \
+    || { echo "did not report the two rows that do not parse" >&2; return 1; }
+}
+assert0 "fixture: the reference set with three odd rows put in front of its index" rsc_oddrows_fixture
+for who in sh go; do
+  name=$(rsc_name "$who")
+  assert0 "$name restore takes an index that fails its hash as unreadable, and extracts with the cross-check DEGRADED" \
+    rsc_badsum_degrades "$who"
+  assert0 "$name restore --only reports the index rows that do not parse, and reads 00000000001 as disc 1" \
+    rsc_oddrows_only "$who"
+done
+unset name
+
+# brb.sh hashes the index with sha512sum before reading it, where the Go build
+# hashes in-process, and a hash that cannot be taken is not a mismatch. It used
+# to come back empty, fail the comparison and report the index rotted, sending
+# the operator to par2 over a file nothing had read. The wrapper fails every
+# call; a restore hashes each image with it long before the index matters, so
+# 'index' is where this shows.
+mkdir -p "$RSC/bin-shafail"
+cat > "$RSC/bin-shafail/sha512sum" <<'EOF'
+#!/bin/sh
+# xcompat wrapper: a sha512sum that cannot read its input.
+echo "sha512sum: the test wrapper cannot read its input" >&2
+exit 1
+EOF
+chmod +x "$RSC/bin-shafail/sha512sum"
+rsc_index_unhashable() {
+  local lf=$LOG/rsc-index-shafail-sh.log rc=0
+  local RSC_PATH="$RSC/bin-shafail:$PATH"
+  rsc_run sh "$lf" "$T/cfg/go" index lib || rc=$?
+  (( rc != 0 )) || { echo "printed the index without its hash having been checked" >&2; return 1; }
+  ! grep -q 'has rotted' "$lf" || { echo "called an index it could not hash rotted" >&2; return 1; }
+  grep -q 'could not hash index\.tsv\.gz\.age' "$lf" \
+    || { echo "refused, but not for the hash: $(_tail "$(cat "$lf")")" >&2; return 1; }
+}
+assert0 "brb.sh index says when it could not hash the index, never that the index has rotted" rsc_index_unhashable
+
+# ---- what 'index' takes its pattern to mean ---------------------------------
+# A literal, case-insensitive substring, on both readers. brb.sh handed the
+# pattern to grep as a basic regular expression, so a bracketed name found
+# nothing, an unbalanced bracket was an error, and both came out as "no match"
+# — from the reader whose own refusals say "check 'brb.sh index ...'". A dot or
+# a star matched more than was typed. And GNU grep in a UTF-8 locale took a row
+# whose name is not valid UTF-8 for binary data and printed nothing for it. A
+# newline in the pattern became two patterns. Output is compared byte for byte,
+# with the exit status, and for a pattern that matches nothing both readers
+# must also have said "no match", so that two readers failing alike for some
+# other reason cannot pass for agreement.
+RSC_IDXSRC=$RSC/idxsrc
+mkdir -p "$RSC_IDXSRC/src"
+for f in 'notes[1].txt' 'a[1.txt' 'report.pdf' 'reportXpdf' 'src/main.go' "$(printf 'caf\351.txt')"; do
+  printf 'x' > "$RSC_IDXSRC/$f"
+done
+unset f
+mkdir -p "$RSC/stage-idx"; mkcfg "$T/cfg/rsc-idx" "$RSC/stage-idx" "$RSC_IDXSRC"
+assert0 "fixture: go brb backs up names holding brackets, a dot, and a byte that is not UTF-8" \
+  run_go "$LOG/rsc-backup-idx.log" "$T/cfg/rsc-idx" backup
+rsc_index_agrees() { # rsc_index_agrees LOCALE PATTERN ROWS
+  local loc=$1 pat=$2 want=$3 a=$RSC/index-sh b=$RSC/index-go ra=0 rb=0
+  LC_ALL=$loc bash "$BRB_SH" -c "$T/cfg/rsc-idx" index "$pat" > "$a" 2> "$a.err" || ra=$?
+  LC_ALL=$loc "$BRB_GO" --no-color -c "$T/cfg/rsc-idx" index "$pat" > "$b" 2> "$b.err" || rb=$?
+  (( $(wc -l < "$a") == want )) || { echo "brb.sh printed $(wc -l < "$a") row(s), want $want" >&2; return 1; }
+  (( $(wc -l < "$b") == want )) || { echo "go brb printed $(wc -l < "$b") row(s), want $want" >&2; return 1; }
+  (( ra == rb )) || { echo "brb.sh exited $ra, go brb $rb" >&2; return 1; }
+  if (( want == 0 )); then
+    grep -q 'no match' "$a.err" || { echo "brb.sh printed nothing without saying 'no match': $(_tail "$(cat "$a.err")")" >&2; return 1; }
+    grep -q 'no match' "$b.err" || { echo "go brb printed nothing without saying 'no match': $(_tail "$(cat "$b.err")")" >&2; return 1; }
+  fi
+  cmp -s "$a" "$b" || { diff "$a" "$b" >&2; return 1; }
+}
+rsc_locales=( C )
+if (( HAVE_UTF8_LOCALE )); then rsc_locales+=( "$UTF8_LOCALE" ); fi
+for loc in "${rsc_locales[@]}"; do
+  assert0 "both readers' index finds 'notes[1]' literally (LC_ALL=$loc)"        rsc_index_agrees "$loc" 'notes[1]' 1
+  assert0 "  ... and 'a[1', which is not a valid regular expression"            rsc_index_agrees "$loc" 'a[1' 1
+  assert0 "  ... and 'report.pdf' without reportXpdf"                           rsc_index_agrees "$loc" 'report.pdf' 1
+  assert0 "  ... and nothing for 'main.*go'"                                    rsc_index_agrees "$loc" 'main.*go' 0
+  assert0 "  ... and the row whose name is not UTF-8, for 'caf'"                rsc_index_agrees "$loc" 'caf' 1
+  assert0 "  ... and nothing for a pattern holding a newline"                   rsc_index_agrees "$loc" "$(printf 'notes\nreport')" 0
+done
+if (( ! HAVE_UTF8_LOCALE )); then
+  skip "the index pattern under a UTF-8 locale (both readers)" "no en_US.UTF-8 locale on this machine"
+fi
+unset loc rsc_locales
+
+# ---- a long listing after the match, and a listing that fails ---------------
+# brb.sh asked each image whether it held the --only path with an awk that
+# exited at the first match. unsquashfs neither ignores nor handles SIGPIPE, so
+# it died on its next write, and pipefail turned that 141 into "not on this
+# image" whenever more than a few kilobytes of listing followed the match — a
+# path near the top of any real disc was reported absent, and a directory was
+# skipped on the disc holding it. The listing here puts the path third, and
+# twelve thousand entries (about 400 KiB) after it: far past anything a pipe
+# buffers, which is what makes the old early exit fail every time rather than
+# only sometimes. The reference set's few dozen entries never got near it.
+RSC_BIGSRC=$RSC/bigsrc
+mkdir -p "$RSC_BIGSRC/a" "$RSC_BIGSRC/b"
+printf 'the one file that was asked for\n' > "$RSC_BIGSRC/a/target.txt"
+( cd "$RSC_BIGSRC/b" && for i in $(seq -w 1 12000); do : > "filler-$i.txt"; done )
+mkdir -p "$RSC/stage-big"; mkcfg "$T/cfg/rsc-big" "$RSC/stage-big" "$RSC_BIGSRC"
+assert0 "fixture: go brb backs up a tree whose listing runs on for 12000 entries after a/target.txt" \
+  run_go "$LOG/rsc-backup-big.log" "$T/cfg/rsc-big" backup
+rsc_big_only() { # rsc_big_only sh|go PATH WANT-FILES
+  local who=$1 p=$2 want=$3 dest=$RSC/out-big-$1 lf=$LOG/rsc-big-$1.log rc=0 n
+  rm -rf "$dest" "$RSC/stage-big/restore"; mkdir -p "$dest"
+  rsc_run "$who" "$lf" "$T/cfg/rsc-big" restore "$dest" --only "$p" || rc=$?
+  (( rc == 0 )) || { echo "exited $rc: $(_tail "$(cat "$lf")")" >&2; return 1; }
+  n=$(find "$dest" -type f | wc -l)
+  (( n == want )) || { echo "restored $n file(s), want $want" >&2; return 1; }
+}
+for who in sh go; do
+  assert0 "$(rsc_name "$who") --only a/target.txt finds it with 12000 entries listed after it" \
+    rsc_big_only "$who" a/target.txt 1
+  assert0 "$(rsc_name "$who") --only b restores all 12000 files of a directory listed early" \
+    rsc_big_only "$who" b 12000
+done
+
+# And a listing that fails outright — an unsquashfs built without the image's
+# compression is the likely cause — used to say the same "not on this image",
+# with unsquashfs's own error sent to /dev/null, and on a multi-disc set the run
+# then carried on and called a partial restore complete. Both readers now stop
+# on it, naming the listing.
+mkdir -p "$RSC/bin-lfail"
+cat > "$RSC/bin-lfail/unsquashfs" <<EOF
+#!/bin/sh
+# xcompat wrapper: refuse the bare listing (-l) as a broken unsquashfs would,
+# and hand every other call to the real tool.
+if [ "\$1" = "-l" ]; then echo "FATAL ERROR: the test wrapper refuses to list this image" >&2; exit 1; fi
+exec "$RSC_REAL_UNSQ" "\$@"
+EOF
+chmod +x "$RSC/bin-lfail/unsquashfs"
+rsc_listing_failure_stops() { # rsc_listing_failure_stops sh|go
+  local who=$1 dest=$RSC/out-lfail-$1 lf=$LOG/rsc-lfail-$1.log rc=0 n
+  local RSC_PATH="$RSC/bin-lfail:$PATH"
+  rm -rf "$dest" "$RSC/lfail/restore"; mkdir -p "$dest"
+  rsc_run "$who" "$lf" "$RSC/lfail.cfg" restore "$dest" --only lib/a.c || rc=$?
+  (( rc != 0 )) || { echo "exited 0 although the listing failed" >&2; return 1; }
+  ! grep -q 'is not on' "$lf" || { echo "took the failed listing for 'not on this image'" >&2; return 1; }
+  grep -qE 'could not list|listing ' "$lf" || { echo "stopped, but not for the listing: $(_tail "$(cat "$lf")")" >&2; return 1; }
+  n=$(find "$dest" -type f | wc -l)
+  (( n == 0 )) || { echo "wrote $n file(s)" >&2; return 1; }
+}
+assert0 "fixture: a private copy of the reference set for the failing listing" rsc_copy "$T/stage-go" lfail "$SRC"
+for who in sh go; do
+  assert0 "$(rsc_name "$who") --only stops on a listing that fails, rather than calling the path absent" \
+    rsc_listing_failure_stops "$who"
+done
+
+# ---- a long non-fatal log from unsquashfs -----------------------------------
+# Exit 2 from unsquashfs means it extracted everything and could not set some
+# attribute, and both readers promise to warn, keep the log and go on to the
+# next disc. brb.sh printed the log's first three lines with `grep | head -3`,
+# and under pipefail and errexit grep's SIGPIPE, once head had its three lines,
+# ended the whole restore with status 141 and no message, on a log of more than
+# a few kilobytes — before the next disc, every time. A destination that will
+# not take xattrs writes such a log; the wrapper writes 3000 lines.
+mkdir -p "$RSC/bin-x2"
+cat > "$RSC/bin-x2/unsquashfs" <<EOF
+#!/bin/sh
+# xcompat wrapper: an extraction (the one call that starts with -d) runs the
+# real tool, then reports 3000 non-fatal errors and exits 2, as unsquashfs does
+# when it extracted everything and could not set some attribute.
+if [ "\$1" = "-d" ]; then
+  "$RSC_REAL_UNSQ" "\$@" || exit \$?
+  i=0
+  while [ \$i -lt 3000 ]; do echo "write_xattr: the test wrapper could not set an xattr on file \$i"; i=\$((i+1)); done
+  exit 2
+fi
+exec "$RSC_REAL_UNSQ" "\$@"
+EOF
+chmod +x "$RSC/bin-x2/unsquashfs"
+rsc_long_log_continues() { # rsc_long_log_continues sh|go
+  local who=$1 dest=$RSC/out-x2-$1 lf=$LOG/rsc-x2-$1.log rc=0
+  local RSC_PATH="$RSC/bin-x2:$PATH"
+  rm -rf "$dest" "$RSC/x2/restore"; mkdir -p "$dest"
+  rsc_run "$who" "$lf" "$RSC/x2.cfg" restore "$dest" || rc=$?
+  (( rc == 0 )) || { echo "exited $rc: $(_tail "$(cat "$lf")")" >&2; return 1; }
+  grep -q 'non-fatal' "$lf" || { echo "the wrapper's exit 2 was never reported" >&2; return 1; }
+  diff -r --no-dereference "$T/m-src" "$dest" >&2
+}
+if (( n_m >= 2 )); then
+  assert0 "fixture: a private copy of the multi-disc set for the long log" \
+    rsc_copy "$T/m-go" x2 "$T/m-src" 'DISC_CAPACITY_BYTES=40000000' 'RESERVE_BYTES=12000000'
+  for who in sh go; do
+    assert0 "$(rsc_name "$who") goes on to every disc after a long non-fatal unsquashfs log" \
+      rsc_long_log_continues "$who"
+  done
+fi
+
+# ---- --only alongside --disc ------------------------------------------------
+# The Go reader asks the index even when --disc names the disc, and refuses up
+# front when the index puts the path only on other discs. brb.sh skipped the
+# index whenever --disc was given: for a file it then hashed and decrypted the
+# whole image to find the same thing out, and for a directory whose files are
+# all on another disc the skeleton copy of it on the named disc satisfied the
+# pre-check — so the run restored one empty directory and said "restore
+# complete". The set is built so that one directory, rsca, sits on a single disc:
+# its three files are the largest in the tree and the packer is first-fit
+# decreasing, so they fill the first disc before anything else does. That is
+# checked against the index rather than assumed.
+RSC_DIRSRC=$RSC/dirsrc
+mkdir -p "$RSC_DIRSRC/rsca" "$RSC_DIRSRC/rscb"
+for i in 1 2 3; do head -c 4000000 /dev/urandom > "$RSC_DIRSRC/rsca/big-$i.bin"; done
+for i in $(seq -w 1 10); do head -c 2000000 /dev/urandom > "$RSC_DIRSRC/rscb/small-$i.bin"; done
+unset i
+mkdir -p "$RSC/stage-dir"
+mkcfg "$T/cfg/rsc-dir" "$RSC/stage-dir" "$RSC_DIRSRC" 'DISC_CAPACITY_BYTES=40000000' 'RESERVE_BYTES=12000000'
+assert0 "fixture: go brb builds a multi-disc set with one directory on one disc" \
+  run_go "$LOG/rsc-backup-dir.log" "$T/cfg/rsc-dir" backup
+# Which disc rsca is on, and one it is not on — read here, in this shell, so the
+# checks below can use them.
+RSC_HOME=$(idx_plain "$RSC/stage-dir" | awk -F'\t' 'index($2, "rsca/") == 1 { print $1 + 0 }' | sort -un | tr '\n' ' ')
+RSC_HOME=${RSC_HOME% }
+RSC_AWAY=""
+for d in $(idx_plain "$RSC/stage-dir" | awk -F'\t' '{ print $1 + 0 }' | sort -un); do
+  if [[ " $RSC_HOME " != *" $d "* ]]; then RSC_AWAY=$d; break; fi
+done
+unset d
+rsc_layout_ok() {
+  [[ "$RSC_HOME" =~ ^[0-9]+$ ]] || { echo "rsca is on disc(s) '$RSC_HOME', not on exactly one" >&2; return 1; }
+  [[ -n "$RSC_AWAY" ]] || { echo "no disc of the set lacks rsca's files" >&2; return 1; }
+}
+rsc_disc_refused() { # rsc_disc_refused sh|go LOGNAME PATH DISC
+  local who=$1 lf=$LOG/rsc-$2-$1.log p=$3 d=$4 dest=$RSC/out-$2-$1 rc=0 n
+  rm -rf "$dest" "$RSC/stage-dir/restore"; mkdir -p "$dest"
+  rsc_run "$who" "$lf" "$T/cfg/rsc-dir" restore "$dest" --only "$p" --disc "$d" || rc=$?
+  (( rc != 0 )) || { echo "exited 0 for a path the index puts on disc $RSC_HOME only" >&2; return 1; }
+  ! grep -q 'preparing disc' "$lf" || { echo "hashed and decrypted an image before refusing" >&2; return 1; }
+  grep -q 'the index puts' "$lf" || { echo "refused, but not on the index's word: $(_tail "$(cat "$lf")")" >&2; return 1; }
+  n=$(find "$dest" -type f | wc -l)
+  (( n == 0 )) || { echo "wrote $n file(s)" >&2; return 1; }
+}
+rsc_disc_restores() { # rsc_disc_restores sh|go PATH DISC WANT-FILES
+  local who=$1 p=$2 d=$3 want=$4 dest=$RSC/out-discok-$1 lf=$LOG/rsc-discok-$1.log rc=0 n
+  rm -rf "$dest" "$RSC/stage-dir/restore"; mkdir -p "$dest"
+  rsc_run "$who" "$lf" "$T/cfg/rsc-dir" restore "$dest" --only "$p" --disc "$d" || rc=$?
+  (( rc == 0 )) || { echo "exited $rc: $(_tail "$(cat "$lf")")" >&2; return 1; }
+  n=$(find "$dest" -type f | wc -l)
+  (( n == want )) || { echo "restored $n file(s), want $want" >&2; return 1; }
+}
+assert0 "fixture: the index puts rsca on one disc ($RSC_HOME) of a set with another (${RSC_AWAY:-none})" rsc_layout_ok
+if rsc_layout_ok 2>/dev/null; then
+  for who in sh go; do
+    name=$(rsc_name "$who")
+    assert0 "$name --only <file> --disc <a disc it is not on> refuses before preparing anything" \
+      rsc_disc_refused "$who" disc-file rsca/big-1.bin "$RSC_AWAY"
+    assert0 "$name --only <directory> --disc <a disc holding only its skeleton> refuses too" \
+      rsc_disc_refused "$who" disc-dir rsca "$RSC_AWAY"
+    assert0 "$name --only <directory> --disc <the disc it is on> still restores it" \
+      rsc_disc_restores "$who" rsca "$RSC_HOME" 3
+  done
+  unset name
+fi
+
+# ---- which image --only narrows to ------------------------------------------
+# The index names discs by number, and both readers look the image for each
+# one up among the numbered images staged, the same set a whole-set restore
+# works through — so rsca's disc staged under a longer spelling of its number
+# still serves --only rsca. brb.sh built the name disc%02d from the number
+# instead, found no such file, warned that the disc had not been ingested and
+# refused a path the Go reader restores from that very image. The copy renames
+# the image and its sidecars, and rewrites the name each hash sidecar records,
+# so that both readers verify the image as they would under its own name.
+rsc_renumbered_fixture() {
+  local old new f
+  old=$(printf 'disc%02d' "$RSC_HOME"); new=$(printf 'disc0%02d' "$RSC_HOME")
+  rsc_copy "$RSC/stage-dir" renum "$RSC_DIRSRC" || return 1
+  for f in "$RSC/renum/enc/$old".*; do
+    [[ -e "$f" ]] || { echo "fixture: nothing named $old.* in staging" >&2; return 1; }
+    mv -- "$f" "$RSC/renum/enc/$new.${f##*/"$old".}"
+  done
+  for f in "$RSC/renum/enc/$new.squashfs.sha512" "$RSC/renum/enc/$new.squashfs.age.sha512"; do
+    sed "s/$old\.squashfs/$new.squashfs/" "$f" > "$f.new" || return 1
+    mv -f -- "$f.new" "$f"
+  done
+}
+rsc_renumbered_narrows() { # rsc_renumbered_narrows sh|go
+  local who=$1 dest=$RSC/out-renum-$1 lf=$LOG/rsc-renum-$1.log rc=0 n
+  rm -rf "$dest" "$RSC/renum/restore"; mkdir -p "$dest"
+  rsc_run "$who" "$lf" "$RSC/renum.cfg" restore "$dest" --only rsca || rc=$?
+  (( rc == 0 )) || { echo "exited $rc: $(_tail "$(cat "$lf")")" >&2; return 1; }
+  n=$(find "$dest" -type f | wc -l)
+  (( n == 3 )) || { echo "restored $n file(s), want rsca's 3" >&2; return 1; }
+}
+if rsc_layout_ok 2>/dev/null; then
+  assert0 "fixture: the one-directory set with disc $RSC_HOME staged as $(printf 'disc0%02d' "$RSC_HOME")" \
+    rsc_renumbered_fixture
+  for who in sh go; do
+    assert0 "$(rsc_name "$who") --only rsca finds disc $RSC_HOME's image under that longer name" \
+      rsc_renumbered_narrows "$who"
+  done
+fi
+unset who
 
 # ---------------------------------------------------------------------------
 head_s "9. ingest, driven on a real terminal"
@@ -1372,6 +2783,127 @@ done
 unset name D
 
 # ---------------------------------------------------------------------------
+head_s "12a. an AGE_IDENTITY that is not a file; more than five planted links"
+# ---------------------------------------------------------------------------
+# Two reader-parity checks from one round of fixes to the Go reader, each of
+# which failed against it before.
+#
+# AGE_IDENTITY is the operator's own setting, and a slip there — a directory, a
+# FIFO — used to end the Go reader's identity search on the spot: "is a
+# directory", or a hang inside open(2) on the FIFO that the first SIGTERM does
+# not end. brb.sh's find_identity takes only `-f && -r` and goes on to
+# <AGE_IDENTITY>.age and then the rescue key, so the same staging area
+# decrypted under one reader and not the other. The plaintext identity is put
+# at <AGE_IDENTITY>.age: a file that is not an age container is used as it is
+# by both readers whatever it is called, so this needs no passphrase and no
+# terminal. timeout -k, because the FIFO hung the Go reader past SIGTERM.
+G8_ODD=$T/g8-odd-identity
+G8_IDSTAGE=$T/g8-id-stage
+G8_IDCFG=$T/cfg/g8-id
+g8_identity_fixture() { # g8_identity_fixture dir|fifo
+  rm -rf -- "$G8_IDSTAGE" "$G8_ODD" "$G8_ODD.age"
+  cp -a "$T/stage-go" "$G8_IDSTAGE" || return 1
+  rm -rf -- "$G8_IDSTAGE/restore"
+  case $1 in
+    dir)  mkdir -- "$G8_ODD" ;;
+    fifo) mkfifo -- "$G8_ODD" ;;
+  esac
+  cp -- "$ID" "$G8_ODD.age" || return 1
+  { printf 'STAGING="%s"\n' "$G8_IDSTAGE"
+    printf 'SOURCE_DIR="%s"\n' "$SRC"
+    printf 'AGE_RECIPIENTS_FILE="%s"\n' "$RCP"
+    printf 'AGE_IDENTITY="%s"\n' "$G8_ODD"
+    printf 'ARCHIVE_NAME="xcompat"\n'
+  } > "$G8_IDCFG"
+  # The plant has to be what it says, or the fallback below proves nothing.
+  [[ -e "$G8_ODD" && ! -f "$G8_ODD" ]] || { echo "$G8_ODD is missing or a regular file" >&2; return 1; }
+  [[ -f "$G8_ODD.age" ]] && ! head -1 "$G8_ODD.age" | grep -q '^age-encryption.org/v1'
+}
+g8_identity_falls_back() { # g8_identity_falls_back sh|go LOGTAG
+  local who=$1 lf=$LOG/g8-id-$2.log rc=0
+  case $who in
+    sh) timeout -k 5 60 bash "$BRB_SH" --yes -c "$G8_IDCFG" index > "$lf" 2>&1 || rc=$? ;;
+    go) timeout -k 5 60 "$BRB_GO" --yes --no-color -c "$G8_IDCFG" index > "$lf" 2>&1 || rc=$? ;;
+  esac
+  (( rc == 0 )) || { echo "exit $rc: $(_tail "$(cat "$lf")")" >&2; return 1; }
+  grep -qF "using identity $G8_ODD.age" "$lf" \
+    || { echo "did not say it fell back to $G8_ODD.age: $(_tail "$(cat "$lf")")" >&2; return 1; }
+  grep -qE "^[0-9]+$(printf '\t')" "$lf" || { echo "printed no index rows" >&2; return 1; }
+}
+for kind in dir fifo; do
+  assert0 "fixture: AGE_IDENTITY names a $kind, with the identity at <AGE_IDENTITY>.age" g8_identity_fixture "$kind"
+  for who in sh go; do
+    name=$([[ $who == sh ]] && echo 'brb.sh' || echo 'go brb')
+    assert0 "$name skips an AGE_IDENTITY that is a $kind and decrypts with <AGE_IDENTITY>.age" \
+      g8_identity_falls_back "$who" "$kind-$who"
+  done
+done
+unset kind name
+
+# The per-image guard of section 12 refuses a destination holding symlinks where
+# the image has directories, and names five of them: brb.sh's
+# refuse_symlinks_at_dirs stops at five and its comment says the sentence is
+# the Go reader's, word for word. With the set's index readable the Go reader's
+# listing scan runs on for the cross-check, and its list of offenders used to
+# run on with it, so more than five such links drew five names from brb.sh and
+# every one of them from the Go build. The reference set has room for three
+# such links at most (a link at project/ hides project/core/ from the guard),
+# so this backs up a set of its own: seven directories of one file each, and a
+# link to a plain file at every one.
+G8_SRC=$T/g8-src
+G8_SET=$T/g8-set
+G8_TARGET=$T/g8-target.txt
+G8_LINKS=7
+g8_link_set() {
+  rm -rf -- "$G8_SRC" "$G8_SET"; mkdir -p "$G8_SRC" "$G8_SET"
+  local i
+  for (( i = 1; i <= G8_LINKS; i++ )); do
+    mkdir -p "$G8_SRC/d$i"; printf 'file %d\n' "$i" > "$G8_SRC/d$i/f.txt"
+  done
+  mkcfg "$T/cfg/g8-links" "$G8_SET" "$G8_SRC"
+  run_go "$LOG/g8-links-backup.log" "$T/cfg/g8-links" backup || return 1
+  # Without a staged index the Go reader stops at five on its own, and the
+  # check below would pass against the code it exists to catch.
+  [[ -f "$G8_SET/enc/index.tsv.gz.age" ]] || { echo "the set has no staged index" >&2; return 1; }
+}
+g8_plant_links() { # g8_plant_links DEST
+  local d=$1 i
+  rm -rf -- "$d"; mkdir -p "$d"
+  printf 'target\n' > "$G8_TARGET"; chmod 600 "$G8_TARGET"
+  for (( i = 1; i <= G8_LINKS; i++ )); do
+    ln -s "$G8_TARGET" "$d/d$i"
+    # A link to a plain FILE: one resolving to a directory is the traversal
+    # guard's, which would refuse first and say something else.
+    [[ -L "$d/d$i" && -f "$d/d$i" ]] || { echo "$d/d$i is not a link to a plain file" >&2; return 1; }
+  done
+}
+# One destination path for both readers, planted afresh for each: the path is
+# part of the sentence the two refusals are compared on.
+g8_names_five() { # g8_names_five sh|go
+  local who=$1 d=$T/g8-dest lf=$LOG/g8-links-$1.log rc=0 line n
+  g8_plant_links "$d" || return 1
+  rm -rf -- "$G8_SET/restore"
+  case $who in
+    sh) bash "$BRB_SH" --yes -c "$T/cfg/g8-links" restore "$d" > "$lf" 2>&1 || rc=$? ;;
+    go) "$BRB_GO" --yes --no-color -c "$T/cfg/g8-links" restore "$d" > "$lf" 2>&1 || rc=$? ;;
+  esac
+  (( rc != 0 )) || { echo "exited 0 with $G8_LINKS links where the image has directories" >&2; return 1; }
+  # Each reader's own prefix off: "fail restore: " from the Go build, "fail "
+  # from brb.sh. What is left is the sentence the two are meant to share.
+  line=$(grep -m1 'symlink(s) where' "$lf" | sed -e 's/^fail //' -e 's/^restore: //')
+  [[ -n $line ]] || { echo "refused, but not by the per-image guard: $(_tail "$(cat "$lf")")" >&2; return 1; }
+  n=$(grep -o ' -> ' <<<"$line" | wc -l)
+  (( n == 5 )) || { echo "the refusal names $n link(s), want 5: $(_tail "$line")" >&2; return 1; }
+  [[ "$(stat -c%a "$G8_TARGET")" == 600 && "$(cat "$G8_TARGET")" == target ]] \
+    || { echo "the links' target was touched" >&2; return 1; }
+  printf '%s\n' "$line" > "$T/g8-refusal-$who"
+}
+assert0 "fixture: a set of $G8_LINKS directories, backed up with its index staged" g8_link_set
+assert0 "brb.sh names five of $G8_LINKS links at the image's directories" g8_names_five sh
+assert0 "go brb names five of them too, with the index read for the cross-check" g8_names_five go
+assert0 "  ... and the two refusals are the same sentence" diff "$T/g8-refusal-sh" "$T/g8-refusal-go"
+
+# ---------------------------------------------------------------------------
 head_s "13. a staging path full of glob metacharacters"
 # ---------------------------------------------------------------------------
 # No suite ever put a metacharacter in a path, and that is exactly where the
@@ -1456,8 +2988,17 @@ glob_restores() { # glob_restores sh|go
 # The negative control that stops the check above passing vacuously: the same
 # damage, the same metacharacter staging, the alternate copy taken away. If this
 # restored too, the repair above would not have been a combination of anything.
+#
+# One compound assert0, in corrupt_image_refused's shape, and not an assertN.
+# Under assertN every `return 1` of the fixture's own (a cp -a that failed, a
+# damage_pair whose sabotage did not land, an alternate copy that would not go)
+# counted as the refusal being tested, and so did a reader that died for an
+# unrelated reason or half-extracted before failing. So the fixture's failures
+# fail the check, and the reader's exit status is captured on its own and must
+# be non-zero for the right reason, with nothing written either side of the
+# guard: no file in the destination and no decrypted image in staging.
 glob_without_the_copy_fails() { # glob_without_the_copy_fails sh|go
-  local who=$1
+  local who=$1 rc=0 n
   local st="$T/g-nc-$who/$GNAME" dest=$T/g-nc-out-$who
   rm -rf -- "$T/g-nc-$who" "$dest"; mkdir -p "$T/g-nc-$who" "$dest"
   cp -a "$GREF" "$st" || return 1
@@ -1468,9 +3009,18 @@ glob_without_the_copy_fails() { # glob_without_the_copy_fails sh|go
   [[ -e "$st/enc/disc01.squashfs.age.copy1700000000" ]] \
     && { echo "the alternate copy is still there" >&2; return 1; }
   case $who in
-    sh) bash "$BRB_SH" --yes -c "$T/cfg/g-nc-$who" restore "$dest" > "$LOG/glob-nc-sh.log" 2>&1 ;;
-    go) "$BRB_GO" --yes --no-color -c "$T/cfg/g-nc-$who" restore "$dest" > "$LOG/glob-nc-go.log" 2>&1 ;;
+    sh) bash "$BRB_SH" --yes -c "$T/cfg/g-nc-$who" restore "$dest" > "$LOG/glob-nc-sh.log" 2>&1 || rc=$? ;;
+    go) "$BRB_GO" --yes --no-color -c "$T/cfg/g-nc-$who" restore "$dest" > "$LOG/glob-nc-go.log" 2>&1 || rc=$? ;;
   esac
+  (( rc != 0 )) || { echo "restored from the damaged image alone, with no second copy to combine" >&2; return 1; }
+  n=$(find "$dest" -type f | wc -l)
+  (( n == 0 )) || { echo "extracted $n file(s) from an image it could not repair" >&2; return 1; }
+  # The path is quoted, so the metacharacters in $st are taken literally here.
+  n=$(find "$st/restore" -maxdepth 1 -name '*.squashfs' 2>/dev/null | wc -l)
+  (( n == 0 )) || { echo "left $n decrypted image(s) behind in staging" >&2; return 1; }
+  # Both readers say this, in these words, when par2 gives up on an image.
+  grep -q 'par2 could not repair' "$LOG/glob-nc-$who.log" \
+    || { echo "refused, but not because par2 could not repair it: $(_tail "$(cat "$LOG/glob-nc-$who.log")")" >&2; return 1; }
 }
 
 for who in sh go; do
@@ -1480,7 +3030,7 @@ for who in sh go; do
     alone_is_unrepairable "$(glob_stage "$who")" "$(glob_stage "$who")/enc/disc01.squashfs.age"
   assert0 "  ... and so is the second pressing alone" \
     alone_is_unrepairable "$(glob_stage "$who")" "$(glob_stage "$who")/enc/disc01.squashfs.age.copy1700000000"
-  assertN "  ... so neither copy alone can restore the set"                glob_without_the_copy_fails "$who"
+  assert0 "  ... so neither copy alone can restore the set"                glob_without_the_copy_fails "$who"
   assert0 "$name combines the two copies and restores byte-identical"      glob_restores "$who"
 done
 unset name
@@ -1610,8 +3160,12 @@ if (( HAVE_SCRIPT )); then
   # same way, not merely render something safe.
   assert0 "the two readers escape a terminal index identically" \
     diff <(esc_rows "$LOG/esc-idx-sh.log") <(esc_rows "$LOG/esc-idx-go.log")
-  # list's column padding differs between the two and carries no information,
-  # the same normalisation section 7 uses.
+  # Only the rows naming the hostile file are compared: this check is about how
+  # each reader escapes that name on a terminal. Collapsing runs of spaces is
+  # slack, not a known difference. Both escapers (esc_controls in brb.sh, the
+  # escapingWriter in Go) pass unsquashfs's own column padding through, so none
+  # is expected, and the columns are section 7's business: list_agrees holds
+  # the two piped listings to byte-for-byte agreement, order included.
   esc_list_rows() { sed 's/  */ /g' "$1" | grep -F 'evil.txt' | LC_ALL=C sort; }
   assert0 "the two readers escape a terminal listing identically" \
     diff <(esc_list_rows "$LOG/esc-list-sh.log") <(esc_list_rows "$LOG/esc-list-go.log")
@@ -2267,6 +3821,403 @@ for who in sh go; do
     grep -qi 'symbolic link' "$LOG/hostile-$who.log"
 done
 unset name st
+
+# ---------------------------------------------------------------------------
+head_s "17a. ingest, both readers: what a disc can make either one stage"
+# ---------------------------------------------------------------------------
+# Sections 9, 15 and 16 drive ingest over discs the Go build wrote. This one
+# drives it mostly over discs built by hand, the way section 17 builds its
+# hostile one — only its first check uses the reference and public discs — to
+# pin what each reader STAGES from them, which has to be the same answer from
+# both, since a staging area filled by one is read by the other. Every check
+# runs both readers into staging areas of their own, and every check but the
+# last was written to fail against the code before it, in at least one reader:
+#
+#   * a disc refused for carrying another set's index left files behind: the
+#     Go reader a public disc's key and everything that sorts before the index
+#     — its image and sidecars, renamed over the staged ones when the names
+#     matched, since its own sums vouched for them — and brb.sh that key, under
+#     a message saying nothing had been staged. Where the staged set's own key
+#     had not come across, the stray key then had the set's next genuine disc
+#     refused as another public archive's;
+#   * ingest staged any regular file in data/ under its own name, so a disc
+#     could plant names staging uses for itself — a .mapfile the Go reader
+#     then resumed a salvage from, INTO the staged image;
+#   * brb.sh staged files nested under data/, the Go reader did not; and with
+#     no file at the top of data/, brb.sh reported success having staged
+#     nothing, where the Go reader fails the disc;
+#   * the Go reader never consulted a file's own .sha512 sidecar when the
+#     disc's SHA512SUMS said nothing about it, so the readers disagreed about
+#     the same disc; and brb.sh took a damaged sidecar's first word for a
+#     digest, read a linked one through the link, and judged a linked index
+#     against the staged one, which its copy loop never reads;
+#   * a second pressing's copy took the name <image>.copy<unix seconds>
+#     whatever was already there, and two reads in one second destroyed the
+#     first;
+#   * each re-read of a disc that returns the same wrong bytes kept one more
+#     byte-identical .copy. The last check pins how far the cure for that
+#     reaches: a new copy is compared with complete copies, never a salvage.
+#
+# No mksquashfs or par2 is involved: ingest copies and hashes, and decrypts
+# nothing, so the hand-built discs only have to look like discs to it.
+if (( HAVE_SCRIPT )); then
+  G3=$T/g3; mkdir -p "$G3"
+
+  # g3_stage NAME — a fresh staging area of its own, and its config. Prints the
+  # staging path.
+  g3_stage() {
+    local st=$G3/stage-$1
+    rm -rf "$st"; mkdir -p "$st/enc"
+    mkcfg "$T/cfg/g3-$1" "$st" "$SRC"
+    printf '%s' "$st"
+  }
+  # g3_ingest sh|go NAME DISC LOGFILE — one pass of one reader over one disc
+  # directory, into the staging area g3_stage NAME made.
+  g3_ingest() {
+    case $1 in
+      sh) run_pty "$4" $'\nq\n' "bash '$BRB_SH' -c '$T/cfg/g3-$2' ingest '$3'" ;;
+      go) run_pty "$4" $'\n\n'  "'$BRB_GO' --no-color -c '$T/cfg/g3-$2' ingest '$3'" ;;
+    esac
+  }
+  # g3_snapshot DIR — every file under DIR with its digest, for a before and
+  # after that must be identical.
+  g3_snapshot() { ( cd "$1" && find . -type f -exec sha512sum {} + | LC_ALL=C sort -k2 ); }
+  # g3_sidecar FILE — FILE.sha512 beside it, in the format the writer uses.
+  g3_sidecar() { ( cd "$(dirname "$1")" && sha512sum "$(basename "$1")" ) > "$1.sha512"; }
+
+  # ---- a disc refused for its index leaves nothing behind ------------------
+  # The finding behind this check was a public disc refused by brb.sh for its
+  # index after its key had already been staged as enc/identity.txt — live,
+  # because the identity search then offered it as the archive's own key — and
+  # a Go reader that refused the same disc only once the copy loop reached the
+  # index, having staged everything that sorted before it. The two discs used
+  # are real: disc 1 of the reference set, and disc 1 of the public set from
+  # section 15, whose index is another set's and whose image has the same name.
+  # A refusal leaves staging alone whatever caused it, so the fixture is checked
+  # first and the refusal has to name the index: a missing disc would
+  # otherwise pass for a refused one.
+  g3_foreign_left_nothing() { # g3_foreign_left_nothing sh|go
+    local who=$1 st before after rc=0
+    [[ -f $GOD/data/index.tsv.gz.age && -f $PUBD/data/index.tsv.gz.age && -f $PUBD/identity.txt ]] \
+      || { echo "fixture: the reference or the public disc is not there to ingest" >&2; return 1; }
+    cmp -s "$GOD/data/index.tsv.gz.age" "$PUBD/data/index.tsv.gz.age" || rc=$?
+    (( rc == 1 )) || { echo "fixture: cmp exited $rc, not 1 — the two sets' indexes are not two differing files" >&2; return 1; }
+    rc=0
+    st=$(g3_stage "foreign-$who")
+    g3_ingest "$who" "foreign-$who" "$GOD" "$LOG/g3-foreign-first-$who.log" \
+      || { echo "fixture: the first disc, of an ordinary set, was refused" >&2; return 1; }
+    [[ -f $st/enc/index.tsv.gz.age && ! -e $st/enc/identity.txt ]] \
+      || { echo "fixture: the first disc did not pin an index, or left a key" >&2; return 1; }
+    before=$(g3_snapshot "$st/enc")
+    g3_ingest "$who" "foreign-$who" "$PUBD" "$LOG/g3-foreign-$who.log" || rc=$?
+    (( rc != 0 )) || { echo "the public disc carrying another set's index was accepted" >&2; return 1; }
+    grep -qiE "$PIN_RX" "$LOG/g3-foreign-$who.log" \
+      || { echo "the public disc was refused, but not for its index" >&2; return 1; }
+    after=$(g3_snapshot "$st/enc")
+    [[ "$before" == "$after" ]] && return 0
+    { echo "the refused disc changed staging:"; diff <(printf '%s\n' "$before") <(printf '%s\n' "$after"); } >&2
+    return 1
+  }
+
+  # ---- a refused disc's key cannot shut out the staged set ------------------
+  # Set P's own key has not come across — its first disc's copy fails the hash
+  # that disc records — when a disc of public set Q is offered and refused for
+  # its index. The key that refusal used to leave behind then had P's next
+  # genuine disc refused as "two different public archives", with a fresh
+  # STAGING the only remedy offered.
+  g3_sums() { ( cd "$1" && find . -type f ! -name SHA512SUMS | LC_ALL=C sort | while IFS= read -r f; do sha512sum "$f"; done ) > "$1/SHA512SUMS"; }
+  g3_keyset_discs() {
+    local d
+    for d in key-p1 key-q key-p2; do rm -rf "${G3:?}/$d"; mkdir -p "$G3/$d/data" || return 1; done
+    printf 'set P index\n' > "$G3/key-p1/data/index.tsv.gz.age"
+    printf 'set P index\n' > "$G3/key-p2/data/index.tsv.gz.age"
+    printf 'set Q index\n' > "$G3/key-q/data/index.tsv.gz.age"
+    head -c 4096 /dev/urandom > "$G3/key-p1/data/disc01.squashfs.age"
+    head -c 4096 /dev/urandom > "$G3/key-q/data/disc01.squashfs.age"
+    head -c 4096 /dev/urandom > "$G3/key-p2/data/disc02.squashfs.age"
+    age-keygen -o "$G3/key-p1/identity.txt" >/dev/null 2>&1 || return 1
+    cp "$G3/key-p1/identity.txt" "$G3/key-p2/identity.txt" || return 1
+    age-keygen -o "$G3/key-q/identity.txt" >/dev/null 2>&1 || return 1
+    for d in key-p1 key-q key-p2; do g3_sums "$G3/$d"; done
+    printf '# a line added after the sums were taken\n' >> "$G3/key-p1/identity.txt"
+  }
+  g3_key_not_left_by_refusal() { # ... sh|go
+    local who=$1 st rc=0
+    st=$(g3_stage "key-$who")
+    g3_ingest "$who" "key-$who" "$G3/key-p1" "$LOG/g3-key-p1-$who.log"
+    [[ -f $st/enc/index.tsv.gz.age && ! -e $st/enc/identity.txt ]] \
+      || { echo "fixture: set P's first disc did not pin its index, or its damaged key came across" >&2; return 1; }
+    g3_ingest "$who" "key-$who" "$G3/key-q" "$LOG/g3-key-q-$who.log" || rc=$?
+    (( rc != 0 )) || { echo "set Q's disc was accepted into set P's staging" >&2; return 1; }
+    [[ ! -e $st/enc/identity.txt ]] || { echo "the refused disc left its key in staging" >&2; return 1; }
+    g3_ingest "$who" "key-$who" "$G3/key-p2" "$LOG/g3-key-p2-$who.log" \
+      || { echo "set P's second disc was refused" >&2; return 1; }
+    cmp -s "$G3/key-p2/identity.txt" "$st/enc/identity.txt" \
+      || { echo "set P's key did not come across from its second disc" >&2; return 1; }
+  }
+
+  # ---- names staging keeps for itself ---------------------------------------
+  # Each of these means something in enc/ beyond "a file this disc carries",
+  # and no disc brb wrote has one in data/: a ddrescue map (which the Go reader
+  # resumed a salvage from, writing the disc's bytes into the staged image in
+  # place), a copy still being written, another pressing's copy, the published
+  # key's staged name, and a disc's renamed sidecar parity. The disc carries no
+  # SHA512SUMS, so nothing would have checked what a salvage wrote.
+  G3_OWN='disc01.squashfs.age.mapfile disc01.squashfs.age.part disc01.squashfs.age.copy1700000000 identity.txt sidecars-disc02.par2'
+  g3_own_disc() {
+    local d=$G3/own-disc n
+    rm -rf "$d"; mkdir -p "$d/data" || return 1
+    printf 'ATTACKER-CHOSEN-BYTES!!!' > "$d/data/disc01.squashfs.age"
+    printf '0x00000000  0x00000018  -\n' > "$d/data/disc01.squashfs.age.mapfile"
+    for n in disc01.squashfs.age.part disc01.squashfs.age.copy1700000000 sidecars-disc02.par2; do
+      printf 'planted\n' > "$d/data/$n"
+    done
+    age-keygen -o "$d/data/identity.txt" >/dev/null 2>&1
+    [[ -s $d/data/identity.txt ]]
+  }
+  g3_own_not_staged() { # g3_own_not_staged sh|go
+    local who=$1 st n pass
+    st=$(g3_stage "own-$who")
+    printf 'GENUINE-CIPHERTEXT-BYTES' > "$st/enc/disc01.squashfs.age"
+    for pass in 1 2; do
+      g3_ingest "$who" "own-$who" "$G3/own-disc" "$LOG/g3-own-$who-$pass.log"
+    done
+    for n in $G3_OWN; do
+      [[ ! -e $st/enc/$n ]] || { echo "$n was staged off the disc" >&2; return 1; }
+    done
+    [[ "$(cat "$st/enc/disc01.squashfs.age")" == GENUINE-CIPHERTEXT-BYTES ]] \
+      || { echo "the staged image was rewritten" >&2; return 1; }
+    # With no ddrescue installed the planted map still did harm: the Go reader
+    # called the good staged copy "an incomplete salvage" and counted it bad.
+    ! grep -qi 'incomplete salvage' "$LOG/g3-own-$who-2.log" \
+      || { echo "a map file off the disc was taken for a salvage of the staged image" >&2; return 1; }
+  }
+  g3_own_named() { # g3_own_named sh|go — each skipped name is named in the first pass's log
+    local n
+    for n in $G3_OWN; do
+      grep -q "$n on this disc has a name staging keeps" "$LOG/g3-own-$1-1.log" \
+        || { echo "nothing said $n was skipped" >&2; return 1; }
+    done
+  }
+
+  # ---- one level of data/ ---------------------------------------------------
+  g3_nested_disc() {
+    local d=$G3/nested-disc
+    rm -rf "$d"; mkdir -p "$d/data/sub" || return 1
+    head -c 4096 /dev/urandom > "$d/data/sub/disc01.squashfs.age"
+    printf 'an index\n' > "$d/data/index.tsv.gz.age"
+  }
+  g3_nested_ignored() { # g3_nested_ignored sh|go
+    local who=$1 st
+    st=$(g3_stage "nested-$who")
+    g3_ingest "$who" "nested-$who" "$G3/nested-disc" "$LOG/g3-nested-$who.log"
+    [[ -f $st/enc/index.tsv.gz.age ]] \
+      || { echo "the top-level index was not staged, so nothing was read at all" >&2; return 1; }
+    [[ ! -e $st/enc/disc01.squashfs.age ]] \
+      || { echo "data/sub/disc01.squashfs.age was staged as the disc's image" >&2; return 1; }
+  }
+  # With nothing but the subdirectory, there is no file at the top of data/ at
+  # all: a disc neither reader can take anything from, which both fail.
+  g3_flat_empty_disc() {
+    local d=$G3/only-nested-disc
+    rm -rf "$d"; mkdir -p "$d/data/sub" || return 1
+    head -c 4096 /dev/urandom > "$d/data/sub/disc01.squashfs.age"
+  }
+  g3_flat_empty_refused() { # ... sh|go
+    local who=$1 st rc=0
+    st=$(g3_stage "flat-empty-$who")
+    g3_ingest "$who" "flat-empty-$who" "$G3/only-nested-disc" "$LOG/g3-flat-empty-$who.log" || rc=$?
+    (( rc != 0 )) || { echo "a disc with no file at the top of data/ was ingested as a success" >&2; return 1; }
+    [[ -z "$(find "$st/enc" -type f)" ]] || { echo "something was staged off it" >&2; return 1; }
+  }
+
+  # ---- the per-file sidecar as the second witness ---------------------------
+  # No SHA512SUMS on either disc, so the file's own .sha512 is the only witness
+  # left. "mismatch": the image no longer matches its sidecar, and both readers
+  # must say so. "rot": the disc's index copy has rotted while its sidecar
+  # still vouches for the index already staged — damage on this disc, which
+  # both must ingest past rather than refuse as another set's.
+  g3_sidecar_discs() {
+    local m=$G3/sc-mismatch r=$G3/sc-rot
+    rm -rf "$m" "$r"; mkdir -p "$m/data" "$r/data" || return 1
+    head -c 4096 /dev/urandom > "$m/data/disc01.squashfs.age"
+    g3_sidecar "$m/data/disc01.squashfs.age"
+    printf 'x' >> "$m/data/disc01.squashfs.age"
+    head -c 4096 /dev/urandom > "$r/data/disc01.squashfs.age"
+    printf 'the set index\n' > "$r/data/index.tsv.gz.age"
+    g3_sidecar "$r/data/index.tsv.gz.age"
+    printf 'the set indeX\n' > "$r/data/index.tsv.gz.age"
+    printf 'parity\n' > "$r/data/sidecars.par2"
+  }
+  g3_sidecar_mismatch_reported() { # ... sh|go
+    local who=$1
+    g3_stage "scm-$who" >/dev/null
+    g3_ingest "$who" "scm-$who" "$G3/sc-mismatch" "$LOG/g3-scm-$who.log"
+    grep -q 'does not match the hash this disc records' "$LOG/g3-scm-$who.log"
+  }
+  g3_sidecar_rot_ingested() { # ... sh|go
+    local who=$1 st
+    st=$(g3_stage "scr-$who")
+    printf 'the set index\n' > "$st/enc/index.tsv.gz.age"
+    # The exit status, not $PIN_RX: brb.sh's rot warning says the index
+    # "differs from the staged one" on its way to accepting the disc.
+    g3_ingest "$who" "scr-$who" "$G3/sc-rot" "$LOG/g3-scr-$who.log" \
+      || { echo "a rotted index its own sidecar vouches against was refused as another set's" >&2; return 1; }
+    [[ "$(cat "$st/enc/index.tsv.gz.age")" == 'the set index' ]] \
+      || { echo "the pinned index was replaced" >&2; return 1; }
+    [[ -f $st/enc/sidecars-disc01.par2 ]] \
+      || { echo "the disc stopped at its index and never staged its sidecar parity" >&2; return 1; }
+  }
+
+  # ---- a sidecar that is no witness, and an index that is a link ------------
+  # A sidecar that does not parse, or that is a link, says nothing about its
+  # image: both readers say so and copy the image unchecked, as restore treats
+  # the same file once it is staged. brb.sh used to take the damaged one's
+  # first word for a digest and read the linked one through its link, and
+  # count the image bad either way. An index that is a link is a name neither
+  # copy loop reads, so it is not judged against the staged one either; brb.sh
+  # used to follow it there and refuse the disc as another set's.
+  g3_nowitness_discs() {
+    local s=$G3/sc-damaged l=$G3/sc-linked i=$G3/idx-linked o=$G3/outside
+    rm -rf "$s" "$l" "$i" "$o"; mkdir -p "$s/data" "$l/data" "$i/data" "$o" || return 1
+    head -c 4096 /dev/urandom > "$s/data/disc01.squashfs.age"
+    printf 'not a checksum\n' > "$s/data/disc01.squashfs.age.sha512"
+    head -c 4096 /dev/urandom > "$l/data/disc01.squashfs.age"
+    printf '%s  disc01.squashfs.age\n' "$(printf 'some other image' | sha512sum | awk '{print $1}')" \
+      > "$o/disc01.squashfs.age.sha512"
+    ln -s "$o/disc01.squashfs.age.sha512" "$l/data/disc01.squashfs.age.sha512"
+    head -c 4096 /dev/urandom > "$i/data/disc01.squashfs.age"
+    printf "another set's index\n" > "$o/index.tsv.gz.age"
+    ln -s "$o/index.tsv.gz.age" "$i/data/index.tsv.gz.age"
+  }
+  g3_nowitness_said() { # g3_nowitness_said sh|go damaged|linked TEXT
+    local who=$1 kind=$2 text=$3 st lf=$LOG/g3-sc-$2-$1.log
+    st=$(g3_stage "sc-$kind-$who")
+    g3_ingest "$who" "sc-$kind-$who" "$G3/sc-$kind" "$lf" \
+      || { echo "the disc was not ingested cleanly" >&2; return 1; }
+    [[ -f $st/enc/disc01.squashfs.age ]] || { echo "the image was not staged" >&2; return 1; }
+    grep -qF "$text" "$lf" || { echo "nothing said the sidecar is no witness ('$text')" >&2; return 1; }
+    ! grep -q 'does not match the hash this disc records' "$lf" \
+      || { echo "the image was judged against a sidecar that is no witness" >&2; return 1; }
+  }
+  g3_linked_index_not_judged() { # ... sh|go
+    local who=$1 st
+    st=$(g3_stage "idx-linked-$who")
+    printf 'the set index\n' > "$st/enc/index.tsv.gz.age"
+    g3_ingest "$who" "idx-linked-$who" "$G3/idx-linked" "$LOG/g3-idx-linked-$who.log" \
+      || { echo "the disc was refused over an index that is a link" >&2; return 1; }
+    [[ "$(cat "$st/enc/index.tsv.gz.age")" == 'the set index' ]] \
+      || { echo "the pinned index changed" >&2; return 1; }
+    [[ -f $st/enc/disc01.squashfs.age ]] || { echo "the disc's image was not staged" >&2; return 1; }
+  }
+
+  # ---- a second pressing never lands on a name already taken ----------------
+  # Sentinels from a second ago to a few seconds ahead, so the clock ticking
+  # over mid-check changes nothing; the disc's copy differs from the staged one
+  # and has no recorded hash, so it is kept as a second pressing.
+  g3_alt_disc() {
+    local d=$G3/alt-disc
+    rm -rf "$d"; mkdir -p "$d/data" || return 1
+    printf 'this pressing, damaged its own way\n' > "$d/data/disc01.squashfs.age"
+  }
+  g3_alt_sentinels_survive() { # ... sh|go
+    local who=$1 st now s
+    st=$(g3_stage "alt-$who")
+    printf 'the staged pressing\n' > "$st/enc/disc01.squashfs.age"
+    now=$(date +%s)
+    for (( s = now - 1; s <= now + 5; s++ )); do
+      printf 'an earlier pressing, %s\n' "$s" > "$st/enc/disc01.squashfs.age.copy$s"
+    done
+    g3_ingest "$who" "alt-$who" "$G3/alt-disc" "$LOG/g3-alt-$who.log"
+    for (( s = now - 1; s <= now + 5; s++ )); do
+      [[ "$(cat "$st/enc/disc01.squashfs.age.copy$s" 2>/dev/null)" == "an earlier pressing, $s" ]] \
+        || { echo "disc01.squashfs.age.copy$s was overwritten or removed" >&2; return 1; }
+    done
+    grep -lx 'this pressing, damaged its own way' "$st"/enc/disc01.squashfs.age.copy* >/dev/null \
+      || { echo "this disc's copy was not kept under a name of its own" >&2; return 1; }
+  }
+
+  # ---- the same wrong bytes are not kept twice ------------------------------
+  # Both discs record a hash neither image matches. Pressing A read three
+  # times: the first read is kept as the damaged primary, the next two are the
+  # same bytes and are dropped. Pressing B then read twice: kept once.
+  g3_dup_discs() {
+    local a=$G3/dup-a b=$G3/dup-b want
+    rm -rf "$a" "$b"; mkdir -p "$a/data" "$b/data" || return 1
+    want=$(printf 'what the image should have been' | sha512sum | awk '{print $1}')
+    printf 'pressing A, wrong the same way every time\n' > "$a/data/disc01.squashfs.age"
+    printf 'pressing B, wrong another way\n' > "$b/data/disc01.squashfs.age"
+    printf '%s  ./data/disc01.squashfs.age\n' "$want" > "$a/SHA512SUMS"
+    cp "$a/SHA512SUMS" "$b/SHA512SUMS"
+  }
+  g3_dup_not_kept() { # ... sh|go
+    local who=$1 st i
+    st=$(g3_stage "dup-$who")
+    for i in 1 2 3; do g3_ingest "$who" "dup-$who" "$G3/dup-a" "$LOG/g3-dup-$who-a$i.log"; done
+    (( $(find "$st/enc" -name 'disc01.squashfs.age.copy*' | wc -l) == 0 )) \
+      || { echo "re-reading the staged pressing kept byte-identical copies of it" >&2; return 1; }
+    for i in 1 2; do g3_ingest "$who" "dup-$who" "$G3/dup-b" "$LOG/g3-dup-$who-b$i.log"; done
+    (( $(find "$st/enc" -name 'disc01.squashfs.age.copy*' | wc -l) == 1 )) \
+      || { echo "a second pressing read twice was not kept exactly once" >&2; return 1; }
+  }
+  # Only complete copies are compared. An alternate with a ddrescue map beside
+  # it is a salvage, its unread regions zeros the drive never returned, so a
+  # complete read is kept beside it even when its bytes happen to be the
+  # salvage's. A planted copy and map stand in for the salvage: there is no
+  # ddrescue here to make one.
+  g3_salvage_not_compared() { # ... sh|go
+    local who=$1 st
+    st=$(g3_stage "salv-$who")
+    printf 'pressing A, wrong the same way every time\n' > "$st/enc/disc01.squashfs.age"
+    printf 'pressing B, wrong another way\n' > "$st/enc/disc01.squashfs.age.copy1700000000"
+    printf '0x00000000  0x0000001e  -\n' > "$st/enc/disc01.squashfs.age.copy1700000000.mapfile"
+    g3_ingest "$who" "salv-$who" "$G3/dup-b" "$LOG/g3-salv-$who.log"
+    (( $(find "$st/enc" -name 'disc01.squashfs.age.copy*' ! -name '*.mapfile' | wc -l) == 2 )) \
+      || { echo "a complete read was dropped as a copy of an incomplete salvage" >&2; return 1; }
+  }
+
+  assert0 "fixture: two discs of public set P, the first with a damaged key, and one of set Q" g3_keyset_discs
+  assert0 "fixture: a disc carrying names staging keeps for itself" g3_own_disc
+  assert0 "fixture: a disc with a file nested under data/" g3_nested_disc
+  assert0 "fixture: a disc with nothing but a subdirectory in data/" g3_flat_empty_disc
+  assert0 "fixture: discs with no SHA512SUMS whose sidecars are the witness" g3_sidecar_discs
+  assert0 "fixture: discs whose sidecar or index is no witness" g3_nowitness_discs
+  assert0 "fixture: a differing pressing with no recorded hash" g3_alt_disc
+  assert0 "fixture: two pressings that each fail the hash their disc records" g3_dup_discs
+  for who in sh go; do
+    case $who in sh) name="brb.sh" ;; go) name="go brb" ;; esac
+    assert0 "$name refuses a public disc carrying another set's index, and staging is exactly as it was — no key, no image" \
+      g3_foreign_left_nothing "$who"
+    assert0 "$name leaves no key behind from a refused public disc, so the staged set's next disc still goes in" \
+      g3_key_not_left_by_refusal "$who"
+    assert0 "$name stages none of the names staging keeps for itself, and the staged image is untouched" \
+      g3_own_not_staged "$who"
+    assert0 "  ... and says which it skipped" g3_own_named "$who"
+    assert0 "$name stages nothing nested under data/" g3_nested_ignored "$who"
+    assert0 "$name fails a disc with no file at the top of data/, staging nothing" \
+      g3_flat_empty_refused "$who"
+    assert0 "$name checks a copy against its own .sha512 when SHA512SUMS says nothing" \
+      g3_sidecar_mismatch_reported "$who"
+    assert0 "$name ingests past an index its sidecar says has rotted, rather than refusing the disc" \
+      g3_sidecar_rot_ingested "$who"
+    assert0 "$name copies an image unchecked past a damaged .sha512, and says the sidecar is damaged" \
+      g3_nowitness_said "$who" damaged "disc01.squashfs.age.sha512 on this disc is damaged"
+    assert0 "$name copies an image unchecked past a linked .sha512, and says it is a link" \
+      g3_nowitness_said "$who" linked "symbolic link"
+    assert0 "$name does not judge a disc by an index that is a link" \
+      g3_linked_index_not_judged "$who"
+    assert0 "$name never puts a second pressing on a .copy name already taken" \
+      g3_alt_sentinels_survive "$who"
+    assert0 "$name keeps no byte-identical copy of a pressing it already holds" \
+      g3_dup_not_kept "$who"
+    assert0 "$name compares a new copy with complete copies only, not with a salvage" \
+      g3_salvage_not_compared "$who"
+  done
+  unset name
+else
+  skip "ingest of hand-built discs (both readers)" \
+       "script(1) is not installed; ingest reads its disc prompts from /dev/tty and cannot be driven from a pipe"
+fi
 
 # ---------------------------------------------------------------------------
 head_s "18. numbers that reach the shell's arithmetic"

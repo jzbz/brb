@@ -62,7 +62,8 @@ COMMANDS
                            other off
   burn <n|n-m|n-|all>    burn discs, confirming before each; builds each ISO
                          first if it is not there, and removes it again once
-                         the disc is written (KEEP_ISOS=1 keeps it)
+                         the disc is written (KEEP_ISOS=1 keeps it, and so does
+                         a tree with no disc directory to rebuild it from)
   iso <n|n-m|n-|all>     build ISO images and stop, without burning
   verify-disc <n> [mount]
                          read a burned disc back and check every hash
@@ -78,12 +79,12 @@ COMMANDS
                          want. --only and --disc overwrite just the same, in
                          the part of the tree they touch
       --only PATH          extract only this path inside the archive (repeatable).
-                           PATH is relative to the archive root, with no leading
-                           '/': it is the path as 'brb index' prints it, not the
-                           path the file had on the machine that was backed up.
-                           The encrypted index says which disc(s) hold it, and
-                           only those are decrypted. Write --only=PATH for a
-                           path that begins with a dash
+                           PATH is relative to the archive root (a leading '/'
+                           or './' is dropped): it is the path as 'brb index'
+                           prints it, not the path the file had on the machine
+                           that was backed up. The encrypted index says which
+                           disc(s) hold it, and only those are decrypted. Write
+                           --only=PATH for a path that begins with a dash
       --disc N             only this disc
       --keep-images        keep each decrypted image instead of deleting it once
                            it has been extracted
@@ -120,7 +121,8 @@ const packRatioText = `ABOUT PACK_RATIO
   the last PACK_RATIO_WINDOW discs plus PACK_RATIO_MARGIN. The estimate moves in
   both directions, so a stretch of incompressible files raises it again instead
   of packing the rest of the set to a ratio only the first discs achieved. Set
-  PACK_RATIO_ADAPT=0 to hold the configured value fixed.
+  PACK_RATIO_ADAPT=0 to keep the configured value instead; only an overshoot
+  then raises it, for that disc and every disc after it.
 `
 
 // writeHelp prints the full help text, with the configuration section filled
@@ -129,6 +131,12 @@ const packRatioText = `ABOUT PACK_RATIO
 // Whether the values are escaped depends on where they are going, which is the
 // rule the restore side's listings already follow: to a terminal they are
 // rendered visibly, to a pipe or a file they stay byte-exact. See configLines.
+//
+// The rm -rf that closes TYPICAL RUN is a command the operator pastes, and the
+// most destructive one brb ever suggests, so STAGING goes into it as one shell
+// word whatever it holds — the quoting the CONFIGURATION listing above already
+// gives the same value. A valid STAGING with a space in it used to come out as
+// two operands.
 func writeHelp(w io.Writer, cfg *config.Config, cfgPath string) {
 	fmt.Fprintf(w, helpText, version)
 
@@ -169,7 +177,7 @@ TYPICAL RUN
   brb verify-disc 1
   brb restore /tmp/testrestore   # once, before you trust the set
   rm -rf %s
-`, show(cfg.Staging))
+`, ui.ShellWord(show(cfg.Staging)))
 }
 
 // helpEscaper decides how the values in the listing are rendered, by where the
@@ -318,7 +326,7 @@ const assignColumn = 44
 // assign renders one KEY=value with its comment lined up. The value is quoted
 // when it has to be, so the line loads back as the value in force.
 func assign(key, value, note string) string {
-	s := key + "=" + shellWord(value)
+	s := key + "=" + configWord(value)
 	if note == "" {
 		return s
 	}
@@ -358,39 +366,20 @@ func arrayLines(key string, values []string, show func(string) string) []string 
 func quoteAll(in []string, show func(string) string) []string {
 	out := make([]string, 0, len(in))
 	for _, s := range in {
-		out = append(out, shellWord(show(s)))
+		out = append(out, configWord(show(s)))
 	}
 	return out
 }
 
-// shellWord renders one value as a word both readers of a config file take
-// back to the same string: bare when it is made only of characters that mean
-// nothing to bash or to config.Parse, otherwise single-quoted, with an
-// embedded single quote spelled the way the shell does — close the quotes,
-// a backslash-escaped quote, reopen them.
-//
-// Single quotes rather than %q on purpose. Bash does not read \x1b or \t
-// escapes inside double quotes and neither does the Go parser, so a
-// Go-quoted value carrying either would load back as a different string from
-// the one in force; inside single quotes every byte but the quote itself is
-// literal to both. An empty value is rendered bare — KEY= — which both
-// readers take as "leave the default": brb.sh through ${VAR:-default}, the
-// Go parser by the same rule in config.Config.set.
-func shellWord(s string) string {
-	if s == "" || strings.IndexFunc(s, func(r rune) bool { return !bareShellRune(r) }) < 0 {
-		return s
+// configWord renders one value of the configuration listing: ui.ShellWord,
+// except that an empty value is rendered bare — KEY= — which both readers take
+// as "leave the default": brb.sh through ${VAR:-default}, the Go parser by the
+// same rule in config.Config.set. That rule belongs to a config file and not to
+// the shell, which is why it lives here and ShellWord renders an empty string
+// as an empty pair of quotes for the commands brb prints.
+func configWord(s string) string {
+	if s == "" {
+		return ""
 	}
-	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
-}
-
-// bareShellRune reports whether r can stand unquoted in a config value for
-// both readers: letters, digits, and the punctuation that neither bash nor
-// config.Parse gives a meaning to. Everything else — space, the globbing and
-// expansion characters, quotes, #, ~ — forces quoting.
-func bareShellRune(r rune) bool {
-	switch {
-	case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9':
-		return true
-	}
-	return strings.ContainsRune("/._-+:,@%=", r)
+	return ui.ShellWord(s)
 }

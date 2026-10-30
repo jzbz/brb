@@ -41,8 +41,18 @@ const (
 )
 
 // Printer writes brb's status output to a single writer, serialising messages
-// against any progress bar that is currently on screen. A Printer is safe for
-// concurrent use.
+// against any progress bar that is currently on screen.
+//
+// A Printer's methods, and those of its Progress bars, may be called from any
+// goroutine, with two exceptions. Confirm, PromptEnter and NewProgress must not
+// run concurrently with one another: each is a transaction over state the next
+// call depends on — the one input stream, the one tracked bar — and only the
+// single writes inside them are serialised, so two prompts at once read from
+// one bufio.Reader unlocked, and two NewProgress calls at once can leave two
+// bars live. And a prompt should not be issued while another goroutine is still
+// updating a bar, because the bar's next redraw erases the question the
+// operator is meant to be answering. Nothing in brb does either today: every
+// prompt and every bar is driven from the command's own goroutine.
 type Printer struct {
 	mu        sync.Mutex
 	w         io.Writer
@@ -170,6 +180,55 @@ func (p *Printer) write(s string) {
 // rather than written — straight to stdout. See [visible] for what is escaped
 // and why.
 func Visible(s string) string { return visible(s) }
+
+// ShellWord renders s as one word that bash reads back as exactly s: bare when
+// it is made only of characters that mean nothing to bash or to config.Parse,
+// otherwise single-quoted, with an embedded single quote spelled the way the
+// shell does — close the quotes, a backslash-escaped quote, reopen them. The
+// empty string is rendered as an empty pair of single quotes, so it is still
+// one word.
+//
+// It serves two kinds of text. `brb help` lists the configuration as
+// assignments that both readers of a config file have to take back to the
+// values in force. And wherever brb prints a command for the operator to paste
+// — rm -rf on the staging tree, chmod on a key directory, umount on a mount
+// point, chown on a staging directory root does not own — the path in it is the
+// operator's own, and a valid one may hold a space or a glob character. Printed
+// bare, "rm -rf /srv/brb staging" deletes /srv/brb and a relative ./staging
+// wherever it is pasted, and leaves the staging tree, plaintext and all, where
+// it was; -f makes sure nothing says so. bareShellRune's set is safe in both
+// places: = % @ : , + and a dash that does not lead mean nothing in an
+// argument either, and ~ is quoted because bash expands it at the start of a
+// word.
+//
+// Single quotes rather than %q on purpose. Bash does not read \x1b or \t
+// escapes inside double quotes and neither does the Go parser, so a
+// Go-quoted value carrying either would load back as a different string from
+// the one in force; inside single quotes every byte but the quote itself is
+// literal to both. Quoting does nothing to stop a terminal acting on a control
+// byte, so text bound for one still needs [Visible], which leaves ' and \
+// alone and can be applied before or after this with the same result.
+func ShellWord(s string) string {
+	if s == "" {
+		return "''"
+	}
+	if strings.IndexFunc(s, func(r rune) bool { return !bareShellRune(r) }) < 0 {
+		return s
+	}
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
+}
+
+// bareShellRune reports whether r can stand unquoted in a shell word for both
+// bash and config.Parse: letters, digits, and the punctuation that neither
+// gives a meaning to. Everything else — space, the globbing and expansion
+// characters, quotes, #, ~ — forces quoting.
+func bareShellRune(r rune) bool {
+	switch {
+	case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9':
+		return true
+	}
+	return strings.ContainsRune("/._-+:,@%=", r)
+}
 
 // visible renders a message so that nothing in it can drive the terminal.
 //

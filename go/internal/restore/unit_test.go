@@ -10,6 +10,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"testing"
@@ -372,6 +373,48 @@ func TestMapfileMissing(t *testing.T) {
 				t.Fatalf("mapfileMissing = (%d, %v), want (%d, %v)", got, ok, tc.want, tc.ok)
 			}
 		})
+	}
+}
+
+// A line no ddrescue wrote — past maxMapfileLine — is an error naming the map,
+// not a line skipped on the way to reading the rest of an unbounded file.
+func TestMapfileMissingRefusesALineNoDdrescueWrote(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "out.mapfile")
+	body := "0x00000000  0x00001000  +\n# " + strings.Repeat("x", maxMapfileLine+1) + "\n0x00001000  0x00000200  -\n"
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := mapfileMissing(path); err == nil || !strings.Contains(err.Error(), path) {
+		t.Fatalf("mapfileMissing = %v, want an error naming %s", err, path)
+	}
+}
+
+// mapfileMissing used to read the whole map into memory, copy it into a
+// string and split that into one string header per line: about eighteen times
+// the file's size in heap, measured, so a map of a few gigabytes was an
+// out-of-memory kill before a line of it was judged. Streamed, the heap does
+// not grow with the file.
+//
+// Not parallel, and must not be: TotalAlloc counts the whole process, and this
+// package's parallel tests only resume once the sequential ones are done.
+func TestMapfileMissingDoesNotHoldTheMapInMemory(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "out.mapfile")
+	const size = 32 << 20
+	if err := os.WriteFile(path, bytes.Repeat([]byte("\n"), size), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var before, after runtime.MemStats
+	runtime.GC()
+	runtime.ReadMemStats(&before)
+	got, ok, err := mapfileMissing(path)
+	runtime.ReadMemStats(&after)
+	if err != nil || got != 0 || ok {
+		t.Fatalf("mapfileMissing = (%d, %v, %v), want (0, false, nil) for a map of blank lines", got, ok, err)
+	}
+	// The whole-file version allocated ~576 MiB here; streaming allocates the
+	// scanner's buffer and next to nothing else.
+	if grew := after.TotalAlloc - before.TotalAlloc; grew > 16<<20 {
+		t.Fatalf("reading a %d MiB map allocated %d MiB; it is being held in memory, not streamed", size>>20, grew>>20)
 	}
 }
 

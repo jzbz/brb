@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"filippo.io/age"
 
@@ -81,6 +82,46 @@ func TestAsyncHashReportsAShortHash(t *testing.T) {
 	a.written += 512 // as if half a chunk had been dropped on the way in
 	if _, err := a.Sum(); err == nil {
 		t.Fatal("Sum accepted a digest over fewer bytes than were written")
+	}
+}
+
+// TestExportedAsyncHash covers the wrapper restore's fused decryption uses:
+// the same digest as sha512.New, through io.TeeReader the way restore feeds
+// it, and a Release after Sum that is as harmless as the deferred one in every
+// caller.
+func TestExportedAsyncHash(t *testing.T) {
+	t.Parallel()
+	data := make([]byte, 2*asyncHashSize+777)
+	if _, err := rand.Read(data); err != nil {
+		t.Fatalf("rand: %v", err)
+	}
+	want := sha512.Sum512(data)
+
+	h := NewAsyncHash()
+	defer h.Release()
+	if _, err := io.Copy(io.Discard, io.TeeReader(bytes.NewReader(data), h)); err != nil {
+		t.Fatalf("copy: %v", err)
+	}
+	sum, err := h.Sum()
+	if err != nil {
+		t.Fatalf("Sum: %v", err)
+	}
+	if sum != hex.EncodeToString(want[:]) {
+		t.Fatalf("AsyncHash digest %s, sha512 %s", sum, hex.EncodeToString(want[:]))
+	}
+	h.Release()
+
+	// Released without a Sum, as every error path does: the goroutine stops.
+	r := NewAsyncHash()
+	if _, err := r.Write([]byte("abandoned")); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	r.Release()
+	r.Release()
+	select {
+	case <-r.a.dead:
+	case <-time.After(5 * time.Second):
+		t.Fatal("a released AsyncHash's goroutine is still running after 5s")
 	}
 }
 

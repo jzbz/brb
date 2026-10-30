@@ -115,6 +115,23 @@ func Restore(ctx context.Context, o Options, ro RestoreOptions) error {
 			return fmt.Errorf("restore --only %s: that is the whole tree — run restore without --only", p)
 		}
 	}
+	// One spelling per path from here on, so the index, the listing, the
+	// unsquashfs operand and the post-extraction check all see the same string
+	// — see onlyPath. Two spellings of one path collapse into one request
+	// rather than asking unsquashfs for the same thing twice. A new slice, so
+	// the caller's is left as it was given.
+	if len(ro.Only) > 0 {
+		only := make([]string, 0, len(ro.Only))
+		seen := make(map[string]bool, len(ro.Only))
+		for _, p := range ro.Only {
+			p = onlyPath(p)
+			if !seen[p] {
+				seen[p] = true
+				only = append(only, p)
+			}
+		}
+		ro.Only = only
+	}
 	// The restore directory is about to receive every disc's plaintext, and
 	// the enc directory is what the images, their hashes and a public set's
 	// staged key are read from; both have to be real directories of ours
@@ -456,6 +473,30 @@ func isArchiveRoot(p string) bool {
 	return path.Clean("/"+strings.TrimSpace(p)) == "/"
 }
 
+// onlyPath is the one spelling of a --only path that a restore works with:
+// every leading "/" and "./" and every trailing "/" dropped, so that "/lib/a.c",
+// "./lib/a.c" and "lib/a.c//" all name lib/a.c. brb.sh strips exactly the same
+// prefixes and suffixes as it parses the flag, and it has to be the same rule
+// on both sides. It was not: covers() trimmed every slash and nothing else and
+// the operand went to unsquashfs untouched, while brb.sh stripped one trailing
+// slash and one leading "./" and never a leading slash — so "./x" restored on
+// brb.sh and failed here, and "/x" and "x//" did the reverse.
+//
+// It is applied after isArchiveRoot has had the raw spelling, so it never sees
+// a path that would come out empty or ".": those are refused first.
+func onlyPath(p string) string {
+	for {
+		switch {
+		case strings.HasPrefix(p, "/"):
+			p = p[1:]
+		case strings.HasPrefix(p, "./"):
+			p = p[2:]
+		default:
+			return strings.TrimRight(p, "/")
+		}
+	}
+}
+
 // unsquashfsLogName is the file the restore staging directory keeps
 // unsquashfs's output in while an image is extracted, and afterwards when it
 // exited non-fatally: "unsquashfs.disc03.squashfs.log", brb.sh's name for the
@@ -571,7 +612,10 @@ func extractionTouches(only []string, dir string) bool {
 		return true
 	}
 	for _, p := range only {
-		if covers(p, dir) || strings.HasPrefix(strings.Trim(p, "/"), dir+"/") {
+		// Trimmed once for both arms: dir is the request, under it, or an
+		// ancestor of it.
+		t := strings.Trim(p, "/")
+		if coversTrimmed(t, dir) || under(t, dir) {
 			return true
 		}
 	}
@@ -718,12 +762,24 @@ func (o Options) auditImage(ctx context.Context, image, dest string, only []stri
 			if err != nil || fi.Mode()&fs.ModeSymlink == 0 {
 				continue
 			}
-			target, _ := os.Readlink(p)
-			bad = append(bad, fmt.Sprintf("%s -> %s", p, target))
-			// Five named links are enough to act on. Stopping early is only
-			// safe while nothing else needs the rest of the listing; the
-			// cross-check needs all of it, or every unread file would look
-			// like one the image does not hold.
+			// Five named links are enough to act on, and five is all the
+			// refusal ever names — brb.sh's refuse_symlinks_at_dirs stops at
+			// the same five and prints the same sentence. The list stops
+			// growing there whatever happens to the scan: with an index it
+			// used to keep one line per link to the end of the listing and
+			// join them all into the error, so a destination full of planted
+			// links made one message as long as the image's directory list,
+			// and a different one from bash's.
+			if len(bad) < maxNamedSamples {
+				target, _ := os.Readlink(p)
+				bad = append(bad, fmt.Sprintf("%s -> %s", p, target))
+			}
+			// Without an index nothing else reads the rest of the listing, so
+			// it stops here. With one the scan runs on, so that the cross-check
+			// tally is whole: today a symlink refusal is returned before that
+			// tally is consulted, but stopping early would leave every unread
+			// file looking like one the image does not hold, and the order of
+			// the two refusals below should stay free to change.
 			if len(bad) >= maxNamedSamples && want == nil {
 				break
 			}
@@ -915,6 +971,13 @@ func (o Options) pathsPresent(ctx context.Context, image string, want []string) 
 		done <- err
 	}()
 
+	// Each request trimmed once, here, rather than inside covers once per
+	// listing line.
+	trimmed := make([]string, len(want))
+	for i, p := range want {
+		trimmed[i] = strings.Trim(p, "/")
+	}
+
 	sc := bufio.NewScanner(pr)
 	sc.Buffer(make([]byte, 0, 64<<10), maxIndexLine)
 	sc.Split(scanLinesKeepCR)
@@ -930,8 +993,8 @@ func (o Options) pathsPresent(ctx context.Context, image string, want []string) 
 		if !ok {
 			continue
 		}
-		for _, p := range want {
-			if !hit[p] && covers(p, entry) {
+		for j, p := range want {
+			if coversTrimmed(trimmed[j], entry) && !hit[p] {
 				hit[p] = true
 			}
 		}
@@ -995,11 +1058,26 @@ func scanLinesKeepCR(data []byte, atEOF bool) (advance int, token []byte, err er
 // covers reports whether the archive entry satisfies a requested path: the
 // entry itself, or something inside it when the request names a directory.
 func covers(want, entry string) bool {
-	want = strings.Trim(want, "/")
+	return coversTrimmed(strings.Trim(want, "/"), entry)
+}
+
+// coversTrimmed is covers for a want already trimmed of its slashes, so that a
+// caller matching one request against a million entries trims it once rather
+// than once per entry.
+func coversTrimmed(want, entry string) bool {
 	if want == "" || want == "." {
 		return true
 	}
-	return entry == want || strings.HasPrefix(entry, want+"/")
+	return entry == want || under(entry, want)
+}
+
+// under reports whether p lies strictly inside the directory dir. It is
+// strings.HasPrefix(p, dir+"/") without building dir+"/": that concatenation
+// is a heap allocation for any dir past Go's 32-byte stack buffer — most real
+// archive paths — and it ran once per index row, or listing line, per
+// requested path.
+func under(p, dir string) bool {
+	return len(p) > len(dir) && p[len(dir)] == '/' && p[:len(dir)] == dir
 }
 
 // discardImage removes a decrypted image once it has served its purpose. A
@@ -1076,8 +1154,14 @@ func List(ctx context.Context, o Options, n int, w io.Writer) error {
 // filtered. Lines are "<disc number>\t<path>", exactly as brb.sh records them.
 //
 // pattern is matched case-insensitively as a plain substring, not as a regular
-// expression: brb.sh pipes the index through grep, where a path containing a
-// dot or a bracket quietly means something other than what the operator typed.
+// expression, because a path containing a dot or a bracket must mean what the
+// operator typed. brb.sh does the same with grep -F, which it did not always
+// pass: as a basic regular expression, "notes[1]" found nothing and "a[1" was
+// an error, both reported as "no match". It passes grep -a as well, so that a
+// row whose name is not valid UTF-8 is printed as it is here rather than
+// suppressed as binary. What still differs is case folding, which grep takes
+// from the locale and this from Unicode: README.md's table of reader
+// differences has the row.
 //
 // It reads nothing but the staging tree, and it opens the way every other
 // command in this package does, for two reasons that are not obvious for a

@@ -183,6 +183,47 @@ mkdir -p "$stage/$top"
 # .github/, repository infrastructure rather than source (the README links it;
 # a dead relative link is not an instruction that fails), and
 # README-brb-sample.md, which is a rendering of a document brb writes itself.
+#
+# go/ is copied whole, and cp -a takes it as the filesystem has it, not as the
+# repository does: anything else sitting there — a bare `go build` binary, a
+# profile, an editor's settings, a test key — would ship in brb-src.tar.gz, in
+# plaintext beside the encrypted image on every disc and on the release page,
+# under a SHA512SUMS that vouches for it. So such a file stops the build. It is
+# refused rather than filtered out, because quietly leaving out an untracked .go
+# file would ship a tarball that disagrees with the binaries just built from the
+# same tree.
+#
+# Checked here, after vendoring and both builds rather than at the top, so that
+# it also sees anything the build itself left under go/: an output directory
+# named inside go/ puts this run's staging directory there too. go/vendor is
+# exempt because `go mod vendor` above has just rewritten it from go.mod and
+# go.sum alone, and .DS_Store because the find below drops it from the copy.
+#
+# What counts as source is asked of the git that tracks this script, when one
+# does — not merely of one whose work tree this directory sits inside, which
+# would call every file of a source tarball unpacked under a dotfiles repository
+# untracked. --others without --exclude-standard is deliberate: an ignored file
+# ships exactly as an untracked one does. Anywhere else, which means an unpacked
+# source tarball, where the on-disc README's rebuild recipe leaves a go/brb
+# behind, only the kinds of file the source is made of pass: regular files named
+# *.go or *.tmpl, plus go.mod and go.sum, and go/vendor whole. That is the list
+# to update when a new kind of file joins go/; CI unpacks the tarball and fails
+# if this refuses anything in it but the go/brb it plants there.
+if git -C "$REPO" ls-files --error-unmatch -- build-dist.sh >/dev/null 2>&1; then
+  stray="$(git -C "$REPO" ls-files --others -- go ':(exclude)go/vendor' \
+             ':(exclude,glob)go/**/.DS_Store')"
+  stray_fix="git add them, or move them out of go/"
+else
+  stray="$(cd "$REPO" && find go -path go/vendor -prune -o ! -type d ! -name .DS_Store \
+             \( ! -type f -o ! \( -name '*.go' -o -name '*.tmpl' -o -path go/go.mod -o -path go/go.sum \) \) \
+             -print | LC_ALL=C sort)"
+  stray_fix="move them out of go/ (no git tracks this tree, so only *.go, *.tmpl, go.mod, go.sum and go/vendor may be packed)"
+fi
+[[ -z "$stray" ]] || {
+  echo "files under go/ that are not source would ship in brb-src.tar.gz on every disc:" >&2
+  printf '  %s\n' "${stray//$'\n'/$'\n  '}" >&2
+  echo "  $stray_fix, then re-run" >&2
+  exit 1; }
 cp -a "$REPO/go" "$stage/$top/go"
 cp -a "$REPO/brb.sh" "$REPO/LICENSE" "$REPO/README.md" "$REPO/build-dist.sh" \
       "$REPO/xcompat-test.sh" "$REPO/go-e2e-test.sh" "$stage/$top/"

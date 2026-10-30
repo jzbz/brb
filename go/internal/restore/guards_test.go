@@ -4,7 +4,9 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
+	"time"
 )
 
 // A restore into a directory that already holds files must ask first, because
@@ -169,6 +171,145 @@ func TestFindIdentityFallsBackToTheRescueKey(t *testing.T) {
 	enc, err := identityIsEncrypted(rescue)
 	if err != nil || !enc {
 		t.Fatalf("identityIsEncrypted(%s) = %v, %v; want true", rescue, enc, err)
+	}
+}
+
+// fifoReleasedAtCleanup makes a named pipe at path and arranges for any reader
+// still blocked opening it to be released when the test ends, so that a
+// regression that opens it hangs one goroutine for the length of the test and
+// no longer.
+func fifoReleasedAtCleanup(t *testing.T, path string) {
+	t.Helper()
+	if err := syscall.Mkfifo(path, 0o600); err != nil {
+		t.Skipf("cannot make a FIFO here: %v", err)
+	}
+	t.Cleanup(func() {
+		// A writer's open completes a blocked reader's; with no reader
+		// waiting, O_NONBLOCK makes it fail at once instead of hanging.
+		if f, err := os.OpenFile(path, os.O_WRONLY|syscall.O_NONBLOCK, 0); err == nil {
+			f.Close()
+		}
+	})
+}
+
+// findIdentityOrTimeout runs findIdentity with a deadline: a candidate that
+// blocks in open is exactly the failure some of these tests look for.
+func findIdentityOrTimeout(t *testing.T, e *env) (string, bool) {
+	t.Helper()
+	type result struct {
+		path string
+		ok   bool
+	}
+	ch := make(chan result, 1)
+	go func() {
+		p, ok := findIdentity(e.cfg)
+		ch <- result{p, ok}
+	}()
+	select {
+	case r := <-ch:
+		return r.path, r.ok
+	case <-time.After(5 * time.Second):
+		t.Fatalf("findIdentity has not returned after 5s; a candidate blocked it")
+		return "", false
+	}
+}
+
+// findIdentity takes only a regular file, as brb.sh's `[[ -f && -r ]]` does.
+// An AGE_IDENTITY naming a directory, a FIFO or a device used to end the
+// search there — "is a directory", a hang in open, or a sniff of /dev/zero
+// that runs out of memory — while brb.sh skipped it for <AGE_IDENTITY>.age or
+// the rescue key, so the same set restored under one reader and not the other.
+// Both fallbacks are checked for each kind.
+func TestFindIdentitySkipsAnIdentityThatIsNotARegularFile(t *testing.T) {
+	kinds := map[string]func(t *testing.T, path string){
+		"directory": func(t *testing.T, path string) {
+			if err := os.Mkdir(path, 0o700); err != nil {
+				t.Fatal(err)
+			}
+		},
+		"fifo": fifoReleasedAtCleanup,
+	}
+	for kind, mk := range kinds {
+		for _, fallback := range []string{"container", "rescue"} {
+			t.Run(kind+" falls back to the "+fallback, func(t *testing.T) {
+				e := newEnv(t)
+				keydir := filepath.Dir(e.cfg.AgeRecipientsFile)
+				e.cfg.AgeIdentity = filepath.Join(keydir, "odd-identity")
+				mk(t, e.cfg.AgeIdentity)
+				want := e.cfg.AgeIdentity + ageExt
+				if fallback == "rescue" {
+					want = filepath.Join(keydir, "rescue-identity.txt"+ageExt)
+				}
+				if err := os.WriteFile(want, []byte("age-encryption.org/v1\n"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				if got, ok := findIdentityOrTimeout(t, e); !ok || got != want {
+					t.Fatalf("findIdentity = %q, %v; want %q", got, ok, want)
+				}
+			})
+		}
+	}
+
+	// A character device, the case that ran the sniff out of memory. /dev/null
+	// stands in for /dev/zero so a regression fails rather than allocates.
+	if fi, err := os.Stat(os.DevNull); err == nil && fi.Mode()&os.ModeCharDevice != 0 {
+		e := newEnv(t)
+		keydir := filepath.Dir(e.cfg.AgeRecipientsFile)
+		e.cfg.AgeIdentity = os.DevNull
+		rescue := filepath.Join(keydir, "rescue-identity.txt"+ageExt)
+		if err := os.WriteFile(rescue, []byte("age-encryption.org/v1\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if got, ok := findIdentityOrTimeout(t, e); !ok || got != rescue {
+			t.Fatalf("findIdentity with AGE_IDENTITY=%s = %q, %v; want the rescue key %q", os.DevNull, got, ok, rescue)
+		}
+	}
+
+	// And a symlink to a real identity still counts, since `-f` follows links.
+	e := newEnv(t)
+	link := filepath.Join(e.dir, "linked-identity.txt")
+	if err := os.Symlink(e.cfg.AgeIdentity, link); err != nil {
+		t.Fatal(err)
+	}
+	e.cfg.AgeIdentity = link
+	if got, ok := findIdentityOrTimeout(t, e); !ok || got != link {
+		t.Fatalf("findIdentity with a symlinked AGE_IDENTITY = %q, %v; want %q", got, ok, link)
+	}
+}
+
+// The public archive's staged key counts only as a regular file, as brb.sh's
+// `[[ -f "$pub" ]]` has it. Anything else at that name is ignored by both
+// readers: the configured identity is used, and nothing hangs or fails.
+func TestIdentitiesIgnoresAStagedKeyThatIsNotARegularFile(t *testing.T) {
+	for kind, mk := range map[string]func(t *testing.T, path string){
+		"directory": func(t *testing.T, path string) {
+			if err := os.Mkdir(path, 0o700); err != nil {
+				t.Fatal(err)
+			}
+		},
+		"fifo": fifoReleasedAtCleanup,
+	} {
+		t.Run(kind, func(t *testing.T) {
+			e := newEnv(t)
+			mk(t, e.opts().stagedPublicIdentity())
+			type result struct {
+				n   int
+				err error
+			}
+			ch := make(chan result, 1)
+			go func() {
+				ids, err := e.opts().identities()
+				ch <- result{len(ids), err}
+			}()
+			select {
+			case r := <-ch:
+				if r.err != nil || r.n != 1 {
+					t.Fatalf("identities() = %d key(s), %v; want the configured identity alone", r.n, r.err)
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("identities() has not returned after 5s; the staged key blocked it")
+			}
+		})
 	}
 }
 

@@ -31,9 +31,11 @@ import (
 
 // Config is the complete set of knobs brb exposes. Every field corresponds to
 // one upper-case shell variable of the same name in a config file; Keys lists
-// the names. brb.sh reads four of them — STAGING, AGE_RECIPIENTS_FILE,
-// AGE_IDENTITY and BURNER — plus its own KEEP_IMAGES, which is not a key here;
-// the rest shape how a set is written and exist in this implementation only.
+// the names. brb.sh reads six of them — STAGING, AGE_RECIPIENTS_FILE,
+// AGE_IDENTITY, BURNER and the reader-side KEEP_IMAGES and ASSUME_YES — and
+// its verify-disc also compares a disc's archive with ARCHIVE_NAME when a
+// writer config sets it. The rest shape how a set is written and exist in this
+// implementation only.
 type Config struct {
 	// SourceDir is the tree to back up (SOURCE_DIR).
 	SourceDir string
@@ -120,14 +122,14 @@ type Config struct {
 	// The flag --keep-images does the same for one command.
 	//
 	// This is a READER-side setting in a file both implementations read. It is
-	// here because brb.sh has always taken it from the config (brb.sh:95), so a
+	// here because brb.sh has always taken it from the config, so a
 	// config that drives one reader has to drive the other, and because the
 	// README's own sample prints it — a sample the Go build refused to load
 	// while this key was unknown.
 	KeepImages bool
 	// AssumeYes answers every confirmation without asking, as --yes does for
 	// one command (ASSUME_YES). Reader-side, and taken from the config for the
-	// same reason as KeepImages: brb.sh has always honoured it (brb.sh:113).
+	// same reason as KeepImages: brb.sh has always honoured it.
 	//
 	// It is a loaded setting to put in a file. `restore` overwrites its
 	// destination, and this is what answers the question that would otherwise
@@ -252,9 +254,11 @@ func Compressions() []string {
 // Default returns the built-in configuration. ArchiveName is left empty; Load,
 // or ResolveDefaults, derives it from SourceDir and today's date.
 //
-// The four settings brb.sh also reads — STAGING, AGE_RECIPIENTS_FILE,
-// AGE_IDENTITY and BURNER — match its defaults (brb.sh:89-92); the rest are
-// writer-only and have no counterpart there, since brb.sh no longer writes.
+// The six settings brb.sh also reads — STAGING, AGE_RECIPIENTS_FILE,
+// AGE_IDENTITY, BURNER, KEEP_IMAGES and ASSUME_YES — match its defaults
+// (reader_defaults near the top of brb.sh, and ASSUME_YES's line after it);
+// the rest are writer-only and have no counterpart there, since brb.sh no
+// longer writes.
 //
 // The two home-derived values are left EMPTY when there is no home directory to
 // derive them from, rather than joined onto an empty string: filepath.Join
@@ -306,9 +310,9 @@ func Default() *Config {
 // It returns "" when neither is available, for the reason [Default] gives: a
 // join onto an absent home is a relative path, and brb would read its
 // configuration out of the current directory. brb.sh refuses the same
-// situation — under set -u its CONFIG_FILE="${BRB_CONFIG:-$HOME/.config/brb/
-// config}" (brb.sh:67) aborts with "HOME: unbound variable" — and Load turns
-// the empty result into an error saying the same thing in words.
+// situation — under set -u the CONFIG_FILE="${BRB_CONFIG:-$HOME/.config/brb/
+// config}" among its defaults aborts with "HOME: unbound variable" — and Load
+// turns the empty result into an error saying the same thing in words.
 func DefaultConfigPath() string {
 	if p := os.Getenv("BRB_CONFIG"); p != "" {
 		return p
@@ -371,9 +375,18 @@ func (c *Config) ResolveDefaults() {
 }
 
 // Load starts from Default, applies the configuration file when it exists, then
-// the environment, which wins. A missing file is not an error; an unreadable or
-// malformed one is. Pass "" for path to use DefaultConfigPath.
-func Load(path string) (*Config, error) {
+// the environment, which wins. A missing file is not an error; an unreadable,
+// malformed or non-regular one is. Pass "" for path to use DefaultConfigPath.
+//
+// Each adjust function runs once every layer has been applied and before the
+// checks that judge the result: that is where a command-line flag that stands
+// for a setting has to be applied. `backup --public-archive` is one: it means
+// PUBLIC_ARCHIVE=1, but it used to be applied by the CLI after Load returned,
+// so it could not reach checkHomeDerived's public-archive exemption. With no
+// HOME and no AGE_RECIPIENTS_FILE, PUBLIC_ARCHIVE=1 got through and the flag
+// that the README calls the same thing was refused — told to name a recipients
+// file a public archive never reads.
+func Load(path string, adjust ...func(*Config)) (*Config, error) {
 	c := Default()
 	if path == "" {
 		path = DefaultConfigPath()
@@ -387,6 +400,22 @@ func Load(path string) (*Config, error) {
 	switch {
 	case err == nil && fi.IsDir():
 		return nil, fmt.Errorf("config file %s is a directory", path)
+	case err == nil && !fi.Mode().IsRegular():
+		// A FIFO, a device, a socket, or a pipe handed over as /dev/fd/N by
+		// `-c <(...)`. brb.sh's load_config tests -f, and refuses every one of
+		// these in the same words; this used to read them. os.ReadFile on a
+		// FIFO blocks until a writer appears, so `brb -c fifo` — and `brb help`,
+		// which loads the same way — hung past the first Ctrl-C, and with
+		// BRB_CONFIG=<(printf 'STAGING=...') the two readers ran against two
+		// different staging directories, brb.sh having said "no config file"
+		// and fallen back to its defaults. os.Stat follows a symlink and never
+		// opens the file, so it cannot block, and a symlink to a regular config
+		// still loads in both readers.
+		//
+		// The stat and ParseFile's open are still two lookups of one name. Only
+		// someone who can replace the file in its directory can get between
+		// them, and that someone already controls the configuration outright.
+		return nil, fmt.Errorf("config file %s is not a regular file", path)
 	case err == nil:
 		vals, err := ParseFile(path)
 		if err != nil {
@@ -402,6 +431,9 @@ func Load(path string) (*Config, error) {
 	}
 	if err := c.ApplyEnv(os.Getenv); err != nil {
 		return nil, err
+	}
+	for _, f := range adjust {
+		f(c)
 	}
 	c.ResolveDefaults()
 	if err := c.checkHomeDerived(); err != nil {
@@ -528,12 +560,26 @@ func (c *Config) Apply(vals map[string]Value) error {
 // stub in tests; nil means os.Getenv.
 //
 // The shell has already stripped quoting from an environment variable, so only
-// two conveniences are applied: a leading ~ and $HOME/${HOME} are expanded, and
-// a value for PRUNE_DIRS or EXCLUDE_MASKS that is written as an array literal —
-// "( a b )" — is parsed as one. Any other value of those two is a single
-// element, since a shell cannot export an array and a bare word in the
+// two conveniences are applied, and each to its own kind of value.
+//
+// A scalar has a lone ~ or a leading ~/, and $HOME or ${HOME} anywhere in it,
+// expanded when HOME is set (expandHomePath; ~user and a ~ further in are left
+// alone), and is used exactly as written when HOME is not. That is the rule
+// brb.sh applies, HOME unset included, to the environment values it reads
+// (env_home_expand), so STAGING='~/brb' from a systemd unit names one
+// directory to both readers; a refusal of the no-HOME case here would be one
+// only this reader made. The same marker in the FILE with no HOME is refused
+// (homeOrErr), where it has a line to point at.
+//
+// A PRUNE_DIRS or EXCLUDE_MASKS value written as an array literal, "( a b )",
+// is parsed the way the file would parse it: expanded, and refused when HOME is
+// not set. Any other value of those two is one element taken verbatim, with no
+// expansion at all, since a shell cannot export an array and a bare word in the
 // environment is one entry, never a list split on spaces: a directory called
-// "Old Stuff" would otherwise become two prune entries that match nothing.
+// "Old Stuff" would otherwise become two prune entries that match nothing. This
+// comment used to promise the expansion for those too. It was never applied,
+// and would not help if it were: prune entries are relative to SOURCE_DIR and
+// lose their leading '/', and a mask is matched against a base name.
 func (c *Config) ApplyEnv(getenv func(string) string) error {
 	if getenv == nil {
 		getenv = os.Getenv
@@ -556,9 +602,14 @@ func (c *Config) ApplyEnv(getenv func(string) string) error {
 }
 
 // envValue turns one environment string into a Value.
+//
+// An array literal may have blanks in front of it, as the prefix test allows,
+// and they are dropped before it is handed to Parse. Kept, they sat between
+// the '=' and the '(' of the line built here, and PRUNE_DIRS=' ( a )' was
+// refused as a syntax error in a line nobody wrote.
 func envValue(key, raw string) (Value, error) {
-	if isArrayKey(key) && strings.HasPrefix(strings.TrimLeft(raw, " \t"), "(") {
-		vals, err := Parse(key+"="+raw, "environment")
+	if lit := strings.TrimLeft(raw, " \t"); isArrayKey(key) && strings.HasPrefix(lit, "(") {
+		vals, err := Parse(key+"="+lit, "environment")
 		if err != nil {
 			return Value{}, err
 		}
@@ -589,6 +640,12 @@ func envValue(key, raw string) (Value, error) {
 // would leave no spelling for it; see [Value.list]. An unknown key is still an
 // error even when it is empty: NO_SUCH_KEY= in a shared file is the same typo
 // as NO_SUCH_KEY=1, and the README promises it is reported.
+//
+// The parity claim above was only half true until brb.sh's load_config began
+// applying its defaults a second time, after sourcing the file
+// (reader_defaults). Applied only before, as they were, an empty STAGING=,
+// AGE_RECIPIENTS_FILE= or BURNER= in the file overwrote the default with
+// nothing there, while it left the default in force here.
 //
 // KEEP_IMAGES used to be this comment's example, which was the wrong example:
 // it is a real key brb.sh has always read, printed in the README's own sample
@@ -888,9 +945,20 @@ func (c *Config) Validate() error {
 	// empty window has no worst case, so an estimate taken from it is not a
 	// measurement at all. Refuse it by name rather than silently disable the
 	// adaptation the operator asked for.
+	//
+	// With adaptation off the window is never read, but it is still checked:
+	// accepting it there would relax what loads today, and PACK_RATIO_MARGIN,
+	// equally unused then, would want the same treatment. What changes with
+	// the mode is the advice. It used to be "set PACK_RATIO_ADAPT=0" in both,
+	// so an operator who followed it and kept the zero got the same refusal
+	// back, word for word, telling them to set what they had just set.
 	if c.PackRatioWindow < 1 {
-		errs = append(errs, fmt.Errorf("PACK_RATIO_WINDOW must be at least 1, got %d "+
-			"(set PACK_RATIO_ADAPT=0 to keep PACK_RATIO fixed instead)", c.PackRatioWindow))
+		hint := "set PACK_RATIO_ADAPT=0, not a window below 1, to stop learning the ratio from finished discs"
+		if !c.PackRatioAdapt {
+			hint = "unused while PACK_RATIO_ADAPT=0, but still checked; remove the line to take the default"
+		}
+		errs = append(errs, fmt.Errorf("PACK_RATIO_WINDOW must be at least 1, got %d (%s)",
+			c.PackRatioWindow, hint))
 	}
 	// Below 1.0 the margin plans every disc to come out over budget, and each
 	// overshoot costs a full mksquashfs pass over multiple gigabytes.
@@ -901,9 +969,13 @@ func (c *Config) Validate() error {
 	// protected — the run dies with "json: unsupported value: +Inf" and leaves
 	// no state to resume from. Ten is far past any safety factor with a use.
 	// The range test also subsumes the IsInf call it replaces.
+	//
+	// The message names both ends. It named only the lower one after the upper
+	// was added, so PACK_RATIO_MARGIN=11 was refused for "must be at least
+	// 1.0" — a rule it keeps — and never told what it broke.
 	if !(c.PackRatioMargin >= 1 && c.PackRatioMargin <= packRatioMarginMax) {
 		errs = append(errs, fmt.Errorf("PACK_RATIO_MARGIN is a safety factor over the measured "+
-			"ratio and must be at least 1.0, got %g", c.PackRatioMargin))
+			"ratio and must be between 1.0 and %d, got %g", packRatioMarginMax, c.PackRatioMargin))
 	}
 
 	if err := c.validateCompression(); err != nil {

@@ -254,16 +254,68 @@ func isPipeClosed(err error) bool {
 		errors.Is(err, io.ErrClosedPipe)
 }
 
+// probeLimit bounds how much of a tool's output brb keeps when that output is
+// the answer rather than a log: a version or help probe, and the superblock
+// summary of "unsquashfs -s". The largest real answer is mksquashfs -help-all,
+// tens of kilobytes, so a mebibyte refuses nothing a working tool says.
+const probeLimit = 1 << 20
+
+// errOutputLimit is what a headBuffer's Write returns once it is full.
+var errOutputLimit = errors.New("output limit reached")
+
+// headBuffer keeps the first limit bytes written to it and then refuses the
+// rest with errOutputLimit.
+//
+// The refusal is the point. Handed a writer that is not an *os.File, os/exec
+// copies the child's pipe into it, and on a write error it stops copying and
+// closes the read end, so the child's next write gets EPIPE — SIGPIPE, for
+// anything that has not chosen otherwise — and a tool flooding its output stops
+// within a pipe's worth of the limit instead of at the timeout, or never. The
+// timeouts bound time and nothing else: a broken mksquashfs answering -version
+// with an endless stream reached gigabytes inside one second through a
+// bytes.Buffer, and Detect probes every known tool on almost every command, so
+// one misbehaving optional helper took a restore down with it. restore's
+// boundedHead is the opposite choice on purpose — it accepts and drops, because
+// failing the write would SIGPIPE ddrescue in the middle of a salvage — and the
+// two are not to be merged.
+//
+// over records that bytes were refused, which a full buffer alone cannot say:
+// output of exactly limit bytes fills it without overflowing it.
+type headBuffer struct {
+	limit int
+	buf   []byte
+	over  bool
+}
+
+func (b *headBuffer) Write(p []byte) (int, error) {
+	room := b.limit - len(b.buf)
+	if len(p) <= room {
+		b.buf = append(b.buf, p...)
+		return len(p), nil
+	}
+	room = max(room, 0)
+	b.buf = append(b.buf, p[:room]...)
+	b.over = true
+	return room, errOutputLimit
+}
+
+func (b *headBuffer) String() string { return string(b.buf) }
+
 // combinedOutput runs a short-lived probe and returns its stdout and stderr
 // together. The exit status is returned but callers generally ignore it:
 // several of these tools print a version and then exit non-zero.
+//
+// At most probeLimit bytes are kept; see headBuffer for why the rest is
+// refused rather than dropped. Stdout and Stderr are one pointer, so os/exec
+// gives them one pipe and one copying goroutine, and the buffer is never
+// written from two at once.
 func combinedOutput(ctx context.Context, path string, args ...string) (string, error) {
 	cmd := exec.CommandContext(ctx, path, args...)
 	cmd.Cancel = func() error { return cmd.Process.Kill() }
 	cmd.WaitDelay = time.Second
-	var buf bytes.Buffer
-	cmd.Stdout = &buf
-	cmd.Stderr = &buf
+	buf := &headBuffer{limit: probeLimit}
+	cmd.Stdout = buf
+	cmd.Stderr = buf
 	err := cmd.Run()
 	return buf.String(), err
 }

@@ -1,18 +1,21 @@
 package backup
 
 import (
-	"bufio"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
+	"path"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 	"unicode/utf8"
 
 	"github.com/jzbz/brb/internal/fsx"
+	"github.com/jzbz/brb/internal/scan"
+	"github.com/jzbz/brb/internal/ui"
 )
 
 // StateVersion is the schema version written into state.json. LoadState
@@ -34,6 +37,17 @@ type State struct {
 	Archive string `json:"archive"`
 	// Source is the directory being backed up.
 	Source string `json:"source"`
+	// ArchiveRaw and SourceRaw carry Archive and Source byte for byte whenever
+	// they are not valid UTF-8, as AssignedRaw does for Assigned (see there):
+	// base64 of the exact bytes, absent otherwise. checkResume compares both
+	// with the configuration byte for byte, so a SOURCE_DIR named in, say,
+	// Latin-1 came back from state.json with U+FFFD where its accented letters
+	// had been, and every resume of that set was refused as belonging to
+	// another source — with the configuration unchanged, and no setting that
+	// could satisfy it. A derived ARCHIVE_NAME inherits the directory's bytes
+	// and failed the same way.
+	ArchiveRaw string `json:"archive_raw,omitempty"`
+	SourceRaw  string `json:"source_raw,omitempty"`
 	// Started is when the first disc of the set began, RFC 3339.
 	Started string `json:"started"`
 	// DiscsDone is the number of discs fully written, encrypted and protected.
@@ -50,7 +64,35 @@ type State struct {
 	// every resumed run wrote it to yet another disc, forever. It is written
 	// only when it is needed, so a state file for an ordinary tree is
 	// unchanged and stays readable at a glance.
+	//
+	// Like every *Raw field it exists in the file and nowhere else: SaveState
+	// computes it on the copy it encodes, and LoadState folds it back into
+	// Assigned and clears it. Kept on the live State it was a second copy of
+	// every assigned path — 4/3 of their bytes, over a hundred megabytes for a
+	// million ordinary-length paths once one of them held a stray byte — held
+	// for the rest of the run with nothing reading it, since every save
+	// rebuilds it anyway.
 	AssignedRaw string `json:"assigned_raw,omitempty"`
+	// Skeleton records every non-file entry a finished disc holds, as a kind
+	// letter, a space and the path: "d Photos" for a directory, "l
+	// Photos/latest" for a symlink, and "o" for the fifos, sockets and device
+	// nodes the scan does not tell apart. It is the union over every run that
+	// finished a disc, because each disc carries the whole skeleton of the
+	// scan that built it, and an entry a later scan no longer sees is still on
+	// the discs an earlier one wrote. resumeFilter refuses a resume that would
+	// give one of these paths a different kind, as Assigned lets it do for the
+	// regular files; resumeFilter says why. Sorted, so the same tree writes the
+	// same file. SkeletonRaw is to it what AssignedRaw is to Assigned.
+	//
+	// Absent from a state file written before the field existed, and from one
+	// rewritten since by a brb that predates it: StateVersion is unchanged, so
+	// such a brb resumes the set, ignores the field and drops it from its next
+	// save. Either way resumeFilter can still work out the directories that
+	// hold an assigned file, which are the ones a change is most likely to
+	// break, and nothing else of the earlier discs; from the first disc a
+	// newer brb finishes, its own scan's skeleton is recorded alongside them.
+	Skeleton    []string `json:"skeleton,omitempty"`
+	SkeletonRaw string   `json:"skeleton_raw,omitempty"`
 	// PackRatio is the compressed/raw ratio in force, which the shrink-retry
 	// loop may have raised and the adaptive estimator may have lowered.
 	PackRatio float64 `json:"pack_ratio"`
@@ -221,53 +263,182 @@ func LoadState(path string) (*State, error) {
 		return nil, fmt.Errorf("backup: resume state %s reports %d completed disc(s) but lists no files",
 			path, s.DiscsDone)
 	}
-	if err := s.restoreRawPaths(); err != nil {
+	if err := s.restoreRaw(); err != nil {
+		return nil, fmt.Errorf("backup: resume state %s: %w", path, err)
+	}
+	// Parsed here as well as where it is used, so a damaged entry is reported
+	// as a damaged state file before anything is decided from it.
+	if _, err := s.skeletonKinds(); err != nil {
 		return nil, fmt.Errorf("backup: resume state %s: %w", path, err)
 	}
 	return &s, nil
 }
 
-// rawSep separates paths inside AssignedRaw. NUL is the one byte a Unix path
+// rawSep separates the entries of a raw list. NUL is the one byte a Unix path
 // cannot hold, which is what makes the encoding unambiguous.
 const rawSep = "\x00"
 
-// encodeRawPaths fills AssignedRaw when at least one assigned path is not
-// valid UTF-8, and clears it otherwise so the field never lingers with stale
-// contents after the list changes.
-func (s *State) encodeRawPaths() {
-	need := false
-	for _, p := range s.Assigned {
+// rawList is the value of a *Raw field for list: base64 of its entries joined
+// by NUL when at least one of them is not valid UTF-8, and "" otherwise, so a
+// state file for an ordinary tree carries no raw field at all.
+func rawList(list []string) string {
+	for _, p := range list {
 		if !utf8.ValidString(p) {
-			need = true
-			break
+			return base64.StdEncoding.EncodeToString([]byte(strings.Join(list, rawSep)))
 		}
 	}
-	if !need {
-		s.AssignedRaw = ""
-		return
-	}
-	s.AssignedRaw = base64.StdEncoding.EncodeToString([]byte(strings.Join(s.Assigned, rawSep)))
+	return ""
 }
 
-// restoreRawPaths replaces Assigned with the byte-exact list when one was
-// recorded. A file that disagrees with itself is refused rather than guessed
-// at: the list decides which files a resumed run will skip, so misreading it
-// leaves data out of the archive.
-func (s *State) restoreRawPaths() error {
-	if s.AssignedRaw == "" {
-		return nil
+// rawText is rawList for a single name: one entry joins to itself, so the
+// encoding is the same, and restoreRawText decodes it without splitting.
+func rawText(s string) string { return rawList([]string{s}) }
+
+// restoreRaw replaces each field that has a byte-exact form recorded with that
+// form, then clears the raw fields, so the live State holds one copy of every
+// path and not two. A file that disagrees with itself is refused rather than
+// guessed at: Assigned decides which files a resumed run skips, Skeleton which
+// changes it refuses, and Archive and Source whether the state belongs to this
+// set at all, so misreading any of them leaves data out of the archive.
+func (s *State) restoreRaw() error {
+	var err error
+	if s.Assigned, err = restoreRawList("assigned", s.Assigned, s.AssignedRaw); err != nil {
+		return err
 	}
-	blob, err := base64.StdEncoding.DecodeString(s.AssignedRaw)
-	if err != nil {
-		return fmt.Errorf("assigned_raw is not valid base64: %w", err)
+	if s.Skeleton, err = restoreRawList("skeleton", s.Skeleton, s.SkeletonRaw); err != nil {
+		return err
 	}
-	raw := strings.Split(string(blob), rawSep)
-	if len(raw) != len(s.Assigned) {
-		return fmt.Errorf("assigned_raw lists %d path(s) but assigned lists %d",
-			len(raw), len(s.Assigned))
+	if s.Archive, err = restoreRawText("archive", s.Archive, s.ArchiveRaw); err != nil {
+		return err
 	}
-	s.Assigned = raw
+	if s.Source, err = restoreRawText("source", s.Source, s.SourceRaw); err != nil {
+		return err
+	}
+	s.AssignedRaw, s.SkeletonRaw, s.ArchiveRaw, s.SourceRaw = "", "", "", ""
 	return nil
+}
+
+// restoreRawList returns the list a raw form records, or list itself when no
+// raw form was written. The two are written together from one slice, so a raw
+// form holding a different number of entries means the file was edited or
+// truncated.
+func restoreRawList(field string, list []string, raw string) ([]string, error) {
+	if raw == "" {
+		return list, nil
+	}
+	blob, err := base64.StdEncoding.DecodeString(raw)
+	if err != nil {
+		return nil, fmt.Errorf("%s_raw is not valid base64: %w", field, err)
+	}
+	out := strings.Split(string(blob), rawSep)
+	if len(out) != len(list) {
+		return nil, fmt.Errorf("%s_raw lists %d name(s) but %s lists %d", field, len(out), field, len(list))
+	}
+	return out, nil
+}
+
+// restoreRawText is restoreRawList for a single name.
+func restoreRawText(field, text, raw string) (string, error) {
+	if raw == "" {
+		return text, nil
+	}
+	blob, err := base64.StdEncoding.DecodeString(raw)
+	if err != nil {
+		return "", fmt.Errorf("%s_raw is not valid base64: %w", field, err)
+	}
+	return string(blob), nil
+}
+
+// skeletonTag is the letter a Skeleton entry records k under; see
+// State.Skeleton. A regular file has none, because Assigned records those.
+func skeletonTag(k scan.Kind) (byte, bool) {
+	switch k {
+	case scan.KindDir:
+		return 'd', true
+	case scan.KindSymlink:
+		return 'l', true
+	case scan.KindOther:
+		return 'o', true
+	}
+	return 0, false
+}
+
+// skeletonKind is skeletonTag the other way round.
+func skeletonKind(tag byte) (scan.Kind, bool) {
+	switch tag {
+	case 'd':
+		return scan.KindDir, true
+	case 'l':
+		return scan.KindSymlink, true
+	case 'o':
+		return scan.KindOther, true
+	}
+	return 0, false
+}
+
+// skeletonKinds parses Skeleton into a lookup from path to kind. An entry that
+// does not parse is refused, not skipped: skipping it would quietly drop the
+// check that stands between a resume and a set that cannot be restored.
+func (s *State) skeletonKinds() (map[string]scan.Kind, error) {
+	m := make(map[string]scan.Kind, len(s.Skeleton))
+	for i, ent := range s.Skeleton {
+		k, ok := scan.Kind(0), false
+		if len(ent) > 2 && ent[1] == ' ' {
+			k, ok = skeletonKind(ent[0])
+		}
+		if !ok {
+			return nil, fmt.Errorf("skeleton entry %d (%q) is not a kind letter, a space and a path", i+1, ent)
+		}
+		m[ent[2:]] = k
+	}
+	return m, nil
+}
+
+// writtenKinds is the kind every non-file path on a finished disc has there:
+// the recorded Skeleton, plus every directory that holds an assigned file.
+// Those directories are in the Skeleton of whichever run wrote the file, so
+// for a current state file they add nothing; for one written before Skeleton
+// existed they are all there is to check against. They cost about one lookup
+// per assigned file, because a directory already present has its ancestors
+// present too.
+func (s *State) writtenKinds() (map[string]scan.Kind, error) {
+	m, err := s.skeletonKinds()
+	if err != nil {
+		return nil, err
+	}
+	for _, p := range s.Assigned {
+		for d := path.Dir(p); d != "." && d != "/"; d = path.Dir(d) {
+			if _, ok := m[d]; ok {
+				break
+			}
+			m[d] = scan.KindDir
+		}
+	}
+	return m, nil
+}
+
+// recordSkeleton sets Skeleton to kinds — what the finished discs hold, from
+// writtenKinds, or nil on a fresh run — plus every non-file entry of a scan
+// whose skeleton is about to go onto another disc. kinds is used up: each path
+// the scan names is deleted from it as the scan's entry is added, so what is
+// left is what the discs hold and the tree has since lost. Where both name a
+// path they agree, because resumeFilter records nothing until it has refused
+// every case where they do not.
+func (s *State) recordSkeleton(kinds map[string]scan.Kind, entries []scan.Entry) {
+	out := make([]string, 0, len(kinds))
+	for _, e := range entries {
+		if tag, ok := skeletonTag(e.Kind); ok {
+			out = append(out, string(tag)+" "+e.Rel)
+			delete(kinds, e.Rel)
+		}
+	}
+	for p, k := range kinds {
+		if tag, ok := skeletonTag(k); ok {
+			out = append(out, string(tag)+" "+p)
+		}
+	}
+	sort.Strings(out)
+	s.Skeleton = out
 }
 
 // SaveState writes a state file atomically: a temporary file in the same
@@ -280,7 +451,13 @@ func SaveState(path string, s *State) (err error) {
 	if s.Version == 0 {
 		s.Version = StateVersion
 	}
-	s.encodeRawPaths()
+	// The raw forms go on a shallow copy, which shares every slice with s, so
+	// the caller's State never holds them; see State.AssignedRaw. Computing
+	// them afresh from the lists is also what keeps a stale one from outliving
+	// a change to its list.
+	onDisk := *s
+	onDisk.AssignedRaw, onDisk.SkeletonRaw = rawList(s.Assigned), rawList(s.Skeleton)
+	onDisk.ArchiveRaw, onDisk.SourceRaw = rawText(s.Archive), rawText(s.Source)
 
 	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
@@ -297,19 +474,22 @@ func SaveState(path string, s *State) (err error) {
 			_ = os.Remove(tmpName)
 		}
 	}()
-	// Streamed, not marshalled into memory first. Assigned grows by a disc's
-	// worth of paths after every disc and the whole list is rewritten each time,
-	// so on a multi-million-file tree the last disc of a set was serialising a
-	// couple of hundred megabytes into a []byte before touching the file.
-	// Encoding straight into the temp file costs one buffer instead.
-	w := bufio.NewWriterSize(tmp, 1<<16)
-	enc := json.NewEncoder(w)
+	// This is not streamed, whatever an Encoder looks like. Encode marshals
+	// the whole State into a buffer, re-indents that into a second one for
+	// SetIndent, and only then hands the writer the finished document in a
+	// single Write — in Go 1.26 and in 1.27's jsonv2-backed encoder alike. So
+	// it goes straight to the file: a bufio.Writer in between batched nothing,
+	// and only made the code look as if it streamed. Assigned grows by a
+	// disc's worth of paths after every disc and the whole list is rewritten
+	// each time, so on a million-path set each save holds a few hundred
+	// megabytes of transient heap, on the order of json.MarshalIndent. An
+	// encoder that truly streamed would have to reproduce these bytes exactly
+	// (TestSaveStateBytesAreUnchanged), which is more change than the saving
+	// has yet been worth.
+	enc := json.NewEncoder(tmp)
 	enc.SetIndent("", "  ")
-	if err = enc.Encode(s); err != nil {
-		return fmt.Errorf("backup: encoding resume state: %w", err)
-	}
-	if err = w.Flush(); err != nil {
-		return fmt.Errorf("backup: writing %s: %w", tmpName, err)
+	if err = enc.Encode(&onDisk); err != nil {
+		return fmt.Errorf("backup: writing resume state %s: %w", tmpName, err)
 	}
 	if err = tmp.Sync(); err != nil {
 		return fmt.Errorf("backup: syncing %s: %w", tmpName, err)
@@ -333,9 +513,13 @@ func (s *State) checkResume(archive, source string) error {
 			ErrStateMismatch, s.Source, source)
 	}
 	if s.Archive != archive {
+		// The hint is pasted into a config file, so the name goes through
+		// ShellWord as every other pasted line does: a name derived from a
+		// SOURCE_DIR such as "My Documents" printed bare had brb.sh's source
+		// run the second word as a command.
 		return fmt.Errorf("%w: state was recorded for archive %q, configuration says %q "+
 			"(set ARCHIVE_NAME=%s to continue that set)",
-			ErrStateMismatch, s.Archive, archive, s.Archive)
+			ErrStateMismatch, s.Archive, archive, ui.ShellWord(s.Archive))
 	}
 	return nil
 }

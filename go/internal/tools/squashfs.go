@@ -235,6 +235,13 @@ func readFailureError(files []string) error {
 // used to prove an image is a readable squashfs before the plaintext copy is
 // deleted. This is the one place a tool's stdout is deliberately the return
 // value, and it is a read-only query with no path in it.
+//
+// The summary is a few dozen lines whatever the image holds, so stdout is kept
+// to probeLimit bytes. Nothing else bounds it: stdout set on a runSpec bypasses
+// the line writer and its limits, and this runs on the backup's own context,
+// which has no deadline. A broken unsquashfs flooding it used to grow memory
+// until the kernel killed the backup, hours in; now it is an error naming the
+// tool, raised within a pipe's worth of the limit (see headBuffer).
 func (s *Set) ImageStats(ctx context.Context, image string) (string, error) {
 	path, err := s.bin(Unsquashfs)
 	if err != nil {
@@ -243,13 +250,21 @@ func (s *Set) ImageStats(ctx context.Context, image string) (string, error) {
 	if image == "" {
 		return "", errors.New("unsquashfs: no image given")
 	}
-	var buf bytes.Buffer
+	buf := &headBuffer{limit: probeLimit}
 	if err := run(ctx, runSpec{
 		name:   Unsquashfs,
 		path:   path,
 		args:   []string{"-s", image},
-		stdout: &buf,
+		stdout: buf,
 	}); err != nil {
+		// The overflow first: it is why the run failed (the child died of the
+		// closed pipe), and the tool, not the image, is what it blames. The flag
+		// rather than a full buffer, so that a summary of exactly the limit
+		// followed by an unrelated failure keeps that failure's own error.
+		if buf.over {
+			return "", fmt.Errorf("unsquashfs -s printed more than %d bytes about %s, which is no superblock summary; "+
+				"check the unsquashfs on PATH", buf.limit, image)
+		}
 		return "", err
 	}
 	out := strings.TrimRight(buf.String(), "\n")
