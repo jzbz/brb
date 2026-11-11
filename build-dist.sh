@@ -322,8 +322,18 @@ printf '\n  Point brb at it:  export BRB_DIST_DIR=%s\n  or:               ln -sf
   "$OUT" "$OUT" "$REPO" >&2
 # The signature is made by hand, off this machine's build path and outside this
 # script: a build script that can sign is a build script that can be made to
-# sign something else. It prints the command and stops there.
-printf '\n  Sign:             cd %s && gpg --detach-sign --armor SHA256SUMS\n' \
-  "$REL" >&2
-printf '  Then publish:     gh release upload v%s %s/*\n\n' \
-  "$VERSION" "$REL" >&2
+# sign something else. It prints the commands and stops there.
+#
+# The order is the point. The assets go up on a draft first, so the SHA256SUMS
+# that gets signed is the one the release already carries, and the release
+# goes public only once the signature is on it. Uploading straight to a public
+# release, as this hint used to say, leaves binaries up with nothing to verify
+# them against until the .asc follows; v0.1.0 and v0.1.1 spent days like that.
+# Bare filenames, from inside $REL, so the asset names are the release names.
+printf '\n  Release, from %s:\n' "$REL" >&2
+printf '    cd %s\n' "$REL" >&2
+printf '    gh release create v%s --repo jzbz/brb --verify-tag --draft %s SHA256SUMS\n' \
+  "$VERSION" "${rel_names[*]}" >&2
+printf '    gpg --detach-sign --armor SHA256SUMS\n' >&2
+printf '    gh release upload v%s SHA256SUMS.asc --repo jzbz/brb\n' "$VERSION" >&2
+printf '    gh release edit v%s --repo jzbz/brb --draft=false\n\n' "$VERSION" >&2
