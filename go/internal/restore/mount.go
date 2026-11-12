@@ -233,35 +233,39 @@ func VerifyDisc(ctx context.Context, o Options, n int, mountPoint string) error 
 	}
 	defer release()
 
-	// os.Stat follows a link, exactly as brb.sh's [[ -f ]] does, so a symlinked
-	// regular SHA512SUMS is read by both readers. What has to be refused here is
-	// anything that is not a regular file: a FIFO blocks open(2) until a writer
-	// appears, and ReadSumFile's open is not one a cancelled context can
-	// interrupt — verify-disc hung through the first Ctrl-C, while brb.sh's -f
-	// refused the same disc at once. Ingest refuses the same non-regular files
-	// (discSums), and refuses a link there as well, which this deliberately
-	// does not: brb.sh's verify-disc tests the name with -f alone.
-	sumPath := filepath.Join(mp, agecrypt.SumsName)
-	sfi, err := os.Stat(sumPath)
+	discRoot, err := os.OpenRoot(mp)
 	if err != nil {
+		return fmt.Errorf("restore: opening %s: %w", mp, err)
+	}
+	defer discRoot.Close()
+
+	// SHA512SUMS is held to discEntry's rule, as ingest holds it (discSums), and
+	// as brb.sh's verify-disc holds it with -L before -f. A link used to be
+	// followed here, so a disc whose SHA512SUMS pointed at a file off the
+	// disc — one the operator's machine supplies — had its hashes taken from
+	// there and was called verified. Anything else that is not a regular file is
+	// refused too: a FIFO blocks open(2) until a writer appears, and
+	// ReadSumFile's open is not one a cancelled context can interrupt, so
+	// verify-disc hung through the first Ctrl-C.
+	sumPath := filepath.Join(mp, agecrypt.SumsName)
+	sfi, err := discEntry(discRoot, agecrypt.SumsName)
+	if errors.Is(err, fs.ErrNotExist) {
 		return fmt.Errorf("restore: no %s at %s — is this one of ours?: %w", agecrypt.SumsName, mp, err)
+	}
+	if err != nil {
+		return fmt.Errorf("restore: %s: %w", mp, err)
 	}
 	if !sfi.Mode().IsRegular() {
 		return fmt.Errorf("restore: %s at %s is not a regular file (%s) — is this one of ours?",
 			agecrypt.SumsName, mp, sfi.Mode().Type())
 	}
 
-	// data/ itself is held to discEntry's rule before dataFiles lists it, as
+	// data/ itself is held to the same rule before dataFiles lists it, as
 	// ingest holds it: os.ReadDir follows a symlinked data/ wherever it points,
 	// so a disc whose data is a link to a directory of the operator's, holding a
 	// file named like the image, passed the identity gate below and verified,
 	// while brb.sh — whose `find -P` will not descend a symlinked start point —
 	// refused it.
-	discRoot, err := os.OpenRoot(mp)
-	if err != nil {
-		return fmt.Errorf("restore: opening %s: %w", mp, err)
-	}
-	defer discRoot.Close()
 	if _, err := discEntry(discRoot, dataDir); err != nil && !errors.Is(err, fs.ErrNotExist) {
 		return fmt.Errorf("restore: %s: %w", mp, err)
 	}

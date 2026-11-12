@@ -182,8 +182,11 @@ func (o Options) checkComplete(imgs []discFile) setStatus {
 		return st
 	}
 	// Word for word what brb.sh prints, so an operator who has read one
-	// implementation's output recognises the other's.
-	o.UI.Warn("MANIFEST says %d discs; %d present. MISSING: %s", want, len(imgs), st.missingList())
+	// implementation's output recognises the other's. "present" is inRange, the
+	// distinct disc numbers of this set that are staged, so that it and the
+	// MISSING list add up to want; it used to be len(imgs), and disc001
+	// beside disc01 read "2 discs; 2 present. MISSING: 2".
+	o.UI.Warn("MANIFEST says %d discs; %d present. MISSING: %s", want, inRange, st.missingList())
 	o.UI.Warn("files on those discs will NOT be restored")
 	return st
 }

@@ -342,8 +342,10 @@ jobs:
           # line then fails the comparison rather than being dropped from it.
           diff <(printf '%s\n' "${assets[@]}" | sort) <(sed 's/^[0-9a-f]\{64\}  //' SHA256SUMS | sort) \
             || { echo "SHA256SUMS does not list exactly the four release assets" >&2; exit 1; }
-          # build-dist.sh ends by telling the releaser to upload release/*, so
-          # anything else in this directory would go up beside them, unsigned.
+          # build-dist.sh's closing hint names each asset for the draft release
+          # (gh release create ... --verify-tag --draft), but the releaser works
+          # in this directory, so anything else here is one glob away from going
+          # up beside them, unsigned, or from being hashed into SHA256SUMS.
           diff <(printf '%s\n' "${assets[@]}" SHA256SUMS | sort) <(find . -mindepth 1 -maxdepth 1 -printf '%P\n' | sort) \
             || { echo "the release directory holds more than the four assets and SHA256SUMS" >&2; exit 1; }
           # An asset that is not the payload byte for byte would put something

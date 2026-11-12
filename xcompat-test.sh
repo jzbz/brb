@@ -518,6 +518,21 @@ sv_data_link() {
 sv_case refuses datalink sv_data_link "data/ a symlink to a directory off the disc, SHA512SUMS listing only MANIFEST.txt" \
   'symbolic link'
 
+# SHA512SUMS itself a link to an intact copy off the disc. Both readers followed
+# it and called the disc verified on hashes the operator's machine supplied,
+# since brb.sh's -f and Go's os.Stat both follow a link; ingest already refused
+# it (Go) or warned and ignored it (brb.sh). The ERE pins the refusal to the
+# link, since the copy's hashes match the disc and nothing else would refuse.
+sv_sums_link() {
+  sv_disc "$1" || return 1
+  mkdir -p "$SV/out-$1"
+  mv -- "$SV/$1/SHA512SUMS" "$SV/out-$1/SHA512SUMS"
+  ln -s "$SV/out-$1/SHA512SUMS" "$SV/$1/SHA512SUMS"
+  test -L "$SV/$1/SHA512SUMS"
+}
+sv_case refuses sumslink sv_sums_link "SHA512SUMS a symlink to an intact copy off the disc" \
+  'symbolic link'
+
 # What a SHA512SUMS has to say before it can vouch for anything. An empty one
 # beside a corrupt image was clean to the Go reader; one that simply leaves the
 # image out was clean to both, since each checked only what the file listed.
@@ -615,7 +630,9 @@ sv_case accepts fifoman   sv_fifo_manifest "MANIFEST.txt a FIFO, unlisted, with 
 # cap both readers verified the file one byte over, and the case exactly at the
 # cap shows the cap is not refusing everything near it. A SHA512SUMS linked to
 # /proc/self/pagemap is the case a stat-based cap misses: a "regular file" of
-# size 0 that reads far past the cap.
+# size 0 that reads far past the cap. Both readers now refuse the link itself
+# before reading (sumslink above), so this now pins that no link here
+# reaches the reader, rather than the cap.
 SV_CAP=16777216
 sv_pad_to() { # sv_pad_to NAME SIZE
   local f=$SV/$1/SHA512SUMS have
@@ -4267,6 +4284,20 @@ manifest_complete() {
   grep -q 'all 2 disc image(s) present' <<<"$out" || { printf '%s\n' "$out" | tail -3 >&2; return 1; }
 }
 assert0 "brb.sh still reports a genuinely complete set as complete" manifest_complete
+
+# "N present" counts disc numbers, not names. disc001 beside disc01 is one disc
+# to both readers, and brb.sh printed "2 discs; 2 present. MISSING: 2" for it.
+# Go's side is TestCheckComplete; its doctor does not run the check.
+manifest_present_counts_discs() {
+  local st=$T/mcount3 out
+  rm -rf "$st"; mkdir -p "$st/enc"
+  : > "$st/enc/disc01.squashfs.age"; : > "$st/enc/disc001.squashfs.age"
+  printf 'discs           : 2\n' > "$st/MANIFEST.txt"
+  mkcfg "$T/cfg/mcount3" "$st" "$SRC"
+  out=$(bash "$BRB_SH" --yes -c "$T/cfg/mcount3" doctor 2>&1) || true
+  grep -q 'MANIFEST says 2 discs; 1 present. MISSING: 2' <<<"$out" || { printf '%s\n' "$out" | tail -3 >&2; return 1; }
+}
+assert0 "brb.sh counts disc01 and disc001 as one disc present, not two" manifest_present_counts_discs
 
 # The same hazard one argument along. num_arg forces base 10 but did not bound
 # the value, and bash arithmetic wraps at 2^64 silently: "18446744073709551618"

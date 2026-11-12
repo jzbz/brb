@@ -57,10 +57,9 @@ func verifyWithin(t *testing.T, o Options, mp, fifo string) error {
 // TestVerifyDiscRefusesANonRegularSums: a FIFO named SHA512SUMS passed the
 // existence check and then blocked ReadSumFile's open until a writer came — a
 // hang a cancelled context could not end, so the first Ctrl-C did nothing.
-// brb.sh's [[ -f ]] refused the same disc at once. A link to a FIFO is refused
-// the same way, and a link to a regular file is still followed, as -f follows
-// it: that last case is what keeps this check from drifting into discEntry's
-// stricter rule, which brb.sh's verify-disc does not apply to this name.
+// brb.sh's [[ -f ]] refused the same disc at once. A link is refused whatever
+// it points at, as brb.sh's -L refuses it: one to a regular file off the disc
+// had that file's hashes vouch for the disc, and the disc was called verified.
 func TestVerifyDiscRefusesANonRegularSums(t *testing.T) {
 	e := newEnv(t)
 
@@ -88,8 +87,8 @@ func TestVerifyDiscRefusesANonRegularSums(t *testing.T) {
 	if err := os.Symlink(fifo, sums); err != nil {
 		t.Fatal(err)
 	}
-	if err := verifyWithin(t, e.opts(), mp, fifo); err == nil || !strings.Contains(err.Error(), "not a regular file") {
-		t.Fatalf("VerifyDisc over a SHA512SUMS linked to a FIFO = %v, want it refused", err)
+	if err := verifyWithin(t, e.opts(), mp, fifo); err == nil || !strings.Contains(err.Error(), "symbolic link") {
+		t.Fatalf("VerifyDisc over a SHA512SUMS linked to a FIFO = %v, want it refused as a link", err)
 	}
 
 	mp = verifyDiscDir(t)
@@ -101,8 +100,8 @@ func TestVerifyDiscRefusesANonRegularSums(t *testing.T) {
 	if err := os.Symlink(elsewhere, sums); err != nil {
 		t.Fatal(err)
 	}
-	if err := VerifyDisc(context.Background(), e.opts(), 1, mp); err != nil {
-		t.Fatalf("VerifyDisc over a SHA512SUMS linked to a regular file: %v (brb.sh's -f follows it)", err)
+	if err := VerifyDisc(context.Background(), e.opts(), 1, mp); err == nil || !strings.Contains(err.Error(), "symbolic link") {
+		t.Fatalf("VerifyDisc over a SHA512SUMS linked to a regular file off the disc = %v, want it refused as a link", err)
 	}
 }
 

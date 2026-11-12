@@ -136,6 +136,17 @@ func TestCheckComplete(t *testing.T) {
 			says: []string{"MISSING: 2 3"},
 		},
 		{
+			// disc001 beside disc01 is one disc to both readers, and an image
+			// past the manifest's count is none of this set's: "present" counts
+			// disc numbers in range, not names, so it and MISSING add up.
+			name:     "two names for one disc, and one past the count",
+			manifest: manifestSaying(3),
+			have:     []int{1, 1, 4},
+			want:     3, known: true, missing: "2 3",
+			says:    []string{"MANIFEST says 3 discs; 1 present. MISSING: 2 3"},
+			notSays: []string{"3 present", "2 present"},
+		},
+		{
 			name:     "a manifest that says nothing usable",
 			manifest: "discs           : some\n",
 			have:     []int{1},

@@ -1759,6 +1759,12 @@ cmd_verify_disc() {
   n="$(num_arg "${1:-}" 'disc number')"
   mount_disc "${2:-}"; mp="$MOUNT_POINT"
   trap unmount_disc EXIT
+  # -L first: -f follows a link, so a SHA512SUMS linked to a file off the disc
+  # had its hashes read from wherever it pointed and the disc called verified.
+  # Ingest only warns (read_disc_sums), since there SHA512SUMS is advice beside
+  # each file's own sidecar; here it is the whole verdict. The Go reader refuses
+  # the same name through discEntry.
+  [[ -L "$mp/SHA512SUMS" ]] && die "$(esc_str "$mp"): SHA512SUMS on this disc is a symbolic link, which no disc brb wrote carries — nothing was read through it"
   [[ -f "$mp/SHA512SUMS" ]] || die "no SHA512SUMS at $mp — is this one of ours?"
   # -L before the identity check, as ingest has it: a disc brb wrote holds
   # data/ as a real directory, and `find -P` will not descend a symlinked one,
@@ -1875,13 +1881,16 @@ expected_discs() {
 # disc01 (two names, one disc), a disc03 in a two-disc set, a discx, even a
 # directory with an image's name. Each of them made "all 2 disc image(s)
 # present" true of a set with no disc 2, and so took away the one warning, and
-# the one prompt, that a partial restore exists to raise. 'have' is the number
-# of numbered images, which is what both readers print as "N present".
+# the one prompt, that a partial restore exists to raise. "N present" counts
+# the same thing, the distinct disc numbers of this set that are staged, so
+# that it and the MISSING list add up to the manifest's count; it used to
+# count names, and disc001 beside disc01 read "2 discs; 2 present.
+# MISSING: 2". Go's checkComplete prints the same figure.
 #
 # Returns 1 for an incomplete set, with SET_MISSING and SET_WANT saying what
 # was missing; 0, with both empty, for a complete one or an unknown size.
 check_complete() {
-  local want have=0 inrange=0 missing=() i f n
+  local want inrange=0 missing=() i f n
   local -A present=()
   SET_MISSING="" SET_WANT=""
   # || true: expected_discs returns 1 when there is no usable manifest, and a
@@ -1893,7 +1902,6 @@ check_complete() {
   # is Go's.
   while IFS= read -r f; do
     n="$(disc_number_of "${f##*/}")"
-    have=$(( have + 1 ))
     if (( n >= 1 && n <= want )) && [[ -z "${present[$n]:-}" ]]; then inrange=$(( inrange + 1 )); fi
     present[$n]=1
   done < <(numbered_images)
@@ -1914,7 +1922,7 @@ check_complete() {
   done
   local shown="${missing[*]}" rest=$(( want - inrange - ${#missing[@]} ))
   (( rest > 0 )) && shown="$shown ... and $rest more"
-  warn "MANIFEST says $want discs; $have present. MISSING: $shown"
+  warn "MANIFEST says $want discs; $inrange present. MISSING: $shown"
   warn "files on those discs will NOT be restored"
   SET_MISSING="$shown" SET_WANT="$want"
   return 1
