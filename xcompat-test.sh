@@ -1702,7 +1702,9 @@ rsc_unnumbered_ignored() { # rsc_unnumbered_ignored sh|go
 # names, so disc001 beside disc01, a disc03 in a two-disc set, a discx, or even
 # a directory with an image's name made a set missing its disc 2 read "all 2
 # disc image(s) present" — and the warning, and the prompt before a partial
-# restore, never came. The Go reader counts distinct disc numbers in range.
+# restore, never came. The Go reader counts distinct disc numbers in range, and
+# "N present" in the warning is that same count in both readers: it counted
+# names, so disc001 beside disc01 read "2 present. MISSING: 2".
 # Asserted through brb.sh's doctor, as section 18 asserts the manifest's own
 # number: the Go build's doctor is a writer's, and its count is pinned by
 # TestCheckComplete. A trailing slash on a name here stages a directory.
@@ -1739,9 +1741,9 @@ if (( n_m >= 2 )); then
   done
 fi
 assert0 "brb.sh counts disc001 beside disc01 as one disc, and names disc 2 missing" \
-  rsc_doctor_says 2 '2 present\. MISSING: 2$' disc01.squashfs.age disc001.squashfs.age
+  rsc_doctor_says 2 '1 present\. MISSING: 2$' disc01.squashfs.age disc001.squashfs.age
 assert0 "  ... does not count a disc03 towards a two-disc set" \
-  rsc_doctor_says 2 '2 present\. MISSING: 2$' disc01.squashfs.age disc03.squashfs.age
+  rsc_doctor_says 2 '1 present\. MISSING: 2$' disc01.squashfs.age disc03.squashfs.age
 assert0 "  ... does not count a name with no disc number at all" \
   rsc_doctor_says 2 '1 present\. MISSING: 2$' disc01.squashfs.age discx.squashfs.age
 assert0 "  ... does not count a directory that has an image's name" \
@@ -4284,20 +4286,6 @@ manifest_complete() {
   grep -q 'all 2 disc image(s) present' <<<"$out" || { printf '%s\n' "$out" | tail -3 >&2; return 1; }
 }
 assert0 "brb.sh still reports a genuinely complete set as complete" manifest_complete
-
-# "N present" counts disc numbers, not names. disc001 beside disc01 is one disc
-# to both readers, and brb.sh printed "2 discs; 2 present. MISSING: 2" for it.
-# Go's side is TestCheckComplete; its doctor does not run the check.
-manifest_present_counts_discs() {
-  local st=$T/mcount3 out
-  rm -rf "$st"; mkdir -p "$st/enc"
-  : > "$st/enc/disc01.squashfs.age"; : > "$st/enc/disc001.squashfs.age"
-  printf 'discs           : 2\n' > "$st/MANIFEST.txt"
-  mkcfg "$T/cfg/mcount3" "$st" "$SRC"
-  out=$(bash "$BRB_SH" --yes -c "$T/cfg/mcount3" doctor 2>&1) || true
-  grep -q 'MANIFEST says 2 discs; 1 present. MISSING: 2' <<<"$out" || { printf '%s\n' "$out" | tail -3 >&2; return 1; }
-}
-assert0 "brb.sh counts disc01 and disc001 as one disc present, not two" manifest_present_counts_discs
 
 # The same hazard one argument along. num_arg forces base 10 but did not bound
 # the value, and bash arithmetic wraps at 2^64 silently: "18446744073709551618"
