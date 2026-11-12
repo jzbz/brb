@@ -70,9 +70,9 @@ concurrency:
 # every disc: a toolchain line there is a release every rebuild has to reach,
 # and a rescuer's Go that is older goes looking for a download, which offline
 # is a refusal. go.mod's go line is the floor instead, and the last step of
-# dist builds on exactly that. Move this by hand when a 1.26 point release ships.
+# dist builds on exactly that. Move this by hand when a 1.27 point release ships.
 env:
-  GO_VERSION: '1.26.9'
+  GO_VERSION: '1.27.4'
 
 jobs:
   check:
